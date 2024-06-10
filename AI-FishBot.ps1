@@ -35,7 +35,7 @@ $useWeakAura      = $False # Set this to $True to use the weak aura companion. I
 ### Main Keybinds ###
 # valid options are the Function keys. F5-F12
 # Code is easily modifiable for different or more if you want to do that yourself.
-$cast   = "F6"  # start fishing keybind. (make a macro '/cast fishin ' and keybind it)
+$cast   = "F6"  # start fishing keybind. (make a macro '/cast fishing' and keybind it)
 $bobber = "F7"  # click bobber action keybind (set in wow options 'Interact With Target')
 $logout = "F8"  # make a macro '/logout' or '/camp' to use for this keybind
 
