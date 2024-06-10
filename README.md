@@ -90,7 +90,7 @@ $buffDuration2 = 30
 - Set your keybinds in game options for 'Interact With Target', your fishing cast key, and optional buffs or logout keybinds.
 - Be in a quiet area if possible, since this is based off of sound detection. Play with the sound levels in wow and the $audioSensitivity if needed.
 - Classic allows overwriting spell sounds. Can replace fishing 'splash/bite' sound with the ones recommended in [this Weakaura](https://wago.io/ajvyuK3Io) for a louder 'ding' sound detection for the bot if needed.
-## Manual soft-targte settings if not using the WeakAura:
+### Manual soft-target settings if not using the WeakAura:
 ```
 /console SoftTargetInteract 3
 /console SoftTargetInteractArc 2
