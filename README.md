@@ -1,5 +1,5 @@
 # AI-FishBot 
-**A**udio **I**nteract Fishbot for World of Warcraft  
+**A**udio **I**nteract FishBot for World of Warcraft  
 
 ***NOTE***: I do not condone botting in games. I do believe in free usage and sharing of code though. What the end user does with that is up to their own morality.
 ## Description & Design:
