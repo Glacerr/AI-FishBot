@@ -9,9 +9,9 @@ It was designed to be very minimalistic and simplistic in code and usage. It was
 It detects the bobber from the sound of the splash. It then utilizes legal in-game API's to fish using Blizzard's new soft-interact features. The app never touches the wow services, files or memory in any way. If utilizing the Raspberry Pi portion of this app, it is completely undetectable. If not using the Pi, it is as close to undetectable as can be, similar to other software based bots that utilize windows or python to do keyboard/mouse movements.
 ## Modes:
 There are different ways that this bot can be used depending on how you want to install/setup the bot. Below are descriptions and installation steps of each.
-1. **Standalone:** Uses the powershell script and nothing else. This will work well in retail, but not as well in classic (due to soft-target range differences). It will also only use software based input, which is not as safe as using raspberry pi hardware input.
+1. **Standalone:** Uses the powershell script and nothing else. This will work well in retail, but not as well in classic (due to soft-target range differences). It will also only use software based input, which is not as safe as using raspberry pi hardware input. You will need to manually set soft-target settings if not using the Weakaura as well (see below)
 2. **Raspberry Pi:** This installation/setup option uses the Raspberry Pi Pico as hardware input, making it undetectable.
-3. **Weakaura:** This uses the Weakaura to detect proper soft-target range, so works well in both retail and classic.
+3. **Weakaura:** This uses the Weakaura to detect proper soft-target range, so works well in both retail and classic. It Also auto-sets sound and soft-target interact settings so you don't have to do it manually.
 
 ## Basic Installation:
 1. Download this repo.
@@ -19,7 +19,8 @@ There are different ways that this bot can be used depending on how you want to 
 3. Extract the zip file. Keep all files in the same directory.
 4. Edit the AI-Fishbot.ps1 file and change the settings at the top to how you want to use the bot.
 5. Optional: Install the Companion Weakaura or set up the Raspberry Pi Pico if using those. (Recommended)
-6. Double-click the AI-Fishbot shortcut file to start the app.
+6. Set in-game keybinds for fishing, Interact With Target,  
+8. Double-click the AI-Fishbot shortcut file to start the app.
 
 ## Weakaura Setup:
 Install the companion Weakaura from [https://wago.io/ajvyuK3Io](https://wago.io/ajvyuK3Io) or copy/paste the import string below:  
@@ -56,7 +57,7 @@ $useWeakAura      = $False # Set this to $True to use the weak aura companion. I
 ### Main Keybinds ###
 # valid options are the Function keys. F5-F12
 # Code is easily modifiable for different or more if you want to do that yourself.
-$cast   = "F6"  # start fishing keybind. (make a macro '/cast fishin ' and keybind it)
+$cast   = "F6"  # start fishing keybind. (make a macro '/cast fishing' and keybind it)
 $bobber = "F7"  # click bobber action keybind (set in wow options 'Interact With Target')
 $logout = "F8"  # make a macro '/logout' or '/camp' to use for this keybind
 
@@ -85,8 +86,19 @@ $buffDuration2 = 30
 # ...
 ```
 # Tips & Tricks:
+- Enable Autoloot
+- Set your keybinds in game options for 'Interact With Target', your fishing cast key, and optional buffs or logout keybinds.
 - Be in a quiet area if possible, since this is based off of sound detection. Play with the sound levels in wow and the $audioSensitivity if needed.
 - Classic allows overwriting spell sounds. Can replace fishing 'splash/bite' sound with the ones recommended in [this Weakaura](https://wago.io/ajvyuK3Io) for a louder 'ding' sound detection for the bot if needed.
+## Manual soft-targte settings if not using the WeakAura:
+```
+/console SoftTargetInteract 3
+/console SoftTargetInteractArc 2
+/console SoftTargetInteractRange 30
+/console SoftTargetInteractGameObject 1
+/console SoftTargetIconInteract 1
+/console SoftTargetTooltipInteract 1
+```
 ## Sample Macros:
 Fishing Macro:
 ```
