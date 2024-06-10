@@ -99,7 +99,7 @@ $buffDuration2 = 30
 /console SoftTargetIconInteract 1
 /console SoftTargetTooltipInteract 1
 ```
-## Sample Macros:
+### Sample Macros:
 Fishing Macro:
 ```
 #showtooltip fishing
