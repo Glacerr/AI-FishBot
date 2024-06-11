@@ -19,7 +19,7 @@ There are different ways that this bot can be used depending on how you want to 
 3. Extract the zip file. Keep all files in the same directory.
 4. Edit the AI-Fishbot.ps1 file and change the settings at the top to how you want to use the bot.
 5. Optional: Install the Companion Weakaura or set up the Raspberry Pi Pico if using those. (Recommended)
-6. Set in-game keybinds for fishing, Interact With Target,  
+6. Set in-game keybinds for fishing, Interact With Target, and optional buffs/logout macros.
 8. Double-click the AI-Fishbot shortcut file to start the app.
 
 ## Weakaura Setup:
