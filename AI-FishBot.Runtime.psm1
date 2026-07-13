@@ -5,11 +5,12 @@ $script:AIFishBotRuntimeRandom = New-Object System.Random
 $script:AIFishBotRuntimeRandomLock = New-Object object
 $script:AIFishBotAllowedStates = @(
     'starting',
-    'running',
+    'ready',
+    'casting',
+    'waiting-for-bite',
+    'hooking',
     'stopping',
     'stopped',
-    'completed',
-    'failed',
     'error'
 )
 $script:AIFishBotStatusFields = @(
@@ -565,10 +566,15 @@ function ConvertTo-AIFishBotStatusObject {
             throw 'The protocol field "lastError" must be text or null.'
         }
 
+        $processId = ConvertTo-AIFishBotNonNegativeInteger `
+            -Value (Get-AIFishBotRequiredProtocolValue -InputObject $Status -Name 'processId') `
+            -FieldName 'processId'
+        if ($processId -le 0) {
+            throw 'The protocol field "processId" must be a positive integer.'
+        }
+
         return [pscustomobject][ordered]@{
-            processId = ConvertTo-AIFishBotNonNegativeInteger `
-                -Value (Get-AIFishBotRequiredProtocolValue -InputObject $Status -Name 'processId') `
-                -FieldName 'processId'
+            processId = $processId
             state = $stateValue
             hookCount = ConvertTo-AIFishBotNonNegativeInteger `
                 -Value (Get-AIFishBotRequiredProtocolValue -InputObject $Status -Name 'hookCount') `

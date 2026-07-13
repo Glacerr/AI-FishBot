@@ -18,7 +18,7 @@ function Remove-RuntimeTestDirectory {
 
 function New-RuntimeStatus {
     param(
-        [string]$State = 'running',
+        [string]$State = 'ready',
         [string]$HeartbeatAt = '2026-07-13T04:00:00.0000000+00:00'
     )
 
@@ -435,7 +435,7 @@ Test-Case 'status round trip contains exactly the fixed protocol fields' {
 
         Assert-Equal -Expected $expectedNames -Actual @($actual.PSObject.Properties.Name)
         Assert-Equal -Expected 4321 -Actual $actual.processId
-        Assert-Equal -Expected 'running' -Actual $actual.state
+        Assert-Equal -Expected 'ready' -Actual $actual.state
         Assert-Equal -Expected 4 -Actual $actual.configVersion
     }
     finally {
@@ -447,9 +447,9 @@ Test-Case 'status replacement is atomic and keeps a backup' {
     $runDirectory = New-TestDirectory
     try {
         Write-AIFishBotStatus -RunDirectory $runDirectory -Status (New-RuntimeStatus -State 'starting') | Out-Null
-        Write-AIFishBotStatus -RunDirectory $runDirectory -Status (New-RuntimeStatus -State 'running') | Out-Null
+        Write-AIFishBotStatus -RunDirectory $runDirectory -Status (New-RuntimeStatus -State 'casting') | Out-Null
 
-        Assert-Equal -Expected 'running' -Actual (Read-AIFishBotStatus -RunDirectory $runDirectory).state
+        Assert-Equal -Expected 'casting' -Actual (Read-AIFishBotStatus -RunDirectory $runDirectory).state
         Assert-Equal -Expected 'starting' -Actual (Read-AIFishBotJson -Path (
                 (Join-Path -Path $runDirectory -ChildPath 'status.json') + '.backup')).state
     }
@@ -481,6 +481,20 @@ foreach ($fieldName in @('processId', 'hookCount', 'retryCount', 'configVersion'
     }
 }
 
+Test-Case 'status processId rejects zero' {
+    $runDirectory = New-TestDirectory
+    try {
+        $status = New-RuntimeStatus -State 'stopping'
+        $status.processId = 0
+        Assert-Throws -ScriptBlock {
+            Write-AIFishBotStatus -RunDirectory $runDirectory -Status $status
+        }
+    }
+    finally {
+        Remove-RuntimeTestDirectory -Path $runDirectory
+    }
+}
+
 foreach ($case in @(
         [pscustomobject]@{ Name = 'blank text'; Value = '   ' },
         [pscustomobject]@{ Name = 'an unknown value'; Value = 'paused' },
@@ -501,12 +515,101 @@ foreach ($case in @(
     }
 }
 
-Test-Case 'status accepts every supported state' {
+Test-Case 'status accepts ready state' {
     $runDirectory = New-TestDirectory
     try {
-        foreach ($state in @('starting', 'running', 'stopping', 'stopped', 'completed', 'failed', 'error')) {
-            Write-AIFishBotStatus -RunDirectory $runDirectory -Status (New-RuntimeStatus -State $state) | Out-Null
-            Assert-Equal -Expected $state -Actual (Read-AIFishBotStatus -RunDirectory $runDirectory).state
+        Write-AIFishBotStatus -RunDirectory $runDirectory -Status (New-RuntimeStatus -State 'ready') | Out-Null
+        Assert-Equal -Expected 'ready' -Actual (Read-AIFishBotStatus -RunDirectory $runDirectory).state
+    }
+    finally {
+        Remove-RuntimeTestDirectory -Path $runDirectory
+    }
+}
+
+Test-Case 'status accepts casting state' {
+    $runDirectory = New-TestDirectory
+    try {
+        Write-AIFishBotStatus -RunDirectory $runDirectory -Status (New-RuntimeStatus -State 'casting') | Out-Null
+        Assert-Equal -Expected 'casting' -Actual (Read-AIFishBotStatus -RunDirectory $runDirectory).state
+    }
+    finally {
+        Remove-RuntimeTestDirectory -Path $runDirectory
+    }
+}
+
+Test-Case 'status accepts waiting-for-bite state' {
+    $runDirectory = New-TestDirectory
+    try {
+        Write-AIFishBotStatus -RunDirectory $runDirectory `
+            -Status (New-RuntimeStatus -State 'waiting-for-bite') | Out-Null
+        Assert-Equal -Expected 'waiting-for-bite' -Actual (Read-AIFishBotStatus `
+                -RunDirectory $runDirectory).state
+    }
+    finally {
+        Remove-RuntimeTestDirectory -Path $runDirectory
+    }
+}
+
+Test-Case 'status accepts hooking state' {
+    $runDirectory = New-TestDirectory
+    try {
+        Write-AIFishBotStatus -RunDirectory $runDirectory -Status (New-RuntimeStatus -State 'hooking') | Out-Null
+        Assert-Equal -Expected 'hooking' -Actual (Read-AIFishBotStatus -RunDirectory $runDirectory).state
+    }
+    finally {
+        Remove-RuntimeTestDirectory -Path $runDirectory
+    }
+}
+
+Test-Case 'status accepts stopping state' {
+    $runDirectory = New-TestDirectory
+    try {
+        Write-AIFishBotStatus -RunDirectory $runDirectory -Status (New-RuntimeStatus -State 'stopping') | Out-Null
+        Assert-Equal -Expected 'stopping' -Actual (Read-AIFishBotStatus -RunDirectory $runDirectory).state
+    }
+    finally {
+        Remove-RuntimeTestDirectory -Path $runDirectory
+    }
+}
+
+Test-Case 'status accepts stopped state' {
+    $runDirectory = New-TestDirectory
+    try {
+        Write-AIFishBotStatus -RunDirectory $runDirectory -Status (New-RuntimeStatus -State 'stopped') | Out-Null
+        Assert-Equal -Expected 'stopped' -Actual (Read-AIFishBotStatus -RunDirectory $runDirectory).state
+    }
+    finally {
+        Remove-RuntimeTestDirectory -Path $runDirectory
+    }
+}
+
+Test-Case 'status accepts error state' {
+    $runDirectory = New-TestDirectory
+    try {
+        Write-AIFishBotStatus -RunDirectory $runDirectory -Status (New-RuntimeStatus -State 'error') | Out-Null
+        Assert-Equal -Expected 'error' -Actual (Read-AIFishBotStatus -RunDirectory $runDirectory).state
+    }
+    finally {
+        Remove-RuntimeTestDirectory -Path $runDirectory
+    }
+}
+
+Test-Case 'status accepts starting state before the engine is ready' {
+    $runDirectory = New-TestDirectory
+    try {
+        Write-AIFishBotStatus -RunDirectory $runDirectory -Status (New-RuntimeStatus -State 'starting') | Out-Null
+        Assert-Equal -Expected 'starting' -Actual (Read-AIFishBotStatus -RunDirectory $runDirectory).state
+    }
+    finally {
+        Remove-RuntimeTestDirectory -Path $runDirectory
+    }
+}
+
+Test-Case 'status rejects generic running state' {
+    $runDirectory = New-TestDirectory
+    try {
+        Assert-Throws -ScriptBlock {
+            Write-AIFishBotStatus -RunDirectory $runDirectory -Status (New-RuntimeStatus -State 'running')
         }
     }
     finally {
