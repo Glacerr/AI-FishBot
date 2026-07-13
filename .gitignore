@@ -1,5 +1,5 @@
 .worktrees/
-profiles/*.json
-runtime/
-logs/
-tests/.tmp/
+/profiles/*.json
+/runtime/
+/logs/
+/tests/.tmp/
