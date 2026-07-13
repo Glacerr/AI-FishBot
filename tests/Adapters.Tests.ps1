@@ -328,6 +328,46 @@ Test-Case 'notifier preserves legacy named HTTP parameters and adds TimeoutSec' 
     Assert-Equal -Expected 0 -Actual $context.ExtraCount
 }
 
+Test-Case 'notifier preserves a strict legacy four-parameter HTTP provider' {
+    $context = [pscustomobject]@{
+        Keys = @()
+        Uri = $null
+        Method = $null
+        ContentType = $null
+        Body = $null
+        ExtraCount = -1
+    }
+    $captured = $context
+    $http = {
+        [CmdletBinding(PositionalBinding = $false)]
+        param(
+            [Parameter(Mandatory = $true)][string]$Uri,
+            [Parameter(Mandatory = $true)][string]$Method,
+            [Parameter(Mandatory = $true)][string]$ContentType,
+            [Parameter(Mandatory = $true)][string]$Body
+        )
+        $captured.Keys = @($PSBoundParameters.Keys | Sort-Object)
+        $captured.Uri = $Uri
+        $captured.Method = $Method
+        $captured.ContentType = $ContentType
+        $captured.Body = $Body
+        $captured.ExtraCount = $args.Count
+    }.GetNewClosure()
+    $webhook = 'https://discord.com/api/v10/webhooks/legacy-id/legacy-token'
+    $notifier = New-AIFishBotNotifier -HttpProvider $http -TimeoutSec 12 `
+        -LogProvider { param($level, $message) }
+
+    $result = Invoke-AdaptersMember -Object $notifier -Name Notify -Arguments @('start', $webhook)
+
+    Assert-Equal -Expected $true -Actual $result
+    Assert-Equal -Expected @('Body', 'ContentType', 'Method', 'Uri') -Actual $context.Keys
+    Assert-Equal -Expected $webhook -Actual $context.Uri
+    Assert-Equal -Expected 'Post' -Actual $context.Method
+    Assert-Equal -Expected 'application/json' -Actual $context.ContentType
+    Assert-Equal -Expected 'start' -Actual (($context.Body | ConvertFrom-Json).event)
+    Assert-Equal -Expected 0 -Actual $context.ExtraCount
+}
+
 Test-Case 'notifier passes an injected timeout from one through sixty seconds' {
     $timeouts = New-Object 'System.Collections.Generic.List[int]'
     $captured = $timeouts

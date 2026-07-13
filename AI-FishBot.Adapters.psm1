@@ -341,6 +341,24 @@ function Test-AIFishBotDiscordWebhook {
     return $uri.AbsolutePath -match '^/api(?:/v[0-9]+)?/webhooks/[A-Za-z0-9_-]+/[A-Za-z0-9._-]+/?$'
 }
 
+function Test-AIFishBotHttpProviderAcceptsTimeout {
+    param(
+        [Parameter(Mandatory = $true)]
+        [scriptblock]$Provider
+    )
+
+    $paramBlock = $Provider.Ast.ParamBlock
+    if ($null -eq $paramBlock) {
+        return $false
+    }
+    foreach ($parameter in @($paramBlock.Parameters)) {
+        if ([string]$parameter.Name.VariablePath.UserPath -ieq 'TimeoutSec') {
+            return $true
+        }
+    }
+    return $false
+}
+
 function New-AIFishBotNotifier {
     [CmdletBinding()]
     param(
@@ -354,6 +372,7 @@ function New-AIFishBotNotifier {
     )
 
     $testWebhook = ${function:Test-AIFishBotDiscordWebhook}
+    $testHttpProviderAcceptsTimeout = ${function:Test-AIFishBotHttpProviderAcceptsTimeout}
     $writeLogSafely = ${function:Write-AIFishBotAdapterLogSafely}
     if ($null -eq $InvokeRestMethodProvider) {
         $InvokeRestMethodProvider = {
@@ -372,10 +391,13 @@ function New-AIFishBotNotifier {
     if ($null -eq $ProtectProvider) {
         $ProtectProvider = { param($text) return Protect-AIFishBotSecret -Text $text }
     }
+    $providerAcceptsTimeout = [bool](& $testHttpProviderAcceptsTimeout `
+            -Provider $InvokeRestMethodProvider)
     $capturedRest = $InvokeRestMethodProvider
     $capturedLog = $LogProvider
     $capturedProtect = $ProtectProvider
     $capturedTimeout = $TimeoutSec
+    $capturedProviderAcceptsTimeout = $providerAcceptsTimeout
     $notifyAction = ({
             param($eventName, $webhook)
             if (-not (& $testWebhook -Webhook ([string]$webhook))) {
@@ -394,7 +416,9 @@ function New-AIFishBotNotifier {
                     Method = 'Post'
                     ContentType = 'application/json'
                     Body = $body
-                    TimeoutSec = $capturedTimeout
+                }
+                if ($capturedProviderAcceptsTimeout) {
+                    $requestArguments.TimeoutSec = $capturedTimeout
                 }
                 & $capturedRest @requestArguments | Out-Null
                 return $true
