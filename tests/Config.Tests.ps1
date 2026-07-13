@@ -166,6 +166,56 @@ Test-Case 'Pico rejects a port that is not currently available' {
     Assert-ConfigError -Result (Test-AIFishBotConfig -Config $config -AvailablePorts @('COM3')) -Field 'picoComPort'
 }
 
+Test-Case 'default port provider reads the system serial ports' {
+    $module = Get-Module -Name 'AI-FishBot.Config'
+    $expectedPorts = @([IO.Ports.SerialPort]::GetPortNames())
+    $actualPorts = @(& $module { Get-AIFishBotAvailablePorts })
+
+    Assert-Equal -Expected $expectedPorts -Actual $actualPorts
+}
+
+Test-Case 'Pico discovers available ports when none are injected' {
+    $module = Get-Module -Name 'AI-FishBot.Config'
+
+    try {
+        & $module {
+            $script:AIFishBotPortProvider = { @('COM_TEST_DISCOVERED') }
+        }
+
+        $config = New-AIFishBotDefaultConfig
+        $config.usePi = $true
+        $config.picoComPort = 'COM_TEST_DISCOVERED'
+
+        $result = Test-AIFishBotConfig -Config $config
+        Assert-Equal -Expected $true -Actual $result.IsValid
+        Assert-Equal -Expected 0 -Actual $result.Errors.Count
+    }
+    finally {
+        Import-Module -Name $script:ConfigModulePath -Force -ErrorAction Stop
+    }
+}
+
+Test-Case 'explicit available ports skip system discovery' {
+    $module = Get-Module -Name 'AI-FishBot.Config'
+
+    try {
+        & $module {
+            $script:AIFishBotPortProvider = { throw 'System discovery should not run.' }
+        }
+
+        $config = New-AIFishBotDefaultConfig
+        $config.usePi = $true
+        $config.picoComPort = 'COM_TEST_INJECTED'
+
+        $result = Test-AIFishBotConfig -Config $config -AvailablePorts @('COM_TEST_INJECTED')
+        Assert-Equal -Expected $true -Actual $result.IsValid
+        Assert-Equal -Expected 0 -Actual $result.Errors.Count
+    }
+    finally {
+        Import-Module -Name $script:ConfigModulePath -Force -ErrorAction Stop
+    }
+}
+
 Test-Case 'Pico accepts a port that is currently available' {
     $config = New-AIFishBotDefaultConfig
     $config.usePi = $true

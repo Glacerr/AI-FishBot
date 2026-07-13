@@ -1,4 +1,12 @@
-﻿function Get-AIFishBotConfigValue {
+﻿$script:AIFishBotPortProvider = {
+    return @([IO.Ports.SerialPort]::GetPortNames())
+}
+
+function Get-AIFishBotAvailablePorts {
+    return @(& $script:AIFishBotPortProvider)
+}
+
+function Get-AIFishBotConfigValue {
     param(
         [AllowNull()]
         [object]$InputObject,
@@ -200,7 +208,12 @@ function Test-AIFishBotConfig {
     $usePi = Get-AIFishBotConfigValue -InputObject $Config -Name 'usePi'
     if ($usePi -is [bool] -and $usePi) {
         $picoComPort = Get-AIFishBotConfigValue -InputObject $Config -Name 'picoComPort'
-        if ([string]::IsNullOrWhiteSpace([string]$picoComPort) -or $AvailablePorts -notcontains [string]$picoComPort) {
+        $effectiveAvailablePorts = $AvailablePorts
+        if (-not $PSBoundParameters.ContainsKey('AvailablePorts')) {
+            $effectiveAvailablePorts = @(Get-AIFishBotAvailablePorts)
+        }
+
+        if ([string]::IsNullOrWhiteSpace([string]$picoComPort) -or $effectiveAvailablePorts -notcontains [string]$picoComPort) {
             Add-AIFishBotConfigError -Errors $errors -Field 'picoComPort' -Message '必须选择当前可用的Pico串口。'
         }
     }
