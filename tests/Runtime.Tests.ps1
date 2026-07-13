@@ -114,6 +114,69 @@ Test-Case 'delay rejects a fractional provider result' {
     } -MessageLike '*whole number*'
 }
 
+Test-Case 'module random is called while its synchronization lock is held' {
+    $module = Get-Module -Name 'AI-FishBot.Runtime'
+    $actual = & $module {
+        $originalRandom = $script:AIFishBotRuntimeRandom
+        try {
+            $lockVariable = Get-Variable -Name 'AIFishBotRuntimeRandomLock' -Scope Script `
+                -ErrorAction SilentlyContinue
+            if ($null -eq $lockVariable) {
+                throw 'The module random lock is missing.'
+            }
+            $probe = New-Object psobject
+            $probe | Add-Member -MemberType ScriptMethod -Name Next -Value {
+                param($minimum, $exclusiveMaximum)
+                if (-not [System.Threading.Monitor]::IsEntered($script:AIFishBotRuntimeRandomLock)) {
+                    throw 'The module random generator was called without its lock.'
+                }
+                return $minimum
+            }
+            $script:AIFishBotRuntimeRandom = $probe
+            Get-AIFishBotDelayMilliseconds -MinimumSeconds 1 -MaximumSeconds 2
+        }
+        finally {
+            $script:AIFishBotRuntimeRandom = $originalRandom
+        }
+    }
+
+    Assert-Equal -Expected 1000 -Actual $actual
+}
+
+Test-Case 'concurrent default delay calls always stay inside the inclusive range' {
+    $workers = @()
+    try {
+        foreach ($workerNumber in 0..3) {
+            $powerShell = [powershell]::Create()
+            [void]$powerShell.AddScript({
+                    param($modulePath)
+                    Import-Module -Name $modulePath -Force -ErrorAction Stop
+                    foreach ($iteration in 0..1999) {
+                        $value = Get-AIFishBotDelayMilliseconds -MinimumSeconds 1 -MaximumSeconds 2
+                        if ($value -lt 1000 -or $value -gt 2000) {
+                            throw ('Delay value was outside the inclusive range: {0}' -f $value)
+                        }
+                    }
+                    return $true
+                }).AddArgument($script:RuntimeModulePath)
+            $workers += [pscustomobject]@{ PowerShell = $powerShell; Async = $powerShell.BeginInvoke() }
+        }
+
+        foreach ($worker in $workers) {
+            $result = $worker.PowerShell.EndInvoke($worker.Async)
+            if ($worker.PowerShell.HadErrors) {
+                throw [string]$worker.PowerShell.Streams.Error[0]
+            }
+            Assert-Equal -Expected $true -Actual $result[0]
+        }
+    }
+    finally {
+        foreach ($worker in $workers) {
+            $worker.PowerShell.Dispose()
+        }
+    }
+}
+
 Test-Case 'atomic JSON round trips Unicode data as strict UTF-8' {
     $directory = New-TestDirectory
     try {
@@ -237,6 +300,103 @@ Test-Case 'concurrent atomic JSON writers always leave one complete document' {
     }
 }
 
+Test-Case 'JSON reads wait for the same runtime directory lock as writes' {
+    $directory = New-TestDirectory
+    $mutex = $null
+    $reader = $null
+    $ownsMutex = $false
+    try {
+        $path = Join-Path -Path $directory -ChildPath 'locked-read.json'
+        Write-AIFishBotAtomicJson -Path $path -InputObject ([pscustomobject]@{ value = 42 }) -CreateNew | Out-Null
+        $module = Get-Module -Name 'AI-FishBot.Runtime'
+        $mutexName = & $module { Get-AIFishBotRuntimeMutexName -DirectoryPath $args[0] } $directory
+        $mutex = New-Object System.Threading.Mutex($false, $mutexName)
+        $ownsMutex = $mutex.WaitOne()
+
+        $reader = [powershell]::Create()
+        [void]$reader.AddScript({
+                param($modulePath, $jsonPath)
+                Import-Module -Name $modulePath -Force -ErrorAction Stop
+                Read-AIFishBotJson -Path $jsonPath
+            }).AddArgument($script:RuntimeModulePath).AddArgument($path)
+        $async = $reader.BeginInvoke()
+        Start-Sleep -Milliseconds 150
+        Assert-Equal -Expected $false -Actual $async.IsCompleted
+
+        $mutex.ReleaseMutex()
+        $ownsMutex = $false
+        $result = $reader.EndInvoke($async)
+        Assert-Equal -Expected 42 -Actual $result[0].value
+    }
+    finally {
+        if ($ownsMutex -and $null -ne $mutex) {
+            $mutex.ReleaseMutex()
+        }
+        if ($null -ne $mutex) {
+            $mutex.Dispose()
+        }
+        if ($null -ne $reader) {
+            $reader.Dispose()
+        }
+        Remove-RuntimeTestDirectory -Path $directory
+    }
+}
+
+Test-Case 'concurrent JSON readers and writers never observe sharing or parse failures' {
+    $directory = New-TestDirectory
+    $workers = @()
+    try {
+        $path = Join-Path -Path $directory -ChildPath 'read-write.json'
+        Write-AIFishBotAtomicJson -Path $path -InputObject ([pscustomobject]@{
+                writer = -1; payload = ('x' * 65536)
+            }) -CreateNew | Out-Null
+
+        foreach ($writer in 0..1) {
+            $powerShell = [powershell]::Create()
+            [void]$powerShell.AddScript({
+                    param($modulePath, $targetPath, $writerNumber)
+                    Import-Module -Name $modulePath -Force -ErrorAction Stop
+                    foreach ($iteration in 0..39) {
+                        Write-AIFishBotAtomicJson -Path $targetPath -InputObject ([pscustomobject]@{
+                                writer = $writerNumber
+                                iteration = $iteration
+                                payload = ([string]$writerNumber * 65536)
+                            }) | Out-Null
+                    }
+                }).AddArgument($script:RuntimeModulePath).AddArgument($path).AddArgument($writer)
+            $workers += [pscustomobject]@{ PowerShell = $powerShell; Async = $powerShell.BeginInvoke() }
+        }
+        foreach ($readerNumber in 0..2) {
+            $powerShell = [powershell]::Create()
+            [void]$powerShell.AddScript({
+                    param($modulePath, $targetPath)
+                    Import-Module -Name $modulePath -Force -ErrorAction Stop
+                    foreach ($iteration in 0..79) {
+                        $value = Read-AIFishBotJson -Path $targetPath
+                        if ($value.payload.Length -ne 65536) {
+                            throw 'Observed an incomplete JSON document.'
+                        }
+                    }
+                }).AddArgument($script:RuntimeModulePath).AddArgument($path)
+            $workers += [pscustomobject]@{ PowerShell = $powerShell; Async = $powerShell.BeginInvoke() }
+        }
+
+        foreach ($worker in $workers) {
+            [void]$worker.PowerShell.EndInvoke($worker.Async)
+            if ($worker.PowerShell.HadErrors) {
+                throw [string]$worker.PowerShell.Streams.Error[0]
+            }
+        }
+        Assert-Equal -Expected 65536 -Actual (Read-AIFishBotJson -Path $path).payload.Length
+    }
+    finally {
+        foreach ($worker in $workers) {
+            $worker.PowerShell.Dispose()
+        }
+        Remove-RuntimeTestDirectory -Path $directory
+    }
+}
+
 Test-Case 'run directories are unique and contain immutable start and writable live configs' {
     $runtimeRoot = New-TestDirectory
     try {
@@ -292,6 +452,168 @@ Test-Case 'status replacement is atomic and keeps a backup' {
         Assert-Equal -Expected 'running' -Actual (Read-AIFishBotStatus -RunDirectory $runDirectory).state
         Assert-Equal -Expected 'starting' -Actual (Read-AIFishBotJson -Path (
                 (Join-Path -Path $runDirectory -ChildPath 'status.json') + '.backup')).state
+    }
+    finally {
+        Remove-RuntimeTestDirectory -Path $runDirectory
+    }
+}
+
+$invalidStatusIntegerCases = @(
+    [pscustomobject]@{ Name = 'a negative value'; Value = -1 },
+    [pscustomobject]@{ Name = 'a Boolean'; Value = $true },
+    [pscustomobject]@{ Name = 'a fractional value'; Value = 1.5 }
+)
+foreach ($fieldName in @('processId', 'hookCount', 'retryCount', 'configVersion')) {
+    foreach ($case in $invalidStatusIntegerCases) {
+        Test-Case ("status {0} rejects {1}" -f $fieldName, $case.Name) {
+            $runDirectory = New-TestDirectory
+            try {
+                $status = New-RuntimeStatus
+                $status.$fieldName = $case.Value
+                Assert-Throws -ScriptBlock {
+                    Write-AIFishBotStatus -RunDirectory $runDirectory -Status $status
+                }
+            }
+            finally {
+                Remove-RuntimeTestDirectory -Path $runDirectory
+            }
+        }
+    }
+}
+
+foreach ($case in @(
+        [pscustomobject]@{ Name = 'blank text'; Value = '   ' },
+        [pscustomobject]@{ Name = 'an unknown value'; Value = 'paused' },
+        [pscustomobject]@{ Name = 'a Boolean'; Value = $true }
+    )) {
+    Test-Case ("status state rejects {0}" -f $case.Name) {
+        $runDirectory = New-TestDirectory
+        try {
+            $status = New-RuntimeStatus
+            $status.state = $case.Value
+            Assert-Throws -ScriptBlock {
+                Write-AIFishBotStatus -RunDirectory $runDirectory -Status $status
+            }
+        }
+        finally {
+            Remove-RuntimeTestDirectory -Path $runDirectory
+        }
+    }
+}
+
+Test-Case 'status accepts every supported state' {
+    $runDirectory = New-TestDirectory
+    try {
+        foreach ($state in @('starting', 'running', 'stopping', 'stopped', 'completed', 'failed', 'error')) {
+            Write-AIFishBotStatus -RunDirectory $runDirectory -Status (New-RuntimeStatus -State $state) | Out-Null
+            Assert-Equal -Expected $state -Actual (Read-AIFishBotStatus -RunDirectory $runDirectory).state
+        }
+    }
+    finally {
+        Remove-RuntimeTestDirectory -Path $runDirectory
+    }
+}
+
+foreach ($case in @(
+        [pscustomobject]@{ Name = 'blank text'; Value = '   ' },
+        [pscustomobject]@{ Name = 'a Boolean'; Value = $true }
+    )) {
+    Test-Case ("status profileName rejects {0}" -f $case.Name) {
+        $runDirectory = New-TestDirectory
+        try {
+            $status = New-RuntimeStatus
+            $status.profileName = $case.Value
+            Assert-Throws -ScriptBlock {
+                Write-AIFishBotStatus -RunDirectory $runDirectory -Status $status
+            }
+        }
+        finally {
+            Remove-RuntimeTestDirectory -Path $runDirectory
+        }
+    }
+}
+
+foreach ($timestampField in @('startedAt', 'heartbeatAt')) {
+    foreach ($case in @(
+            [pscustomobject]@{ Name = 'invalid text'; Value = 'not-a-time' },
+            [pscustomobject]@{ Name = 'null'; Value = $null },
+            [pscustomobject]@{ Name = 'a number'; Value = 1 }
+        )) {
+        Test-Case ("status {0} rejects {1}" -f $timestampField, $case.Name) {
+            $runDirectory = New-TestDirectory
+            try {
+                $status = New-RuntimeStatus
+                $status.$timestampField = $case.Value
+                Assert-Throws -ScriptBlock {
+                    Write-AIFishBotStatus -RunDirectory $runDirectory -Status $status
+                }
+            }
+            finally {
+                Remove-RuntimeTestDirectory -Path $runDirectory
+            }
+        }
+    }
+}
+
+foreach ($case in @(
+        [pscustomobject]@{ Name = 'a negative value'; Value = -0.1 },
+        [pscustomobject]@{ Name = 'a Boolean'; Value = $true },
+        [pscustomobject]@{ Name = 'text'; Value = '5' },
+        [pscustomobject]@{ Name = 'NaN'; Value = [double]::NaN }
+    )) {
+    Test-Case ("status remainingSeconds rejects {0}" -f $case.Name) {
+        $runDirectory = New-TestDirectory
+        try {
+            $status = New-RuntimeStatus
+            $status.remainingSeconds = $case.Value
+            Assert-Throws -ScriptBlock {
+                Write-AIFishBotStatus -RunDirectory $runDirectory -Status $status
+            }
+        }
+        finally {
+            Remove-RuntimeTestDirectory -Path $runDirectory
+        }
+    }
+}
+
+foreach ($case in @(
+        [pscustomobject]@{ Name = 'a number'; Value = 1 },
+        [pscustomobject]@{ Name = 'a Boolean'; Value = $false }
+    )) {
+    Test-Case ("status lastError rejects {0}" -f $case.Name) {
+        $runDirectory = New-TestDirectory
+        try {
+            $status = New-RuntimeStatus
+            $status.lastError = $case.Value
+            Assert-Throws -ScriptBlock {
+                Write-AIFishBotStatus -RunDirectory $runDirectory -Status $status
+            }
+        }
+        finally {
+            Remove-RuntimeTestDirectory -Path $runDirectory
+        }
+    }
+}
+
+Test-Case 'status fields retain the protocol value types after a round trip' {
+    $runDirectory = New-TestDirectory
+    try {
+        $status = New-RuntimeStatus
+        $status.remainingSeconds = 90.5
+        $status.lastError = 'sample error'
+        Write-AIFishBotStatus -RunDirectory $runDirectory -Status $status | Out-Null
+        $actual = Read-AIFishBotStatus -RunDirectory $runDirectory
+
+        Assert-Equal -Expected ([int]) -Actual $actual.processId.GetType()
+        Assert-Equal -Expected ([string]) -Actual $actual.state.GetType()
+        Assert-Equal -Expected ([int]) -Actual $actual.hookCount.GetType()
+        Assert-Equal -Expected ([int]) -Actual $actual.retryCount.GetType()
+        Assert-Equal -Expected ([string]) -Actual $actual.profileName.GetType()
+        Assert-Equal -Expected ([string]) -Actual $actual.startedAt.GetType()
+        Assert-Equal -Expected ([double]) -Actual $actual.remainingSeconds.GetType()
+        Assert-Equal -Expected ([string]) -Actual $actual.lastError.GetType()
+        Assert-Equal -Expected ([string]) -Actual $actual.heartbeatAt.GetType()
+        Assert-Equal -Expected ([int]) -Actual $actual.configVersion.GetType()
     }
     finally {
         Remove-RuntimeTestDirectory -Path $runDirectory
@@ -390,10 +712,33 @@ Test-Case 'heartbeat is stale when it is missing' {
 }
 
 Test-Case 'heartbeat is stale when it is in the future' {
-    $status = New-RuntimeStatus -HeartbeatAt '2026-07-13T04:00:31+00:00'
+    $status = New-RuntimeStatus -HeartbeatAt '2026-07-13T04:00:33+00:00'
 
     Assert-Equal -Expected $false -Actual (Test-AIFishBotHeartbeatFresh -Status $status `
             -Now ([datetimeoffset]'2026-07-13T04:00:30+00:00') -MaxAgeSeconds 30)
+}
+
+Test-Case 'heartbeat tolerates the default two seconds of future clock skew' {
+    $status = New-RuntimeStatus -HeartbeatAt '2026-07-13T04:00:32+00:00'
+
+    Assert-Equal -Expected $true -Actual (Test-AIFishBotHeartbeatFresh -Status $status `
+            -Now ([datetimeoffset]'2026-07-13T04:00:30+00:00') -MaxAgeSeconds 30)
+}
+
+Test-Case 'heartbeat future tolerance can be injected' {
+    $status = New-RuntimeStatus -HeartbeatAt '2026-07-13T04:00:31+00:00'
+
+    Assert-Equal -Expected $false -Actual (Test-AIFishBotHeartbeatFresh -Status $status `
+            -Now ([datetimeoffset]'2026-07-13T04:00:30+00:00') -MaxAgeSeconds 30 `
+            -FutureToleranceSeconds 0.5)
+}
+
+Test-Case 'heartbeat rejects a negative future tolerance' {
+    Assert-Throws -ScriptBlock {
+        Test-AIFishBotHeartbeatFresh -Status (New-RuntimeStatus) `
+            -Now ([datetimeoffset]'2026-07-13T04:00:30+00:00') -MaxAgeSeconds 30 `
+            -FutureToleranceSeconds -1
+    } -MessageLike '*FutureToleranceSeconds*non-negative*'
 }
 
 Test-Case 'heartbeat is stale after the maximum allowed age' {
@@ -414,6 +759,55 @@ Test-Case 'secret protection masks Discord webhooks embedded in other text' {
 
     Assert-Equal -Expected 'Send to https://discord.com/api/webhooks/*** when ready' `
         -Actual (Protect-AIFishBotSecret -Text $text)
+}
+
+Test-Case 'secret protection and logs mask common Discord webhook URL variants' {
+    $runDirectory = New-TestDirectory
+    try {
+        $cases = @(
+            [pscustomobject]@{
+                Url = 'https://discordapp.com/api/webhooks/111aaa/tokenOne'
+                Id = '111aaa'
+                Token = 'tokenOne'
+            },
+            [pscustomobject]@{
+                Url = 'https://canary.discord.com/api/v10/webhooks/222bbb/tokenTwo'
+                Id = '222bbb'
+                Token = 'tokenTwo'
+            },
+            [pscustomobject]@{
+                Url = 'https://ptb.discord.com/api/v9/webhooks/333ccc/tokenThree?wait=true'
+                Id = '333ccc'
+                Token = 'tokenThree'
+            },
+            [pscustomobject]@{
+                Url = 'https:\/\/discord.com\/api\/v10\/webhooks\/444ddd\/tokenFour'
+                Id = '444ddd'
+                Token = 'tokenFour'
+            }
+        )
+
+        foreach ($case in $cases) {
+            $protected = Protect-AIFishBotSecret -Text ('Before {0} after' -f $case.Url)
+            Assert-True -Condition ($protected.Contains('***'))
+            Assert-True -Condition (-not $protected.Contains($case.Id))
+            Assert-True -Condition (-not $protected.Contains($case.Token))
+            Write-AIFishBotLog -RunDirectory $runDirectory -Level Info -Message $case.Url `
+                -Now ([datetimeoffset]'2026-07-13T13:00:00+08:00') | Out-Null
+        }
+
+        $logPath = Join-Path -Path $runDirectory -ChildPath 'logs\2026-07-13.log'
+        $logText = [System.IO.File]::ReadAllText(
+            $logPath,
+            (New-Object System.Text.UTF8Encoding($false, $true)))
+        foreach ($case in $cases) {
+            Assert-True -Condition (-not $logText.Contains($case.Id))
+            Assert-True -Condition (-not $logText.Contains($case.Token))
+        }
+    }
+    finally {
+        Remove-RuntimeTestDirectory -Path $runDirectory
+    }
 }
 
 Test-Case 'dated logs contain levels and never expose Discord webhook tokens' {
@@ -450,6 +844,171 @@ Test-Case 'logs preserve the complete warning level name' {
         $text = [System.IO.File]::ReadAllText($path, (New-Object System.Text.UTF8Encoding($false, $true)))
 
         Assert-True -Condition ($text.Contains('[WARNING]'))
+    }
+    finally {
+        Remove-RuntimeTestDirectory -Path $runDirectory
+    }
+}
+
+Test-Case 'log append retries a temporary external reader lock without losing the entry' {
+    $runDirectory = New-TestDirectory
+    $locker = $null
+    $ready = $null
+    try {
+        $logPath = Write-AIFishBotLog -RunDirectory $runDirectory -Level Info -Message 'first' `
+            -Now ([datetimeoffset]'2026-07-13T14:00:00+08:00')
+        $ready = New-Object System.Threading.ManualResetEventSlim($false)
+        $locker = [powershell]::Create()
+        [void]$locker.AddScript({
+                param($path, $readySignal)
+                $stream = New-Object System.IO.FileStream(
+                    $path,
+                    [System.IO.FileMode]::Open,
+                    [System.IO.FileAccess]::Read,
+                    [System.IO.FileShare]::Read)
+                try {
+                    $readySignal.Set()
+                    Start-Sleep -Milliseconds 350
+                }
+                finally {
+                    $stream.Dispose()
+                }
+            }).AddArgument($logPath).AddArgument($ready)
+        $async = $locker.BeginInvoke()
+        Assert-Equal -Expected $true -Actual $ready.Wait(5000)
+
+        Write-AIFishBotLog -RunDirectory $runDirectory -Level Info -Message 'second' `
+            -Now ([datetimeoffset]'2026-07-13T14:00:01+08:00') `
+            -RetryCount 20 -RetryDelayMilliseconds 25 | Out-Null
+        [void]$locker.EndInvoke($async)
+
+        $text = [System.IO.File]::ReadAllText(
+            $logPath,
+            (New-Object System.Text.UTF8Encoding($false, $true)))
+        Assert-True -Condition ($text.Contains('first'))
+        Assert-True -Condition ($text.Contains('second'))
+    }
+    finally {
+        if ($null -ne $ready) {
+            $ready.Dispose()
+        }
+        if ($null -ne $locker) {
+            $locker.Dispose()
+        }
+        Remove-RuntimeTestDirectory -Path $runDirectory
+    }
+}
+
+Test-Case 'log append reports a clear error after its finite retries are exhausted' {
+    $runDirectory = New-TestDirectory
+    $lockStream = $null
+    try {
+        $logPath = Write-AIFishBotLog -RunDirectory $runDirectory -Level Info -Message 'first' `
+            -Now ([datetimeoffset]'2026-07-13T14:10:00+08:00')
+        $lockStream = New-Object System.IO.FileStream(
+            $logPath,
+            [System.IO.FileMode]::Open,
+            [System.IO.FileAccess]::Read,
+            [System.IO.FileShare]::Read)
+
+        Assert-Throws -ScriptBlock {
+            Write-AIFishBotLog -RunDirectory $runDirectory -Level Error -Message 'blocked' `
+                -Now ([datetimeoffset]'2026-07-13T14:10:01+08:00') `
+                -RetryCount 1 -RetryDelayMilliseconds 10
+        } -MessageLike '*Unable to append*log*after*attempts*'
+    }
+    finally {
+        if ($null -ne $lockStream) {
+            $lockStream.Dispose()
+        }
+        Remove-RuntimeTestDirectory -Path $runDirectory
+    }
+}
+
+Test-Case 'cross-process log readers and appenders preserve every complete entry' {
+    $runDirectory = New-TestDirectory
+    $jobs = @()
+    try {
+        $logPath = Write-AIFishBotLog -RunDirectory $runDirectory -Level Info -Message 'seed' `
+            -Now ([datetimeoffset]'2026-07-13T14:20:00+08:00')
+        $jobs += Start-Job -ScriptBlock {
+            param($path)
+            $encoding = New-Object System.Text.UTF8Encoding($false, $true)
+            $successfulReads = 0
+            foreach ($iteration in 0..99) {
+                try {
+                    [void][System.IO.File]::ReadAllText($path, $encoding)
+                    $successfulReads += 1
+                }
+                catch [System.IO.IOException] {
+                }
+                Start-Sleep -Milliseconds 10
+            }
+            if ($successfulReads -eq 0) {
+                throw 'The ordinary log reader never completed a read.'
+            }
+            return $true
+        } -ArgumentList $logPath
+
+        foreach ($writerNumber in 0..2) {
+            $jobs += Start-Job -ScriptBlock {
+                param($modulePath, $directoryPath, $writer)
+                Import-Module -Name $modulePath -Force -ErrorAction Stop
+                foreach ($iteration in 0..14) {
+                    Write-AIFishBotLog -RunDirectory $directoryPath -Level Info `
+                        -Message ('writer-{0}-{1}' -f $writer, $iteration) `
+                        -Now ([datetimeoffset]'2026-07-13T14:20:01+08:00') | Out-Null
+                }
+                return $true
+            } -ArgumentList $script:RuntimeModulePath, $runDirectory, $writerNumber
+        }
+
+        foreach ($job in $jobs) {
+            Wait-Job -Job $job -Timeout 20 | Out-Null
+            Assert-Equal -Expected 'Completed' -Actual ([string]$job.State)
+            Assert-Equal -Expected @($true) -Actual @(Receive-Job -Job $job -ErrorAction Stop)
+        }
+
+        $lines = @([System.IO.File]::ReadAllLines(
+                $logPath,
+                (New-Object System.Text.UTF8Encoding($false, $true))))
+        Assert-Equal -Expected 46 -Actual $lines.Count
+        foreach ($writerNumber in 0..2) {
+            foreach ($iteration in 0..14) {
+                Assert-True -Condition ([bool]($lines -match ('writer-{0}-{1}$' -f $writerNumber, $iteration)))
+            }
+        }
+    }
+    finally {
+        foreach ($job in $jobs) {
+            if ($job.State -eq 'Running') {
+                Stop-Job -Job $job
+            }
+            Remove-Job -Job $job -Force
+        }
+        Remove-RuntimeTestDirectory -Path $runDirectory
+    }
+}
+
+Test-Case 'logs remove every newline and Unicode line separator from messages' {
+    $runDirectory = New-TestDirectory
+    try {
+        $nel = [char]0x0085
+        $lineSeparator = [char]0x2028
+        $paragraphSeparator = [char]0x2029
+        $message = 'one' + "`r`n" + 'two' + $nel + 'three' +
+            $lineSeparator + 'four' + $paragraphSeparator + 'five'
+        $logPath = Write-AIFishBotLog -RunDirectory $runDirectory -Level Info -Message $message `
+            -Now ([datetimeoffset]'2026-07-13T15:00:00+08:00')
+        $text = [System.IO.File]::ReadAllText(
+            $logPath,
+            (New-Object System.Text.UTF8Encoding($false, $true)))
+
+        Assert-True -Condition ($text.Contains('one two three four five'))
+        Assert-True -Condition (-not $text.Contains([string]$nel))
+        Assert-True -Condition (-not $text.Contains([string]$lineSeparator))
+        Assert-True -Condition (-not $text.Contains([string]$paragraphSeparator))
+        Assert-Equal -Expected 1 -Actual @($text.TrimEnd() -split '[\r\n]+').Count
     }
     finally {
         Remove-RuntimeTestDirectory -Path $runDirectory

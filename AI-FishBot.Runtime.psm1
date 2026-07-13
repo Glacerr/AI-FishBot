@@ -2,6 +2,16 @@ Set-StrictMode -Version Latest
 
 $script:AIFishBotRuntimeUtf8 = New-Object System.Text.UTF8Encoding($false, $true)
 $script:AIFishBotRuntimeRandom = New-Object System.Random
+$script:AIFishBotRuntimeRandomLock = New-Object object
+$script:AIFishBotAllowedStates = @(
+    'starting',
+    'running',
+    'stopping',
+    'stopped',
+    'completed',
+    'failed',
+    'error'
+)
 $script:AIFishBotStatusFields = @(
     'processId',
     'state',
@@ -171,38 +181,61 @@ function Read-AIFishBotJson {
     )
 
     $fullPath = [System.IO.Path]::GetFullPath($Path)
-    if (-not [System.IO.File]::Exists($fullPath)) {
-        throw (New-Object System.IO.FileNotFoundException('The JSON file was not found.', $fullPath))
-    }
-
-    try {
-        $bytes = [System.IO.File]::ReadAllBytes($fullPath)
-        $offset = 0
-        if ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF) {
-            $offset = 3
-        }
-        elseif (($bytes.Length -ge 2 -and (($bytes[0] -eq 0xFF -and $bytes[1] -eq 0xFE) -or
-                    ($bytes[0] -eq 0xFE -and $bytes[1] -eq 0xFF))) -or
-            ($bytes.Length -ge 4 -and (($bytes[0] -eq 0x00 -and $bytes[1] -eq 0x00 -and
-                        $bytes[2] -eq 0xFE -and $bytes[3] -eq 0xFF) -or
-                    ($bytes[0] -eq 0xFF -and $bytes[1] -eq 0xFE -and
-                        $bytes[2] -eq 0x00 -and $bytes[3] -eq 0x00)))) {
-            throw 'The JSON file must use UTF-8 encoding.'
+    $directoryPath = [System.IO.Path]::GetDirectoryName($fullPath)
+    Invoke-AIFishBotRuntimeLocked -DirectoryPath $directoryPath -ScriptBlock {
+        if (-not [System.IO.File]::Exists($fullPath)) {
+            throw (New-Object System.IO.FileNotFoundException('The JSON file was not found.', $fullPath))
         }
 
-        $json = $script:AIFishBotRuntimeUtf8.GetString($bytes, $offset, $bytes.Length - $offset)
-        if ([string]::IsNullOrWhiteSpace($json)) {
-            throw 'The JSON file is empty.'
+        try {
+            $fileShare = [System.IO.FileShare]([int][System.IO.FileShare]::ReadWrite -bor
+                [int][System.IO.FileShare]::Delete)
+            $stream = New-Object System.IO.FileStream(
+                $fullPath,
+                [System.IO.FileMode]::Open,
+                [System.IO.FileAccess]::Read,
+                $fileShare)
+            try {
+                $memory = New-Object System.IO.MemoryStream
+                try {
+                    $stream.CopyTo($memory)
+                    $bytes = $memory.ToArray()
+                }
+                finally {
+                    $memory.Dispose()
+                }
+            }
+            finally {
+                $stream.Dispose()
+            }
+
+            $offset = 0
+            if ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF) {
+                $offset = 3
+            }
+            elseif (($bytes.Length -ge 2 -and (($bytes[0] -eq 0xFF -and $bytes[1] -eq 0xFE) -or
+                        ($bytes[0] -eq 0xFE -and $bytes[1] -eq 0xFF))) -or
+                ($bytes.Length -ge 4 -and (($bytes[0] -eq 0x00 -and $bytes[1] -eq 0x00 -and
+                            $bytes[2] -eq 0xFE -and $bytes[3] -eq 0xFF) -or
+                        ($bytes[0] -eq 0xFF -and $bytes[1] -eq 0xFE -and
+                            $bytes[2] -eq 0x00 -and $bytes[3] -eq 0x00)))) {
+                throw 'The JSON file must use UTF-8 encoding.'
+            }
+
+            $json = $script:AIFishBotRuntimeUtf8.GetString($bytes, $offset, $bytes.Length - $offset)
+            if ([string]::IsNullOrWhiteSpace($json)) {
+                throw 'The JSON file is empty.'
+            }
+            return ($json | ConvertFrom-Json -ErrorAction Stop)
         }
-        return ($json | ConvertFrom-Json -ErrorAction Stop)
-    }
-    catch [System.IO.FileNotFoundException] {
-        throw
-    }
-    catch {
-        throw (New-Object System.IO.InvalidDataException(
-                ('The JSON file is invalid: {0}' -f $_.Exception.Message),
-                $_.Exception))
+        catch [System.IO.FileNotFoundException] {
+            throw
+        }
+        catch {
+            throw (New-Object System.IO.InvalidDataException(
+                    ('The JSON file is invalid: {0}' -f $_.Exception.Message),
+                    $_.Exception))
+        }
     }
 }
 
@@ -415,6 +448,11 @@ function ConvertTo-AIFishBotDateTimeOffsetText {
         throw ('The protocol field "{0}" cannot be null.' -f $FieldName)
     }
 
+    if ($Value -isnot [string] -and $Value -isnot [datetime] -and
+        $Value -isnot [datetimeoffset]) {
+        throw ('The protocol field "{0}" is not a valid timestamp.' -f $FieldName)
+    }
+
     $parsed = [datetimeoffset]::MinValue
     if ($Value -is [datetimeoffset]) {
         $parsed = $Value
@@ -432,6 +470,70 @@ function ConvertTo-AIFishBotDateTimeOffsetText {
     return $parsed.ToString('o', [System.Globalization.CultureInfo]::InvariantCulture)
 }
 
+function ConvertTo-AIFishBotNonNegativeInteger {
+    param(
+        [Parameter(Mandatory = $true)]
+        [AllowNull()]
+        [object]$Value,
+
+        [Parameter(Mandatory = $true)]
+        [string]$FieldName
+    )
+
+    $isIntegerType = $Value -is [sbyte] -or $Value -is [byte] -or
+        $Value -is [int16] -or $Value -is [uint16] -or
+        $Value -is [int32] -or $Value -is [uint32] -or
+        $Value -is [int64] -or $Value -is [uint64]
+    if (-not $isIntegerType) {
+        throw ('The protocol field "{0}" must be a non-negative integer.' -f $FieldName)
+    }
+
+    try {
+        $decimalValue = [convert]::ToDecimal(
+            $Value,
+            [System.Globalization.CultureInfo]::InvariantCulture)
+    }
+    catch {
+        throw ('The protocol field "{0}" must be a non-negative integer.' -f $FieldName)
+    }
+    if ($decimalValue -lt 0 -or $decimalValue -gt [int]::MaxValue) {
+        throw ('The protocol field "{0}" must be a non-negative integer.' -f $FieldName)
+    }
+    return [int]$decimalValue
+}
+
+function ConvertTo-AIFishBotRemainingSeconds {
+    param(
+        [AllowNull()]
+        [object]$Value
+    )
+
+    if ($null -eq $Value) {
+        return $null
+    }
+    $isNumericType = $Value -is [sbyte] -or $Value -is [byte] -or
+        $Value -is [int16] -or $Value -is [uint16] -or
+        $Value -is [int32] -or $Value -is [uint32] -or
+        $Value -is [int64] -or $Value -is [uint64] -or
+        $Value -is [single] -or $Value -is [double] -or $Value -is [decimal]
+    if (-not $isNumericType) {
+        throw 'The protocol field "remainingSeconds" must be null or a non-negative number.'
+    }
+
+    try {
+        $converted = [convert]::ToDouble(
+            $Value,
+            [System.Globalization.CultureInfo]::InvariantCulture)
+    }
+    catch {
+        throw 'The protocol field "remainingSeconds" must be null or a non-negative number.'
+    }
+    if ([double]::IsNaN($converted) -or [double]::IsInfinity($converted) -or $converted -lt 0) {
+        throw 'The protocol field "remainingSeconds" must be null or a non-negative number.'
+    }
+    return [double]$converted
+}
+
 function ConvertTo-AIFishBotStatusObject {
     param(
         [Parameter(Mandatory = $true)]
@@ -443,39 +545,50 @@ function ConvertTo-AIFishBotStatusObject {
         throw 'Status cannot be null.'
     }
 
-    $lastError = Get-AIFishBotRequiredProtocolValue -InputObject $Status -Name 'lastError'
-    if ($null -ne $lastError -and $lastError -isnot [string]) {
-        throw 'The protocol field "lastError" must be text or null.'
-    }
-
-    $remainingSeconds = Get-AIFishBotRequiredProtocolValue -InputObject $Status -Name 'remainingSeconds'
-    if ($null -ne $remainingSeconds) {
-        try {
-            $remainingSeconds = [convert]::ToDouble(
-                $remainingSeconds,
-                [System.Globalization.CultureInfo]::InvariantCulture)
-        }
-        catch {
-            throw 'The protocol field "remainingSeconds" must be numeric or null.'
-        }
-    }
-
     try {
+        $stateValue = Get-AIFishBotRequiredProtocolValue -InputObject $Status -Name 'state'
+        if ($stateValue -isnot [string] -or [string]::IsNullOrWhiteSpace($stateValue)) {
+            throw 'The protocol field "state" must be a supported non-empty string.'
+        }
+        $stateValue = $stateValue.Trim().ToLowerInvariant()
+        if ($script:AIFishBotAllowedStates -notcontains $stateValue) {
+            throw ('The protocol field "state" has an unsupported value: {0}' -f $stateValue)
+        }
+
+        $profileName = Get-AIFishBotRequiredProtocolValue -InputObject $Status -Name 'profileName'
+        if ($profileName -isnot [string] -or [string]::IsNullOrWhiteSpace($profileName)) {
+            throw 'The protocol field "profileName" must be a non-empty string.'
+        }
+
+        $lastError = Get-AIFishBotRequiredProtocolValue -InputObject $Status -Name 'lastError'
+        if ($null -ne $lastError -and $lastError -isnot [string]) {
+            throw 'The protocol field "lastError" must be text or null.'
+        }
+
         return [pscustomobject][ordered]@{
-            processId = [convert]::ToInt32((Get-AIFishBotRequiredProtocolValue -InputObject $Status -Name 'processId'))
-            state = [string](Get-AIFishBotRequiredProtocolValue -InputObject $Status -Name 'state')
-            hookCount = [convert]::ToInt32((Get-AIFishBotRequiredProtocolValue -InputObject $Status -Name 'hookCount'))
-            retryCount = [convert]::ToInt32((Get-AIFishBotRequiredProtocolValue -InputObject $Status -Name 'retryCount'))
-            profileName = [string](Get-AIFishBotRequiredProtocolValue -InputObject $Status -Name 'profileName')
+            processId = ConvertTo-AIFishBotNonNegativeInteger `
+                -Value (Get-AIFishBotRequiredProtocolValue -InputObject $Status -Name 'processId') `
+                -FieldName 'processId'
+            state = $stateValue
+            hookCount = ConvertTo-AIFishBotNonNegativeInteger `
+                -Value (Get-AIFishBotRequiredProtocolValue -InputObject $Status -Name 'hookCount') `
+                -FieldName 'hookCount'
+            retryCount = ConvertTo-AIFishBotNonNegativeInteger `
+                -Value (Get-AIFishBotRequiredProtocolValue -InputObject $Status -Name 'retryCount') `
+                -FieldName 'retryCount'
+            profileName = $profileName
             startedAt = ConvertTo-AIFishBotDateTimeOffsetText `
                 -Value (Get-AIFishBotRequiredProtocolValue -InputObject $Status -Name 'startedAt') `
                 -FieldName 'startedAt'
-            remainingSeconds = $remainingSeconds
+            remainingSeconds = ConvertTo-AIFishBotRemainingSeconds `
+                -Value (Get-AIFishBotRequiredProtocolValue -InputObject $Status -Name 'remainingSeconds')
             lastError = $lastError
             heartbeatAt = ConvertTo-AIFishBotDateTimeOffsetText `
                 -Value (Get-AIFishBotRequiredProtocolValue -InputObject $Status -Name 'heartbeatAt') `
-                -FieldName 'heartbeatAt' -AllowNull
-            configVersion = [convert]::ToInt32((Get-AIFishBotRequiredProtocolValue -InputObject $Status -Name 'configVersion'))
+                -FieldName 'heartbeatAt'
+            configVersion = ConvertTo-AIFishBotNonNegativeInteger `
+                -Value (Get-AIFishBotRequiredProtocolValue -InputObject $Status -Name 'configVersion') `
+                -FieldName 'configVersion'
         }
     }
     catch {
@@ -627,12 +740,18 @@ function Test-AIFishBotHeartbeatFresh {
         [datetimeoffset]$Now = $([datetimeoffset]::UtcNow),
 
         [Parameter(Mandatory = $true)]
-        [double]$MaxAgeSeconds
+        [double]$MaxAgeSeconds,
+
+        [double]$FutureToleranceSeconds = 2
     )
 
     if ([double]::IsNaN($MaxAgeSeconds) -or [double]::IsInfinity($MaxAgeSeconds) -or
         $MaxAgeSeconds -lt 0) {
         throw 'MaxAgeSeconds must be a finite non-negative number.'
+    }
+    if ([double]::IsNaN($FutureToleranceSeconds) -or
+        [double]::IsInfinity($FutureToleranceSeconds) -or $FutureToleranceSeconds -lt 0) {
+        throw 'FutureToleranceSeconds must be a finite non-negative number.'
     }
 
     $heartbeatValue = $null
@@ -675,7 +794,7 @@ function Test-AIFishBotHeartbeatFresh {
     }
 
     if ($parsed -gt $Now) {
-        return $false
+        return (($parsed - $Now).TotalSeconds -le $FutureToleranceSeconds)
     }
     return (($Now - $parsed).TotalSeconds -le $MaxAgeSeconds)
 }
@@ -693,11 +812,13 @@ function Protect-AIFishBotSecret {
         if ($null -eq $Text) {
             return $null
         }
-        $pattern = 'https://discord\.com/api/webhooks/[A-Za-z0-9_-]+/[A-Za-z0-9._-]+(?:\?[^\s<>"'']*)?'
+        $pattern = '(?<prefix>https:(?:\\/|/){2}(?:(?:canary|ptb)\.)?discord(?:app)?\.com' +
+            '(?:\\/|/)api(?:(?:\\/|/)v[0-9]+)?(?:\\/|/)webhooks(?:\\/|/))' +
+            '[A-Za-z0-9_-]+(?:\\/|/)[A-Za-z0-9._-]+(?:\?[^\s<>"'']*)?'
         return [regex]::Replace(
             $Text,
             $pattern,
-            'https://discord.com/api/webhooks/***',
+            '${prefix}***',
             [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
     }
 }
@@ -716,7 +837,13 @@ function Write-AIFishBotLog {
         [AllowEmptyString()]
         [string]$Message,
 
-        [datetimeoffset]$Now = $([datetimeoffset]::Now)
+        [datetimeoffset]$Now = $([datetimeoffset]::Now),
+
+        [ValidateRange(0, 1000)]
+        [int]$RetryCount = 20,
+
+        [ValidateRange(0, 60000)]
+        [int]$RetryDelayMilliseconds = 50
     )
 
     $normalizedLevel = $Level.Trim().ToUpperInvariant()
@@ -730,7 +857,7 @@ function Write-AIFishBotLog {
     }
     $logsDirectory = Join-Path -Path $fullRunDirectory -ChildPath 'logs'
     $logPath = Join-Path -Path $logsDirectory -ChildPath ($Now.ToString('yyyy-MM-dd') + '.log')
-    $safeMessage = (Protect-AIFishBotSecret -Text $Message) -replace '[\r\n]+', ' '
+    $safeMessage = (Protect-AIFishBotSecret -Text $Message) -replace '[\r\n\u0085\u2028\u2029]+', ' '
     $line = '{0} [{1}] {2}{3}' -f `
         $Now.ToString('o', [System.Globalization.CultureInfo]::InvariantCulture),
         $normalizedLevel,
@@ -742,17 +869,37 @@ function Write-AIFishBotLog {
             [void][System.IO.Directory]::CreateDirectory($logsDirectory)
         }
         $bytes = $script:AIFishBotRuntimeUtf8.GetBytes($line)
-        $stream = New-Object System.IO.FileStream(
-            $logPath,
-            [System.IO.FileMode]::Append,
-            [System.IO.FileAccess]::Write,
-            [System.IO.FileShare]::Read)
-        try {
-            $stream.Write($bytes, 0, $bytes.Length)
-            $stream.Flush($true)
-        }
-        finally {
-            $stream.Dispose()
+        $fileShare = [System.IO.FileShare]([int][System.IO.FileShare]::ReadWrite -bor
+            [int][System.IO.FileShare]::Delete)
+        for ($attempt = 0; $attempt -le $RetryCount; $attempt += 1) {
+            $stream = $null
+            try {
+                $stream = New-Object System.IO.FileStream(
+                    $logPath,
+                    [System.IO.FileMode]::Append,
+                    [System.IO.FileAccess]::Write,
+                    $fileShare)
+                $stream.Write($bytes, 0, $bytes.Length)
+                $stream.Flush($true)
+                return
+            }
+            catch [System.IO.IOException] {
+                if ($attempt -ge $RetryCount) {
+                    throw (New-Object System.IO.IOException(
+                            ('Unable to append the log after {0} attempts: {1}' -f
+                                ($attempt + 1), $_.Exception.Message),
+                            $_.Exception))
+                }
+            }
+            finally {
+                if ($null -ne $stream) {
+                    $stream.Dispose()
+                }
+            }
+
+            if ($RetryDelayMilliseconds -gt 0) {
+                Start-Sleep -Milliseconds $RetryDelayMilliseconds
+            }
         }
     }
     return $logPath
@@ -851,12 +998,18 @@ function Get-AIFishBotDelayMilliseconds {
         return [int]$providedDecimal
     }
 
-    if ($maximumMilliseconds -lt [int]::MaxValue) {
-        return $script:AIFishBotRuntimeRandom.Next($minimumMilliseconds, $maximumMilliseconds + 1)
+    [System.Threading.Monitor]::Enter($script:AIFishBotRuntimeRandomLock)
+    try {
+        if ($maximumMilliseconds -lt [int]::MaxValue) {
+            return $script:AIFishBotRuntimeRandom.Next($minimumMilliseconds, $maximumMilliseconds + 1)
+        }
+        $inclusiveWidth = ([long]$maximumMilliseconds - [long]$minimumMilliseconds) + 1
+        return [int]([long]$minimumMilliseconds +
+            [long][math]::Floor($script:AIFishBotRuntimeRandom.NextDouble() * $inclusiveWidth))
     }
-    $inclusiveWidth = ([long]$maximumMilliseconds - [long]$minimumMilliseconds) + 1
-    return [int]([long]$minimumMilliseconds +
-        [long][math]::Floor($script:AIFishBotRuntimeRandom.NextDouble() * $inclusiveWidth))
+    finally {
+        [System.Threading.Monitor]::Exit($script:AIFishBotRuntimeRandomLock)
+    }
 }
 
 Export-ModuleMember -Function @(
