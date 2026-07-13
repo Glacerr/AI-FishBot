@@ -2,6 +2,8 @@
     return @([IO.Ports.SerialPort]::GetPortNames())
 }
 
+$script:AIFishBotUtf8Encoding = New-Object System.Text.UTF8Encoding($false, $true)
+
 function Get-AIFishBotAvailablePorts {
     return @(& $script:AIFishBotPortProvider)
 }
@@ -358,6 +360,63 @@ function Get-AIFishBotProfilePath {
     return $profilePath
 }
 
+function Get-AIFishBotProfilesMutexName {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$ProfilesDirectory
+    )
+
+    $directoryPath = [System.IO.Path]::GetFullPath($ProfilesDirectory)
+    $rootPath = [System.IO.Path]::GetPathRoot($directoryPath)
+    if ($directoryPath.Length -gt $rootPath.Length) {
+        $directoryPath = $directoryPath.TrimEnd(
+            [System.IO.Path]::DirectorySeparatorChar,
+            [System.IO.Path]::AltDirectorySeparatorChar)
+    }
+
+    $canonicalPath = $directoryPath.ToUpperInvariant()
+    $hashAlgorithm = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $hash = $hashAlgorithm.ComputeHash($script:AIFishBotUtf8Encoding.GetBytes($canonicalPath))
+    }
+    finally {
+        $hashAlgorithm.Dispose()
+    }
+
+    $hashText = [System.BitConverter]::ToString($hash).Replace('-', '').Substring(0, 32)
+    return 'Local\AI-FishBot.Profiles.{0}' -f $hashText
+}
+
+function Invoke-AIFishBotProfilesLocked {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$ProfilesDirectory,
+
+        [Parameter(Mandatory = $true)]
+        [scriptblock]$ScriptBlock
+    )
+
+    $mutexName = Get-AIFishBotProfilesMutexName -ProfilesDirectory $ProfilesDirectory
+    $mutex = New-Object System.Threading.Mutex($false, $mutexName)
+    $ownsMutex = $false
+    try {
+        try {
+            $ownsMutex = $mutex.WaitOne()
+        }
+        catch [System.Threading.AbandonedMutexException] {
+            $ownsMutex = $true
+        }
+
+        & $ScriptBlock
+    }
+    finally {
+        if ($ownsMutex) {
+            $mutex.ReleaseMutex()
+        }
+        $mutex.Dispose()
+    }
+}
+
 function Get-AIFishBotProfiles {
     [CmdletBinding()]
     param(
@@ -411,16 +470,117 @@ function Assert-AIFishBotPersistableConfig {
     throw ('方案配置无效：{0}' -f $details)
 }
 
+function Assert-AIFishBotObjectGraphNode {
+    param(
+        [AllowNull()]
+        [object]$Value,
+
+        [Parameter(Mandatory = $true)]
+        [int]$Depth,
+
+        [Parameter(Mandatory = $true)]
+        [int]$MaximumDepth,
+
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyCollection()]
+        [System.Collections.Generic.List[object]]$Ancestors
+    )
+
+    if ($null -eq $Value -or $Value -is [string] -or $Value.GetType().IsValueType) {
+        return
+    }
+
+    if ($Depth -gt $MaximumDepth) {
+        throw ('方案配置对象层级超过安全上限（{0}层）。' -f $MaximumDepth)
+    }
+
+    foreach ($ancestor in $Ancestors) {
+        if ([object]::ReferenceEquals($ancestor, $Value)) {
+            throw '方案配置不能包含循环引用。'
+        }
+    }
+
+    $Ancestors.Add($Value)
+    try {
+        if ($Value -is [System.Collections.IDictionary]) {
+            foreach ($key in @($Value.Keys)) {
+                Assert-AIFishBotObjectGraphNode -Value $Value[$key] -Depth ($Depth + 1) -MaximumDepth $MaximumDepth -Ancestors $Ancestors
+            }
+            return
+        }
+
+        if ($Value -is [System.Collections.IEnumerable]) {
+            foreach ($item in $Value) {
+                Assert-AIFishBotObjectGraphNode -Value $item -Depth ($Depth + 1) -MaximumDepth $MaximumDepth -Ancestors $Ancestors
+            }
+            return
+        }
+
+        foreach ($property in $Value.PSObject.Properties) {
+            if ($property.MemberType -eq [System.Management.Automation.PSMemberTypes]::NoteProperty -or
+                $property.MemberType -eq [System.Management.Automation.PSMemberTypes]::Property) {
+                Assert-AIFishBotObjectGraphNode -Value $property.Value -Depth ($Depth + 1) -MaximumDepth $MaximumDepth -Ancestors $Ancestors
+            }
+        }
+    }
+    finally {
+        $Ancestors.RemoveAt($Ancestors.Count - 1)
+    }
+}
+
+function Assert-AIFishBotObjectGraph {
+    param(
+        [Parameter(Mandatory = $true)]
+        [AllowNull()]
+        [object]$Value,
+
+        [int]$MaximumDepth = 20
+    )
+
+    $ancestors = New-Object 'System.Collections.Generic.List[object]'
+    Assert-AIFishBotObjectGraphNode -Value $Value -Depth 0 -MaximumDepth $MaximumDepth -Ancestors $ancestors
+}
+
+function Read-AIFishBotUtf8Text {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Description
+    )
+
+    try {
+        return [System.IO.File]::ReadAllText($Path, $script:AIFishBotUtf8Encoding)
+    }
+    catch [System.Text.DecoderFallbackException] {
+        $invalidEncodingError = New-Object System.IO.InvalidDataException(
+            ('{0}不是有效的UTF-8文件。' -f $Description),
+            $_.Exception)
+        throw $invalidEncodingError
+    }
+}
+
 function Read-AIFishBotConfigFile {
     param(
         [Parameter(Mandatory = $true)]
-        [string]$Path
+        [string]$Path,
+
+        [Parameter(Mandatory = $true)]
+        [string]$ExpectedProfileName
     )
 
-    $json = [System.IO.File]::ReadAllText($Path, [System.Text.Encoding]::UTF8)
+    $json = Read-AIFishBotUtf8Text -Path $Path -Description '方案JSON'
     try {
         $config = $json | ConvertFrom-Json -ErrorAction Stop
         Assert-AIFishBotPersistableConfig -Config $config
+        $actualProfileName = [string](Get-AIFishBotConfigValue -InputObject $config -Name 'profileName')
+        if (-not [string]::Equals(
+                $actualProfileName,
+                $ExpectedProfileName,
+                [System.StringComparison]::Ordinal)) {
+            throw ('JSON内的方案名称“{0}”与文件名“{1}”不一致。' -f $actualProfileName, $ExpectedProfileName)
+        }
         return $config
     }
     catch {
@@ -457,7 +617,7 @@ function Restore-AIFishBotProfileBackup {
     }
 }
 
-function Read-AIFishBotProfile {
+function Read-AIFishBotProfileCore {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)]
@@ -474,7 +634,14 @@ function Read-AIFishBotProfile {
     }
 
     try {
-        return Read-AIFishBotConfigFile -Path $profilePath
+        return Read-AIFishBotConfigFile -Path $profilePath -ExpectedProfileName $normalizedName
+    }
+    catch [System.IO.InvalidDataException] {
+        $profileError = $_.Exception.Message
+    }
+
+    try {
+        return Read-AIFishBotConfigFile -Path $profilePath -ExpectedProfileName $normalizedName
     }
     catch [System.IO.InvalidDataException] {
         $profileError = $_.Exception.Message
@@ -483,7 +650,7 @@ function Read-AIFishBotProfile {
     $backupPath = $profilePath + '.backup'
     if (Test-Path -LiteralPath $backupPath -PathType Leaf) {
         try {
-            $backupConfig = Read-AIFishBotConfigFile -Path $backupPath
+            $backupConfig = Read-AIFishBotConfigFile -Path $backupPath -ExpectedProfileName $normalizedName
         }
         catch [System.IO.InvalidDataException] {
             throw ('方案“{0}”已损坏，备份也无法恢复。原错误：{1}' -f $normalizedName, $profileError)
@@ -501,7 +668,22 @@ function Read-AIFishBotProfile {
     throw ('方案“{0}”已损坏，且没有可用备份。原错误：{1}' -f $normalizedName, $profileError)
 }
 
-function Save-AIFishBotProfile {
+function Read-AIFishBotProfile {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$ProfilesDirectory,
+
+        [Parameter(Mandatory = $true)]
+        [string]$ProfileName
+    )
+
+    Invoke-AIFishBotProfilesLocked -ProfilesDirectory $ProfilesDirectory -ScriptBlock {
+        Read-AIFishBotProfileCore -ProfilesDirectory $ProfilesDirectory -ProfileName $ProfileName
+    }
+}
+
+function Save-AIFishBotProfileCore {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)]
@@ -513,7 +695,9 @@ function Save-AIFishBotProfile {
 
         [AllowNull()]
         [AllowEmptyString()]
-        [string]$ProfileName
+        [string]$ProfileName,
+
+        [switch]$CreateNew
     )
 
     if ($null -eq $Config) {
@@ -525,6 +709,8 @@ function Save-AIFishBotProfile {
         $effectiveName = [string](Get-AIFishBotConfigValue -InputObject $Config -Name 'profileName')
     }
     $normalizedName = ConvertTo-AIFishBotProfileName -ProfileName $effectiveName
+
+    Assert-AIFishBotObjectGraph -Value $Config -MaximumDepth 20
 
     try {
         $sourceJson = $Config | ConvertTo-Json -Depth 100 -Compress -ErrorAction Stop
@@ -549,14 +735,24 @@ function Save-AIFishBotProfile {
         New-Item -ItemType Directory -Path $directoryPath -Force -ErrorAction Stop | Out-Null
     }
 
+    if ($CreateNew -and (Test-Path -LiteralPath $profilePath)) {
+        throw ('方案“{0}”已存在。' -f $normalizedName)
+    }
+
     $temporaryPath = '{0}.{1}.tmp' -f $profilePath, [guid]::NewGuid().ToString('N')
     try {
         $json = $workingConfig | ConvertTo-Json -Depth 100 -ErrorAction Stop
-        $utf8WithoutBom = New-Object System.Text.UTF8Encoding($false)
-        [System.IO.File]::WriteAllText($temporaryPath, $json, $utf8WithoutBom)
-        $verifiedConfig = Read-AIFishBotConfigFile -Path $temporaryPath
+        [System.IO.File]::WriteAllText($temporaryPath, $json, $script:AIFishBotUtf8Encoding)
+        $verifiedConfig = Read-AIFishBotConfigFile -Path $temporaryPath -ExpectedProfileName $normalizedName
 
-        if (Test-Path -LiteralPath $profilePath -PathType Leaf) {
+        if ($CreateNew) {
+            $staleBackupPath = $profilePath + '.backup'
+            if (Test-Path -LiteralPath $staleBackupPath -PathType Leaf) {
+                Remove-Item -LiteralPath $staleBackupPath -Force -ErrorAction Stop
+            }
+            [System.IO.File]::Move($temporaryPath, $profilePath)
+        }
+        elseif (Test-Path -LiteralPath $profilePath -PathType Leaf) {
             [System.IO.File]::Replace($temporaryPath, $profilePath, ($profilePath + '.backup'))
         }
         else {
@@ -576,6 +772,37 @@ function Save-AIFishBotProfile {
     }
 }
 
+function Save-AIFishBotProfile {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$ProfilesDirectory,
+
+        [Parameter(Mandatory = $true)]
+        [AllowNull()]
+        [object]$Config,
+
+        [AllowNull()]
+        [AllowEmptyString()]
+        [string]$ProfileName,
+
+        [switch]$CreateNew
+    )
+
+    $hasProfileName = $PSBoundParameters.ContainsKey('ProfileName')
+    Invoke-AIFishBotProfilesLocked -ProfilesDirectory $ProfilesDirectory -ScriptBlock {
+        $parameters = @{
+            ProfilesDirectory = $ProfilesDirectory
+            Config = $Config
+            CreateNew = $CreateNew
+        }
+        if ($hasProfileName) {
+            $parameters.ProfileName = $ProfileName
+        }
+        Save-AIFishBotProfileCore @parameters
+    }
+}
+
 function Copy-AIFishBotProfile {
     [CmdletBinding()]
     param(
@@ -591,14 +818,16 @@ function Copy-AIFishBotProfile {
         [string]$DestinationProfileName
     )
 
-    $destinationName = ConvertTo-AIFishBotProfileName -ProfileName $DestinationProfileName
-    $destinationPath = Get-AIFishBotProfilePath -ProfilesDirectory $ProfilesDirectory -ProfileName $destinationName
-    if (Test-Path -LiteralPath $destinationPath) {
-        throw ('方案“{0}”已存在。' -f $destinationName)
-    }
+    Invoke-AIFishBotProfilesLocked -ProfilesDirectory $ProfilesDirectory -ScriptBlock {
+        $destinationName = ConvertTo-AIFishBotProfileName -ProfileName $DestinationProfileName
+        $destinationPath = Get-AIFishBotProfilePath -ProfilesDirectory $ProfilesDirectory -ProfileName $destinationName
+        if (Test-Path -LiteralPath $destinationPath) {
+            throw ('方案“{0}”已存在。' -f $destinationName)
+        }
 
-    $sourceConfig = Read-AIFishBotProfile -ProfilesDirectory $ProfilesDirectory -ProfileName $SourceProfileName
-    return Save-AIFishBotProfile -ProfilesDirectory $ProfilesDirectory -Config $sourceConfig -ProfileName $destinationName
+        $sourceConfig = Read-AIFishBotProfileCore -ProfilesDirectory $ProfilesDirectory -ProfileName $SourceProfileName
+        Save-AIFishBotProfileCore -ProfilesDirectory $ProfilesDirectory -Config $sourceConfig -ProfileName $destinationName -CreateNew
+    }
 }
 
 function Rename-AIFishBotProfile {
@@ -616,20 +845,22 @@ function Rename-AIFishBotProfile {
         [string]$ProfilesDirectory
     )
 
-    $oldName = ConvertTo-AIFishBotProfileName -ProfileName $ProfileName
-    $newName = ConvertTo-AIFishBotProfileName -ProfileName $NewProfileName
-    $newPath = Get-AIFishBotProfilePath -ProfilesDirectory $ProfilesDirectory -ProfileName $newName
-    if (Test-Path -LiteralPath $newPath) {
-        throw ('方案“{0}”已存在。' -f $newName)
-    }
+    Invoke-AIFishBotProfilesLocked -ProfilesDirectory $ProfilesDirectory -ScriptBlock {
+        $oldName = ConvertTo-AIFishBotProfileName -ProfileName $ProfileName
+        $newName = ConvertTo-AIFishBotProfileName -ProfileName $NewProfileName
+        $newPath = Get-AIFishBotProfilePath -ProfilesDirectory $ProfilesDirectory -ProfileName $newName
+        if (Test-Path -LiteralPath $newPath) {
+            throw ('方案“{0}”已存在。' -f $newName)
+        }
 
-    $config = Read-AIFishBotProfile -ProfilesDirectory $ProfilesDirectory -ProfileName $oldName
-    $savedConfig = Save-AIFishBotProfile -ProfilesDirectory $ProfilesDirectory -Config $config -ProfileName $newName
-    Remove-AIFishBotProfile -ProfilesDirectory $ProfilesDirectory -ProfileName $oldName
-    return $savedConfig
+        $config = Read-AIFishBotProfileCore -ProfilesDirectory $ProfilesDirectory -ProfileName $oldName
+        $savedConfig = Save-AIFishBotProfileCore -ProfilesDirectory $ProfilesDirectory -Config $config -ProfileName $newName -CreateNew
+        Remove-AIFishBotProfileCore -ProfilesDirectory $ProfilesDirectory -ProfileName $oldName
+        return $savedConfig
+    }
 }
 
-function Remove-AIFishBotProfile {
+function Remove-AIFishBotProfileCore {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)]
@@ -652,6 +883,21 @@ function Remove-AIFishBotProfile {
     }
 }
 
+function Remove-AIFishBotProfile {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$ProfilesDirectory,
+
+        [Parameter(Mandatory = $true)]
+        [string]$ProfileName
+    )
+
+    Invoke-AIFishBotProfilesLocked -ProfilesDirectory $ProfilesDirectory -ScriptBlock {
+        Remove-AIFishBotProfileCore -ProfilesDirectory $ProfilesDirectory -ProfileName $ProfileName
+    }
+}
+
 function Get-AIFishBotLegacyAssignments {
     param(
         [Parameter(Mandatory = $true)]
@@ -662,10 +908,11 @@ function Get-AIFishBotLegacyAssignments {
         throw ('找不到旧版配置脚本：{0}' -f $ScriptPath)
     }
 
+    $scriptText = Read-AIFishBotUtf8Text -Path ([System.IO.Path]::GetFullPath($ScriptPath)) -Description '旧版配置脚本'
     $tokens = $null
     $parseErrors = $null
-    $ast = [System.Management.Automation.Language.Parser]::ParseFile(
-        [System.IO.Path]::GetFullPath($ScriptPath),
+    $ast = [System.Management.Automation.Language.Parser]::ParseInput(
+        $scriptText,
         [ref]$tokens,
         [ref]$parseErrors)
     if (@($parseErrors).Count -gt 0) {
@@ -686,20 +933,30 @@ function Get-AIFishBotLegacyAssignments {
         }, $true)
 
     foreach ($assignment in $assignments) {
-        if ($assignment.Operator -ne [System.Management.Automation.Language.TokenKind]::Equals -or
-            $assignment.Left -isnot [System.Management.Automation.Language.VariableExpressionAst] -or
+        if ($assignment.Left -isnot [System.Management.Automation.Language.VariableExpressionAst] -or
             $assignment.Parent.Parent -ne $ast) {
             continue
         }
 
         $name = $assignment.Left.VariablePath.UserPath
         if ($name -eq 'enableBuffs') {
-            $enableBuffsText = $assignment.Right.Expression.Extent.Text
+            if ($assignment.Operator -eq [System.Management.Automation.Language.TokenKind]::Equals -and
+                $null -ne $assignment.Right.Expression) {
+                $enableBuffsText = $assignment.Right.Expression.Extent.Text
+            }
+            else {
+                $enableBuffsText = $null
+            }
             continue
         }
 
         if ($simpleNames -notcontains $name -and
             $name -notmatch '^buff(?:Keybind|CastTime|Duration)[0-9]+$') {
+            continue
+        }
+
+        if ($assignment.Operator -ne [System.Management.Automation.Language.TokenKind]::Equals) {
+            [void]$values.Remove($name)
             continue
         }
 
@@ -709,6 +966,7 @@ function Get-AIFishBotLegacyAssignments {
             ($expression -is [System.Management.Automation.Language.VariableExpressionAst] -and
                 $expression.VariablePath.UserPath -match '^(?i:true|false|null)$')
         if (-not $isLiteral) {
+            [void]$values.Remove($name)
             continue
         }
 
@@ -716,6 +974,7 @@ function Get-AIFishBotLegacyAssignments {
             $values[$name] = $expression.SafeGetValue()
         }
         catch {
+            [void]$values.Remove($name)
             continue
         }
     }

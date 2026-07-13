@@ -603,6 +603,65 @@ $buffDuration999999999999999999999999 = 20
     }
 }
 
+Test-Case 'legacy import uses the final assignment even when it is unsafe' {
+    $directory = New-TestDirectory
+    try {
+        $legacyPath = Join-Path -Path $directory -ChildPath 'legacy.ps1'
+        Write-TestTextFile -Path $legacyPath -Content @'
+$retail = $True
+$retail = Get-Process
+$autoStopTime = 10
+$autoStopTime = 25
+$enableBuffs = (1)
+$enableBuffs = (1 + 1)
+$buffKeybind1 = "F9"
+$buffKeybind1 = Get-Process
+$buffCastTime1 = 2
+$buffDuration1 = 10
+'@
+
+        $config = Import-AIFishBotLegacyConfig -ScriptPath $legacyPath -ProfileName '重复赋值'
+
+        Assert-Equal -Expected $false -Actual $config.retail
+        Assert-Equal -Expected 25 -Actual $config.autoStopTime
+        Assert-Equal -Expected 0 -Actual @($config.buffs).Count
+    }
+    finally {
+        Remove-TestDirectory -Path $directory
+    }
+}
+
+Test-Case 'legacy import reads UTF-8 Chinese text without a BOM' {
+    $directory = New-TestDirectory
+    try {
+        $legacyPath = Join-Path -Path $directory -ChildPath 'legacy.ps1'
+        Write-TestTextFile -Path $legacyPath -Content '$discordWebhook = "中文通知"'
+
+        $config = Import-AIFishBotLegacyConfig -ScriptPath $legacyPath -ProfileName '中文配置'
+
+        Assert-Equal -Expected '中文通知' -Actual $config.discordWebhook
+    }
+    finally {
+        Remove-TestDirectory -Path $directory
+    }
+}
+
+Test-Case 'legacy import rejects invalid UTF-8 bytes' {
+    $directory = New-TestDirectory
+    try {
+        $legacyPath = Join-Path -Path $directory -ChildPath 'legacy.ps1'
+        $prefix = [System.Text.Encoding]::ASCII.GetBytes('$discordWebhook = "')
+        $suffix = [System.Text.Encoding]::ASCII.GetBytes('"')
+        $bytes = [byte[]]@($prefix + [byte[]]@(0xFF) + $suffix)
+        [System.IO.File]::WriteAllBytes($legacyPath, $bytes)
+
+        Assert-Throws -ScriptBlock { Import-AIFishBotLegacyConfig -ScriptPath $legacyPath -ProfileName '非法编码' } -MessageLike '*UTF-8*'
+    }
+    finally {
+        Remove-TestDirectory -Path $directory
+    }
+}
+
 Test-Case 'profiles save and read UTF-8 JSON without losing nested values' {
     $directory = New-TestDirectory
     try {
@@ -619,6 +678,81 @@ Test-Case 'profiles save and read UTF-8 JSON without losing nested values' {
         Assert-Equal -Expected '中文通知' -Actual $loaded.discordWebhook
         Assert-Equal -Expected '烹饪帽' -Actual $loaded.buffs[0].name
         Assert-True -Condition (Test-Path -LiteralPath (Get-AIFishBotProfilePath -ProfilesDirectory $directory -ProfileName '钓鱼方案'))
+    }
+    finally {
+        Remove-TestDirectory -Path $directory
+    }
+}
+
+Test-Case 'profile read rejects a JSON profile name that differs from its file name' {
+    $directory = New-TestDirectory
+    try {
+        $config = New-AIFishBotDefaultConfig
+        $config.profileName = '文件方案'
+        Save-AIFishBotProfile -ProfilesDirectory $directory -Config $config | Out-Null
+
+        $wrongConfig = New-AIFishBotDefaultConfig
+        $wrongConfig.profileName = '其他方案'
+        $profilePath = Get-AIFishBotProfilePath -ProfilesDirectory $directory -ProfileName '文件方案'
+        Write-TestTextFile -Path $profilePath -Content ($wrongConfig | ConvertTo-Json -Depth 20)
+        $originalText = [System.IO.File]::ReadAllText($profilePath)
+
+        Assert-Throws -ScriptBlock { Read-AIFishBotProfile -ProfilesDirectory $directory -ProfileName '文件方案' } -MessageLike '*名称*不一致*'
+        Assert-Equal -Expected $originalText -Actual ([System.IO.File]::ReadAllText($profilePath))
+    }
+    finally {
+        Remove-TestDirectory -Path $directory
+    }
+}
+
+Test-Case 'profile read rejects invalid UTF-8 without changing the file' {
+    $directory = New-TestDirectory
+    try {
+        $profilePath = Get-AIFishBotProfilePath -ProfilesDirectory $directory -ProfileName '非法编码'
+        $bytes = [byte[]]@(0x7B, 0x22, 0xFF, 0x22, 0x3A, 0x31, 0x7D)
+        [System.IO.File]::WriteAllBytes($profilePath, $bytes)
+
+        Assert-Throws -ScriptBlock { Read-AIFishBotProfile -ProfilesDirectory $directory -ProfileName '非法编码' } -MessageLike '*UTF-8*'
+        Assert-Equal -Expected $bytes -Actual ([System.IO.File]::ReadAllBytes($profilePath))
+    }
+    finally {
+        Remove-TestDirectory -Path $directory
+    }
+}
+
+Test-Case 'profile save rejects object graphs deeper than the safe limit' {
+    $directory = New-TestDirectory
+    try {
+        $config = New-AIFishBotDefaultConfig
+        $config.profileName = '过深方案'
+        $root = [pscustomobject]@{}
+        $current = $root
+        foreach ($level in 1..21) {
+            $next = [pscustomobject]@{ level = $level }
+            $current | Add-Member -MemberType NoteProperty -Name child -Value $next
+            $current = $next
+        }
+        $config | Add-Member -MemberType NoteProperty -Name extra -Value $root
+
+        Assert-Throws -ScriptBlock { Save-AIFishBotProfile -ProfilesDirectory $directory -Config $config } -MessageLike '*层*'
+        Assert-True -Condition (-not (Test-Path -LiteralPath (Get-AIFishBotProfilePath -ProfilesDirectory $directory -ProfileName '过深方案')))
+    }
+    finally {
+        Remove-TestDirectory -Path $directory
+    }
+}
+
+Test-Case 'profile save rejects circular object graphs' {
+    $directory = New-TestDirectory
+    try {
+        $config = New-AIFishBotDefaultConfig
+        $config.profileName = '循环方案'
+        $loop = @{}
+        $loop['self'] = $loop
+        $config | Add-Member -MemberType NoteProperty -Name extra -Value $loop
+
+        Assert-Throws -ScriptBlock { Save-AIFishBotProfile -ProfilesDirectory $directory -Config $config } -MessageLike '*循环*'
+        Assert-True -Condition (-not (Test-Path -LiteralPath (Get-AIFishBotProfilePath -ProfilesDirectory $directory -ProfileName '循环方案')))
     }
     finally {
         Remove-TestDirectory -Path $directory
@@ -816,6 +950,132 @@ Test-Case 'failed atomic replacement preserves the previous profile and cleans t
     finally {
         if ($null -ne $lock) {
             $lock.Dispose()
+        }
+        Remove-TestDirectory -Path $directory
+    }
+}
+
+Test-Case 'profile reads wait for the cross-process directory mutex' {
+    $directory = New-TestDirectory
+    $mutex = $null
+    $ownsMutex = $false
+    $job = $null
+    try {
+        $config = New-AIFishBotDefaultConfig
+        $config.profileName = '互斥读取'
+        Save-AIFishBotProfile -ProfilesDirectory $directory -Config $config | Out-Null
+
+        $module = Get-Module -Name 'AI-FishBot.Config'
+        $mutexName = & $module {
+            param($directoryPath)
+            Get-AIFishBotProfilesMutexName -ProfilesDirectory $directoryPath
+        } $directory
+        $mutex = New-Object System.Threading.Mutex($false, $mutexName)
+        $ownsMutex = $mutex.WaitOne()
+
+        $markerPath = Join-Path -Path $directory -ChildPath 'reader.ready'
+        $job = Start-Job -ScriptBlock {
+            param($modulePath, $profilesDirectory, $marker)
+            Import-Module -Name $modulePath -Force -ErrorAction Stop
+            [System.IO.File]::WriteAllText($marker, 'ready')
+            (Read-AIFishBotProfile -ProfilesDirectory $profilesDirectory -ProfileName '互斥读取').autoStopTime
+        } -ArgumentList $script:ConfigModulePath, $directory, $markerPath
+
+        $deadline = [DateTime]::UtcNow.AddSeconds(10)
+        while (-not (Test-Path -LiteralPath $markerPath) -and [DateTime]::UtcNow -lt $deadline) {
+            Start-Sleep -Milliseconds 50
+        }
+        Assert-True -Condition (Test-Path -LiteralPath $markerPath)
+        Start-Sleep -Milliseconds 300
+        Assert-Equal -Expected 'Running' -Actual ([string]$job.State)
+
+        $mutex.ReleaseMutex()
+        $ownsMutex = $false
+        Wait-Job -Job $job -Timeout 10 | Out-Null
+        Assert-Equal -Expected @(60) -Actual @(Receive-Job -Job $job -ErrorAction Stop)
+    }
+    finally {
+        if ($ownsMutex -and $null -ne $mutex) {
+            $mutex.ReleaseMutex()
+        }
+        if ($null -ne $mutex) {
+            $mutex.Dispose()
+        }
+        if ($null -ne $job) {
+            if ($job.State -eq 'Running') {
+                Stop-Job -Job $job
+            }
+            Remove-Job -Job $job -Force
+        }
+        Remove-TestDirectory -Path $directory
+    }
+}
+
+Test-Case 'create-new profile saves never overwrite an existing target' {
+    $directory = New-TestDirectory
+    try {
+        $config = New-AIFishBotDefaultConfig
+        $config.profileName = '不可覆盖'
+        $config.autoStopTime = 10
+        Save-AIFishBotProfile -ProfilesDirectory $directory -Config $config -CreateNew | Out-Null
+
+        $config.autoStopTime = 20
+        Assert-Throws -ScriptBlock { Save-AIFishBotProfile -ProfilesDirectory $directory -Config $config -CreateNew } -MessageLike '*已存在*'
+        Assert-Equal -Expected 10 -Actual (Read-AIFishBotProfile -ProfilesDirectory $directory -ProfileName '不可覆盖').autoStopTime
+    }
+    finally {
+        Remove-TestDirectory -Path $directory
+    }
+}
+
+Test-Case 'concurrent copies allow only one process to create the destination' {
+    $directory = New-TestDirectory
+    $jobs = @()
+    try {
+        $config = New-AIFishBotDefaultConfig
+        $config.profileName = '并发源'
+        Save-AIFishBotProfile -ProfilesDirectory $directory -Config $config | Out-Null
+        $goPath = Join-Path -Path $directory -ChildPath 'copy.go'
+
+        foreach ($number in 1..2) {
+            $readyPath = Join-Path -Path $directory -ChildPath ('copy.{0}.ready' -f $number)
+            $jobs += Start-Job -ScriptBlock {
+                param($modulePath, $profilesDirectory, $ready, $go)
+                Import-Module -Name $modulePath -Force -ErrorAction Stop
+                [System.IO.File]::WriteAllText($ready, 'ready')
+                while (-not (Test-Path -LiteralPath $go)) {
+                    Start-Sleep -Milliseconds 20
+                }
+                try {
+                    Copy-AIFishBotProfile -ProfilesDirectory $profilesDirectory -SourceProfileName '并发源' -DestinationProfileName '并发目标' | Out-Null
+                    'SUCCESS'
+                }
+                catch {
+                    'FAILED'
+                }
+            } -ArgumentList $script:ConfigModulePath, $directory, $readyPath, $goPath
+        }
+
+        $deadline = [DateTime]::UtcNow.AddSeconds(10)
+        while (@(Get-ChildItem -LiteralPath $directory -Filter 'copy.*.ready' -File).Count -lt 2 -and
+            [DateTime]::UtcNow -lt $deadline) {
+            Start-Sleep -Milliseconds 50
+        }
+        Assert-Equal -Expected 2 -Actual @(Get-ChildItem -LiteralPath $directory -Filter 'copy.*.ready' -File).Count
+        Write-TestTextFile -Path $goPath -Content 'go'
+
+        Wait-Job -Job $jobs -Timeout 15 | Out-Null
+        $results = @($jobs | Receive-Job -ErrorAction Stop)
+        Assert-Equal -Expected 1 -Actual @($results | Where-Object { $_ -eq 'SUCCESS' }).Count
+        Assert-Equal -Expected 1 -Actual @($results | Where-Object { $_ -eq 'FAILED' }).Count
+        Assert-Equal -Expected '并发目标' -Actual (Read-AIFishBotProfile -ProfilesDirectory $directory -ProfileName '并发目标').profileName
+    }
+    finally {
+        foreach ($job in $jobs) {
+            if ($job.State -eq 'Running') {
+                Stop-Job -Job $job
+            }
+            Remove-Job -Job $job -Force
         }
         Remove-TestDirectory -Path $directory
     }
