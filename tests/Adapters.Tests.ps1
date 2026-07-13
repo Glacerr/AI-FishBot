@@ -131,6 +131,47 @@ Test-Case 'Pico key sender opens with fixed serial settings sends lines and clos
     Assert-Equal -Expected 1 -Actual $context.DisposeCount
 }
 
+Test-Case 'Pico key sender accepts an injected legacy port without a WriteTimeout property' {
+    $context = [pscustomobject]@{
+        OpenCount = 0
+        CloseCount = 0
+        DisposeCount = 0
+        Lines = New-Object 'System.Collections.Generic.List[string]'
+    }
+    $captured = $context
+    $serial = [pscustomobject]@{ IsOpen = $false }
+    $serial | Add-Member -MemberType ScriptMethod -Name Open -Value {
+        $captured.OpenCount += 1
+        $this.IsOpen = $true
+    }.GetNewClosure()
+    $serial | Add-Member -MemberType ScriptMethod -Name WriteLine -Value {
+        param($line)
+        [void]$captured.Lines.Add([string]$line)
+    }.GetNewClosure()
+    $serial | Add-Member -MemberType ScriptMethod -Name Close -Value {
+        $captured.CloseCount += 1
+        $this.IsOpen = $false
+    }.GetNewClosure()
+    $serial | Add-Member -MemberType ScriptMethod -Name Dispose -Value {
+        $captured.DisposeCount += 1
+    }.GetNewClosure()
+    $factory = {
+        param($portName, $baudRate, $parity, $dataBits, $stopBits)
+        return $serial
+    }.GetNewClosure()
+
+    $sender = New-AIFishBotKeySender -UsePico -ComPort 'COM6' -SerialPortFactory $factory
+    Invoke-AdaptersMember -Object $sender -Name Send -Arguments @('F6') | Out-Null
+    Invoke-AdaptersMember -Object $sender -Name Dispose | Out-Null
+    Invoke-AdaptersMember -Object $sender -Name Dispose | Out-Null
+
+    Assert-Equal -Expected @('F6') -Actual @($context.Lines)
+    Assert-Equal -Expected 1 -Actual $context.OpenCount
+    Assert-Equal -Expected 1 -Actual $context.CloseCount
+    Assert-Equal -Expected 1 -Actual $context.DisposeCount
+    Assert-Equal -Expected $null -Actual $serial.PSObject.Properties['WriteTimeout']
+}
+
 Test-Case 'Pico key sender bounds writes and reports timeout details before disposing once' {
     $context = [pscustomobject]@{ CloseCount = 0; DisposeCount = 0 }
     $captured = $context
@@ -221,9 +262,9 @@ Test-Case 'notifier posts JSON to a valid Discord webhook' {
     $requests = New-Object 'System.Collections.Generic.List[object]'
     $captured = $requests
     $rest = {
-        param($Uri, $Method, $ContentType, $Body, $TimeoutSec)
+        param($Uri, $Method, $Headers, $Body, $TimeoutSec)
         [void]$captured.Add([pscustomobject]@{
-                Uri = $Uri; Method = $Method; ContentType = $ContentType
+                Uri = $Uri; Method = $Method; Headers = $Headers
                 Body = $Body; TimeoutSec = $TimeoutSec
             })
         return [pscustomobject]@{ ok = $true }
@@ -238,16 +279,60 @@ Test-Case 'notifier posts JSON to a valid Discord webhook' {
     Assert-Equal -Expected 1 -Actual $requests.Count
     Assert-Equal -Expected $webhook -Actual $requests[0].Uri
     Assert-Equal -Expected 'Post' -Actual $requests[0].Method
-    Assert-Equal -Expected 'application/json' -Actual $requests[0].ContentType
+    Assert-Equal -Expected 'application/json' -Actual $requests[0].Headers['Content-Type']
     Assert-Equal -Expected 10 -Actual $requests[0].TimeoutSec
     Assert-Equal -Expected 'start' -Actual (($requests[0].Body | ConvertFrom-Json).event)
+}
+
+Test-Case 'notifier invokes an injected HTTP provider with named request parameters' {
+    $context = [pscustomobject]@{
+        Keys = @()
+        Uri = $null
+        Method = $null
+        Headers = $null
+        Body = $null
+        TimeoutSec = $null
+        ExtraCount = -1
+    }
+    $captured = $context
+    $http = {
+        [CmdletBinding(PositionalBinding = $false)]
+        param(
+            [Parameter(Mandatory = $true)][string]$Uri,
+            [Parameter(Mandatory = $true)][string]$Method,
+            [Parameter(Mandatory = $true)][hashtable]$Headers,
+            [Parameter(Mandatory = $true)][string]$Body,
+            [Parameter(Mandatory = $true)][int]$TimeoutSec
+        )
+        $captured.Keys = @($PSBoundParameters.Keys | Sort-Object)
+        $captured.Uri = $Uri
+        $captured.Method = $Method
+        $captured.Headers = $Headers
+        $captured.Body = $Body
+        $captured.TimeoutSec = $TimeoutSec
+        $captured.ExtraCount = $args.Count
+    }.GetNewClosure()
+    $webhook = 'https://discord.com/api/v10/webhooks/named-id/named-token'
+    $notifier = New-AIFishBotNotifier -HttpProvider $http -TimeoutSec 12 `
+        -LogProvider { param($level, $message) }
+
+    $result = Invoke-AdaptersMember -Object $notifier -Name Notify -Arguments @('start', $webhook)
+
+    Assert-Equal -Expected $true -Actual $result
+    Assert-Equal -Expected @('Body', 'Headers', 'Method', 'TimeoutSec', 'Uri') -Actual $context.Keys
+    Assert-Equal -Expected $webhook -Actual $context.Uri
+    Assert-Equal -Expected 'Post' -Actual $context.Method
+    Assert-Equal -Expected 'application/json' -Actual $context.Headers['Content-Type']
+    Assert-Equal -Expected 'start' -Actual (($context.Body | ConvertFrom-Json).event)
+    Assert-Equal -Expected 12 -Actual $context.TimeoutSec
+    Assert-Equal -Expected 0 -Actual $context.ExtraCount
 }
 
 Test-Case 'notifier passes an injected timeout from one through sixty seconds' {
     $timeouts = New-Object 'System.Collections.Generic.List[int]'
     $captured = $timeouts
     $http = {
-        param($Uri, $Method, $ContentType, $Body, $TimeoutSec)
+        param($Uri, $Method, $Headers, $Body, $TimeoutSec)
         [void]$captured.Add([int]$TimeoutSec)
     }.GetNewClosure()
     $webhook = 'https://discord.com/api/webhooks/timeout-id/timeout-token'
@@ -273,7 +358,7 @@ Test-Case 'notifier contains an injected request timeout without exposing its we
     $capturedLogs = $logs
     $webhook = 'https://discord.com:443/api/v10/webhooks/timeout-id/timeout-secret-token'
     $http = {
-        param($Uri, $Method, $ContentType, $Body, $TimeoutSec)
+        param($Uri, $Method, $Headers, $Body, $TimeoutSec)
         throw (New-Object System.TimeoutException(('timed out after {0}s at {1}' -f $TimeoutSec, $Uri)))
     }
     $notifier = New-AIFishBotNotifier -HttpProvider $http -TimeoutSec 3 -LogProvider ({
@@ -295,7 +380,7 @@ Test-Case 'notifier contains a timeout even when an injected protector fails' {
     $capturedLogs = $logs
     $webhook = 'https://discord.com:443/api/v10/webhooks/protect-id/protect-secret-token'
     $http = {
-        param($Uri, $Method, $ContentType, $Body, $TimeoutSec)
+        param($Uri, $Method, $Headers, $Body, $TimeoutSec)
         throw (New-Object System.TimeoutException(('request timed out at {0}' -f $Uri)))
     }
     $notifier = New-AIFishBotNotifier -HttpProvider $http -ProtectProvider {
@@ -319,7 +404,7 @@ Test-Case 'notifier rejects empty and non-Discord webhook values without a reque
     $context = [pscustomobject]@{ RequestCount = 0 }
     $captured = $context
     $notifier = New-AIFishBotNotifier -InvokeRestMethodProvider ({
-            param($Uri, $Method, $ContentType, $Body)
+            param($Uri, $Method, $Headers, $Body)
             $captured.RequestCount += 1
         }.GetNewClosure()) -LogProvider { param($level, $message) }
 
@@ -336,7 +421,7 @@ Test-Case 'notifier contains network errors and masks webhook tokens in logs' {
     $logs = New-Object 'System.Collections.Generic.List[string]'
     $capturedLogs = $logs
     $webhook = 'https://discord.com/api/webhooks/123456/secret-token'
-    $rest = { param($Uri, $Method, $ContentType, $Body) throw ('request failed: {0}' -f $Uri) }
+    $rest = { param($Uri, $Method, $Headers, $Body) throw ('request failed: {0}' -f $Uri) }
     $notifier = New-AIFishBotNotifier -InvokeRestMethodProvider $rest -LogProvider ({
             param($level, $message)
             [void]$capturedLogs.Add([string]$message)
@@ -358,7 +443,7 @@ Test-Case 'notifier masks a port-bearing webhook when an injected request fails'
     $capturedLogs = $logs
     $webhook = 'https://canary.discordapp.com:8443/api/v11/webhooks/port-id/port-secret-token'
     $rest = {
-        param($Uri, $Method, $ContentType, $Body)
+        param($Uri, $Method, $Headers, $Body)
         throw ('request failed: {0}' -f $Uri)
     }
     $notifier = New-AIFishBotNotifier -InvokeRestMethodProvider $rest -LogProvider ({

@@ -177,7 +177,10 @@ function New-AIFishBotKeySender {
                 throw 'The serial port factory must return exactly one port object.'
             }
             $port = $ports[0]
-            $port.WriteTimeout = $WriteTimeoutMilliseconds
+            $writeTimeoutProperty = $port.PSObject.Properties['WriteTimeout']
+            if ($null -ne $writeTimeoutProperty) {
+                $writeTimeoutProperty.Value = $WriteTimeoutMilliseconds
+            }
             Invoke-AIFishBotAdapterObjectMember -Object $port -Name Open | Out-Null
             $context.SerialPort = $port
             $context.Opened = $true
@@ -354,9 +357,27 @@ function New-AIFishBotNotifier {
     $writeLogSafely = ${function:Write-AIFishBotAdapterLogSafely}
     if ($null -eq $InvokeRestMethodProvider) {
         $InvokeRestMethodProvider = {
-            param($Uri, $Method, $ContentType, $Body, $TimeoutSec)
-            Invoke-RestMethod -Uri $Uri -Method $Method -ContentType $ContentType `
-                -Body $Body -TimeoutSec $TimeoutSec -ErrorAction Stop
+            param($Uri, $Method, $Headers, $Body, $TimeoutSec)
+            $invokeArguments = @{
+                Uri = $Uri
+                Method = $Method
+                Body = $Body
+                TimeoutSec = $TimeoutSec
+                ErrorAction = 'Stop'
+            }
+            $forwardHeaders = @{}
+            foreach ($key in @($Headers.Keys)) {
+                if ([string]$key -ieq 'Content-Type') {
+                    $invokeArguments.ContentType = [string]$Headers[$key]
+                }
+                else {
+                    $forwardHeaders[[string]$key] = $Headers[$key]
+                }
+            }
+            if ($forwardHeaders.Count -gt 0) {
+                $invokeArguments.Headers = $forwardHeaders
+            }
+            Invoke-RestMethod @invokeArguments
         }
     }
     if ($null -eq $ProtectProvider) {
@@ -379,8 +400,14 @@ function New-AIFishBotNotifier {
             }
             $body = $payload | ConvertTo-Json -Compress
             try {
-                & $capturedRest ([string]$webhook) 'Post' 'application/json' `
-                    $body $capturedTimeout | Out-Null
+                $requestArguments = @{
+                    Uri = [string]$webhook
+                    Method = 'Post'
+                    Headers = @{ 'Content-Type' = 'application/json' }
+                    Body = $body
+                    TimeoutSec = $capturedTimeout
+                }
+                & $capturedRest @requestArguments | Out-Null
                 return $true
             }
             catch {
