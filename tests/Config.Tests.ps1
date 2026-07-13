@@ -1107,6 +1107,112 @@ Test-Case 'create-new profile saves never overwrite an existing target' {
     }
 }
 
+Test-Case 'ordinary new save succeeds when a stale backup is locked' {
+    $directory = New-TestDirectory
+    $lock = $null
+    try {
+        $config = New-AIFishBotDefaultConfig
+        $config.profileName = '普通新建'
+        $profilePath = Get-AIFishBotProfilePath -ProfilesDirectory $directory -ProfileName '普通新建'
+        $backupPath = $profilePath + '.backup'
+        Write-TestTextFile -Path $backupPath -Content 'locked backup'
+        $lock = [System.IO.File]::Open($backupPath, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::Read)
+
+        $saved = Save-AIFishBotProfile -ProfilesDirectory $directory -Config $config
+
+        Assert-Equal -Expected '普通新建' -Actual $saved.profileName
+        Assert-True -Condition (Test-Path -LiteralPath $profilePath -PathType Leaf)
+        Assert-True -Condition (Test-Path -LiteralPath $backupPath -PathType Leaf)
+        Assert-Equal -Expected '普通新建' -Actual (Read-AIFishBotProfile -ProfilesDirectory $directory -ProfileName '普通新建').profileName
+    }
+    finally {
+        if ($null -ne $lock) {
+            $lock.Dispose()
+        }
+        Remove-TestDirectory -Path $directory
+    }
+}
+
+Test-Case 'create-new save succeeds when a stale backup is locked' {
+    $directory = New-TestDirectory
+    $lock = $null
+    try {
+        $config = New-AIFishBotDefaultConfig
+        $config.profileName = '不可覆盖新建'
+        $profilePath = Get-AIFishBotProfilePath -ProfilesDirectory $directory -ProfileName '不可覆盖新建'
+        $backupPath = $profilePath + '.backup'
+        Write-TestTextFile -Path $backupPath -Content 'locked backup'
+        $lock = [System.IO.File]::Open($backupPath, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::Read)
+
+        $saved = Save-AIFishBotProfile -ProfilesDirectory $directory -Config $config -CreateNew
+
+        Assert-Equal -Expected '不可覆盖新建' -Actual $saved.profileName
+        Assert-True -Condition (Test-Path -LiteralPath $profilePath -PathType Leaf)
+        Assert-True -Condition (Test-Path -LiteralPath $backupPath -PathType Leaf)
+        Assert-Equal -Expected '不可覆盖新建' -Actual (Read-AIFishBotProfile -ProfilesDirectory $directory -ProfileName '不可覆盖新建').profileName
+    }
+    finally {
+        if ($null -ne $lock) {
+            $lock.Dispose()
+        }
+        Remove-TestDirectory -Path $directory
+    }
+}
+
+Test-Case 'profile copy succeeds when the destination backup is locked' {
+    $directory = New-TestDirectory
+    $lock = $null
+    try {
+        $config = New-AIFishBotDefaultConfig
+        $config.profileName = '复制源'
+        Save-AIFishBotProfile -ProfilesDirectory $directory -Config $config | Out-Null
+        $destinationPath = Get-AIFishBotProfilePath -ProfilesDirectory $directory -ProfileName '复制目标'
+        $backupPath = $destinationPath + '.backup'
+        Write-TestTextFile -Path $backupPath -Content 'locked backup'
+        $lock = [System.IO.File]::Open($backupPath, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::Read)
+
+        $copied = Copy-AIFishBotProfile -ProfilesDirectory $directory -SourceProfileName '复制源' -DestinationProfileName '复制目标'
+
+        Assert-Equal -Expected '复制目标' -Actual $copied.profileName
+        Assert-True -Condition (Test-Path -LiteralPath $backupPath -PathType Leaf)
+        Assert-Equal -Expected '复制目标' -Actual (Read-AIFishBotProfile -ProfilesDirectory $directory -ProfileName '复制目标').profileName
+    }
+    finally {
+        if ($null -ne $lock) {
+            $lock.Dispose()
+        }
+        Remove-TestDirectory -Path $directory
+    }
+}
+
+Test-Case 'profile rename succeeds when the destination backup is locked' {
+    $directory = New-TestDirectory
+    $lock = $null
+    try {
+        $config = New-AIFishBotDefaultConfig
+        $config.profileName = '重命名源'
+        Save-AIFishBotProfile -ProfilesDirectory $directory -Config $config | Out-Null
+        $sourcePath = Get-AIFishBotProfilePath -ProfilesDirectory $directory -ProfileName '重命名源'
+        $destinationPath = Get-AIFishBotProfilePath -ProfilesDirectory $directory -ProfileName '重命名目标'
+        $backupPath = $destinationPath + '.backup'
+        Write-TestTextFile -Path $backupPath -Content 'locked backup'
+        $lock = [System.IO.File]::Open($backupPath, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::Read)
+
+        $renamed = Rename-AIFishBotProfile -ProfilesDirectory $directory -ProfileName '重命名源' -NewProfileName '重命名目标'
+
+        Assert-Equal -Expected '重命名目标' -Actual $renamed.profileName
+        Assert-True -Condition (-not (Test-Path -LiteralPath $sourcePath))
+        Assert-True -Condition (Test-Path -LiteralPath $backupPath -PathType Leaf)
+        Assert-Equal -Expected '重命名目标' -Actual (Read-AIFishBotProfile -ProfilesDirectory $directory -ProfileName '重命名目标').profileName
+    }
+    finally {
+        if ($null -ne $lock) {
+            $lock.Dispose()
+        }
+        Remove-TestDirectory -Path $directory
+    }
+}
+
 Test-Case 'create-new failure preserves a stale backup until the final move succeeds' {
     $directory = New-TestDirectory
     $job = $null

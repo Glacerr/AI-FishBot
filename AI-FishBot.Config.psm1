@@ -774,8 +774,8 @@ function Save-AIFishBotProfileCore {
         if ($CreateNew) {
             $staleBackupPath = $profilePath + '.backup'
             [System.IO.File]::Move($temporaryPath, $profilePath)
-            if (Test-Path -LiteralPath $staleBackupPath -PathType Leaf) {
-                Remove-Item -LiteralPath $staleBackupPath -Force -ErrorAction Stop
+            if (Test-Path -LiteralPath $staleBackupPath -PathType Leaf -ErrorAction SilentlyContinue) {
+                Remove-Item -LiteralPath $staleBackupPath -Force -ErrorAction SilentlyContinue
             }
         }
         elseif (Test-Path -LiteralPath $profilePath -PathType Leaf) {
@@ -783,10 +783,10 @@ function Save-AIFishBotProfileCore {
         }
         else {
             $staleBackupPath = $profilePath + '.backup'
-            if (Test-Path -LiteralPath $staleBackupPath -PathType Leaf) {
-                Remove-Item -LiteralPath $staleBackupPath -Force -ErrorAction Stop
-            }
             [System.IO.File]::Move($temporaryPath, $profilePath)
+            if (Test-Path -LiteralPath $staleBackupPath -PathType Leaf -ErrorAction SilentlyContinue) {
+                Remove-Item -LiteralPath $staleBackupPath -Force -ErrorAction SilentlyContinue
+            }
         }
 
         return $verifiedConfig
