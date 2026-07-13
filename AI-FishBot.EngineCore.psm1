@@ -611,6 +611,19 @@ function Invoke-AIFishBotCastAttempt {
     return $true
 }
 
+function Stop-AIFishBotCastAtAttemptLimit {
+    param(
+        [Parameter(Mandatory = $true)]
+        [object]$State
+    )
+
+    $message = 'WeakAura cast retry limit reached.'
+    $State.StopRequested = $true
+    Set-AIFishBotEngineStateValue -State $State -Value 'error' -LastError $message
+    Write-AIFishBotEngineLog -State $State -Level Error -Message $message
+    throw $message
+}
+
 function Invoke-AIFishBotCast {
     [CmdletBinding()]
     param(
@@ -618,11 +631,16 @@ function Invoke-AIFishBotCast {
         [object]$State
     )
 
-    $retriesForCast = 0
+    $maximumAttempts = [int]$State.LockedConfig.fishingRetries
+    if ([bool]$State.LockedConfig.useWeakAura -and $maximumAttempts -eq 0) {
+        Stop-AIFishBotCastAtAttemptLimit -State $State
+    }
+    $attempts = 0
     while (-not $State.StopRequested) {
         if (-not (Invoke-AIFishBotCastAttempt -State $State)) {
             return $false
         }
+        $attempts += 1
         if (-not [bool]$State.LockedConfig.useWeakAura) {
             return $true
         }
@@ -638,14 +656,9 @@ function Invoke-AIFishBotCast {
         if ($peak -ge [double]$State.LiveConfig.audioSensitivity) {
             return $true
         }
-        if ($retriesForCast -ge [int]$State.LockedConfig.fishingRetries) {
-            $message = 'WeakAura cast retry limit reached.'
-            $State.StopRequested = $true
-            Set-AIFishBotEngineStateValue -State $State -Value 'error' -LastError $message
-            Write-AIFishBotEngineLog -State $State -Level Error -Message $message
-            throw $message
+        if ($attempts -ge $maximumAttempts) {
+            Stop-AIFishBotCastAtAttemptLimit -State $State
         }
-        $retriesForCast += 1
         $State.RetryCount += 1
         Write-AIFishBotEngineStatus -State $State
     }

@@ -403,16 +403,36 @@ Test-Case 'WeakAura cast accepts a peak exactly at the sensitivity threshold' {
 }
 
 Test-Case 'WeakAura cast records retries and stops at its configured limit' {
-    $adapter = New-SimulatedAdapter -Peaks @(0, 0, 0)
+    $adapter = New-SimulatedAdapter -Peaks @(0, 0)
     $config = New-EngineConfig -Values @{ useWeakAura = $true; fishingRetries = 2 }
     $state = $null
     try {
         $state = New-EngineTestState -Config $config -Adapter $adapter
         Assert-Throws -ScriptBlock { Invoke-AIFishBotCast -State $state } -MessageLike '*retry limit*'
 
-        Assert-Equal -Expected 3 -Actual (Get-EventCount -Adapter $adapter -Event 'key:F6')
-        Assert-Equal -Expected 3 -Actual (Get-EventCount -Adapter $adapter -Event 'sleep:1000')
-        Assert-Equal -Expected 2 -Actual $state.RetryCount
+        Assert-Equal -Expected 2 -Actual (Get-EventCount -Adapter $adapter -Event 'key:F6')
+        Assert-Equal -Expected 2 -Actual (Get-EventCount -Adapter $adapter -Event 'sleep:1000')
+        Assert-Equal -Expected 1 -Actual $state.RetryCount
+        Assert-Equal -Expected $true -Actual $state.StopRequested
+        Assert-Equal -Expected 'error' -Actual $state.State
+    }
+    finally {
+        Remove-EngineTestState -State $state
+    }
+}
+
+Test-Case 'WeakAura zero-attempt limit errors immediately without sending a key' {
+    $adapter = New-SimulatedAdapter -ThrowOnReadPeak
+    $config = New-EngineConfig -Values @{ useWeakAura = $true; fishingRetries = 0 }
+    $state = $null
+    try {
+        $state = New-EngineTestState -Config $config -Adapter $adapter
+        Assert-Throws -ScriptBlock { Invoke-AIFishBotCast -State $state } -MessageLike '*retry limit*'
+
+        Assert-Equal -Expected 0 -Actual (Get-EventCount -Adapter $adapter -Event 'key:F6')
+        Assert-Equal -Expected 0 -Actual (Get-EventCount -Adapter $adapter -Event 'peak')
+        Assert-Equal -Expected 0 -Actual @($adapter.Context.Events).Count
+        Assert-Equal -Expected 0 -Actual $state.RetryCount
         Assert-Equal -Expected $true -Actual $state.StopRequested
         Assert-Equal -Expected 'error' -Actual $state.State
     }
@@ -442,7 +462,8 @@ Test-Case 'no bite completes the classic window and starts the next round before
     $config = New-EngineConfig -Values @{ retail = $false; audioSensitivity = 3 }
     $reader = {
         param($state)
-        if ($state.Adapter.Context.Now -ge $state.StartedAt.AddSeconds(30)) {
+        $casts = @($state.Adapter.Context.Events | Where-Object { $_ -eq 'key:F6' }).Count
+        if ($casts -ge 2) {
             return [pscustomobject]@{ command = 'stop' }
         }
         return $null
@@ -453,7 +474,10 @@ Test-Case 'no bite completes the classic window and starts the next round before
         Start-AIFishBotEngineLoop -State $state | Out-Null
 
         Assert-Equal -Expected 0 -Actual $state.HookCount
-        Assert-Equal -Expected 1 -Actual (Get-EventCount -Adapter $adapter -Event 'key:F6')
+        Assert-Equal -Expected 2 -Actual (Get-EventCount -Adapter $adapter -Event 'key:F6')
+        Assert-Equal -Expected @(
+            'ready', 'casting', 'waiting-for-bite', 'casting', 'stopping', 'stopped'
+        ) -Actual @($state.StateHistory)
         Assert-Equal -Expected 'stopped' -Actual $state.State
         Assert-Equal -Expected 1 -Actual $adapter.Context.DisposeCount
         Assert-True -Condition ($adapter.Context.Now -ge $state.StartedAt.AddSeconds(30))
@@ -471,7 +495,8 @@ Test-Case 'retail no-bite window ends after twenty-two total seconds' {
     $config = New-EngineConfig -Values @{ retail = $true }
     $reader = {
         param($state)
-        if ($state.Adapter.Context.Now -ge $state.StartedAt.AddSeconds(22.2)) {
+        $casts = @($state.Adapter.Context.Events | Where-Object { $_ -eq 'key:F6' }).Count
+        if ($casts -ge 2) {
             return [pscustomobject]@{ command = 'stop' }
         }
         return $null
@@ -481,7 +506,10 @@ Test-Case 'retail no-bite window ends after twenty-two total seconds' {
         $state = New-EngineTestState -Config $config -Adapter $adapter -ControlReader $reader
         Start-AIFishBotEngineLoop -State $state | Out-Null
 
-        Assert-Equal -Expected 1 -Actual (Get-EventCount -Adapter $adapter -Event 'key:F6')
+        Assert-Equal -Expected 2 -Actual (Get-EventCount -Adapter $adapter -Event 'key:F6')
+        Assert-Equal -Expected @(
+            'ready', 'casting', 'waiting-for-bite', 'casting', 'stopping', 'stopped'
+        ) -Actual @($state.StateHistory)
         Assert-True -Condition ($adapter.Context.Now -ge $state.StartedAt.AddSeconds(22.2))
         Assert-True -Condition ($adapter.Context.Now -lt $state.StartedAt.AddSeconds(23))
         Assert-Equal -Expected 'stopped' -Actual $state.State
