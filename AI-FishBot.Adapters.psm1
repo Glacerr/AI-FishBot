@@ -357,25 +357,14 @@ function New-AIFishBotNotifier {
     $writeLogSafely = ${function:Write-AIFishBotAdapterLogSafely}
     if ($null -eq $InvokeRestMethodProvider) {
         $InvokeRestMethodProvider = {
-            param($Uri, $Method, $Headers, $Body, $TimeoutSec)
+            param($Uri, $Method, $ContentType, $Body, $TimeoutSec)
             $invokeArguments = @{
                 Uri = $Uri
                 Method = $Method
+                ContentType = $ContentType
                 Body = $Body
                 TimeoutSec = $TimeoutSec
                 ErrorAction = 'Stop'
-            }
-            $forwardHeaders = @{}
-            foreach ($key in @($Headers.Keys)) {
-                if ([string]$key -ieq 'Content-Type') {
-                    $invokeArguments.ContentType = [string]$Headers[$key]
-                }
-                else {
-                    $forwardHeaders[[string]$key] = $Headers[$key]
-                }
-            }
-            if ($forwardHeaders.Count -gt 0) {
-                $invokeArguments.Headers = $forwardHeaders
             }
             Invoke-RestMethod @invokeArguments
         }
@@ -403,7 +392,7 @@ function New-AIFishBotNotifier {
                 $requestArguments = @{
                     Uri = [string]$webhook
                     Method = 'Post'
-                    Headers = @{ 'Content-Type' = 'application/json' }
+                    ContentType = 'application/json'
                     Body = $body
                     TimeoutSec = $capturedTimeout
                 }
