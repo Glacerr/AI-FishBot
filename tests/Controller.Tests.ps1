@@ -1,0 +1,1031 @@
+﻿$controllerModulePath = Join-Path -Path (Split-Path -Path $PSScriptRoot -Parent) -ChildPath 'AI-FishBot.Controller.psm1'
+$configModulePath = Join-Path -Path (Split-Path -Path $PSScriptRoot -Parent) -ChildPath 'AI-FishBot.Config.psm1'
+$runtimeModulePath = Join-Path -Path (Split-Path -Path $PSScriptRoot -Parent) -ChildPath 'AI-FishBot.Runtime.psm1'
+Import-Module $configModulePath -Force
+Import-Module $runtimeModulePath -Force
+Import-Module $controllerModulePath -Force
+
+function New-ControllerFakeControl {
+    param(
+        [AllowNull()][object]$Value,
+        [string]$Text = '',
+        [bool]$Checked = $false
+    )
+
+    $control = [pscustomobject]@{
+        Value = $Value
+        Text = $Text
+        Checked = $Checked
+        SelectedItem = $null
+        SelectedIndex = -1
+        Items = New-Object System.Collections.ArrayList
+        Rows = @()
+        Enabled = $true
+        ReadOnly = $false
+        BackColor = 'normal'
+        ForeColor = 'normal'
+        ErrorText = ''
+        HasError = $false
+        Events = @{}
+        Visible = $true
+        Name = ''
+    }
+    foreach ($eventName in @(
+            'Click', 'CheckedChanged', 'ValueChanged', 'SelectedIndexChanged', 'TextChanged',
+            'CellValueChanged', 'RowsAdded', 'RowsRemoved', 'Tick', 'DoubleClick')) {
+        $nameCopy = $eventName
+        $control | Add-Member -MemberType ScriptMethod -Name ('Add_{0}' -f $eventName) -Value ({
+                param([scriptblock]$Handler)
+                if (-not $this.Events.ContainsKey($nameCopy)) {
+                    $this.Events[$nameCopy] = New-Object System.Collections.ArrayList
+                }
+                [void]$this.Events[$nameCopy].Add($Handler)
+            }.GetNewClosure())
+    }
+    $control | Add-Member -MemberType ScriptMethod -Name InvokeEvent -Value {
+        param([string]$EventName, $EventArgs = $null)
+        foreach ($handler in @($this.Events[$EventName])) {
+            & $handler $this $EventArgs
+        }
+    }
+    return $control
+}
+
+function New-ControllerFakeView {
+    $controls = @{}
+    foreach ($name in @(
+            'ProfileSelector', 'NewProfileButton', 'CopyProfileButton', 'RenameProfileButton',
+            'DeleteProfileButton', 'StatusBadge', 'SaveStateLabel', 'SaveButton', 'StartStopButton',
+            'Retail', 'AutoStop', 'AutoStopTime', 'AutoLogout', 'AudioSensitivity', 'AudioPeakBar',
+            'HookCount', 'RemainingTime', 'BiteResponseMin', 'BiteResponseMax', 'PreHookMin',
+            'PreHookMax', 'PostHookMin', 'PostHookMax', 'PreCastMin', 'PreCastMax', 'CastKey',
+            'BobberKey', 'LogoutKey', 'UseWindowFocus', 'UseWeakAura', 'FishingRetries', 'UsePi',
+            'PicoComPort', 'BuffGrid', 'AddBuffButton', 'RemoveBuffButton', 'MoveBuffUpButton',
+            'MoveBuffDownButton', 'EnableNotifications', 'NotifyOnStart', 'NotifyOnStop',
+            'WebhookText', 'LogBox')) {
+        $controls[$name] = New-ControllerFakeControl -Value 0
+        $controls[$name].Name = $name
+    }
+    $controls.LogBox.Text = ''
+    $trayItems = @{}
+    foreach ($name in @('StatusItem', 'OpenItem', 'StartItem', 'StopItem', 'ExitItem')) {
+        $trayItems[$name] = New-ControllerFakeControl
+        $trayItems[$name].Name = $name
+    }
+    $form = [pscustomobject]@{
+        Visible = $true
+        WindowState = 'Normal'
+        Events = @{}
+        WasActivated = $false
+        WasDisposed = $false
+    }
+    foreach ($eventName in @('FormClosing', 'Resize')) {
+        $copy = $eventName
+        $form | Add-Member -MemberType ScriptMethod -Name ('Add_{0}' -f $eventName) -Value ({
+                param([scriptblock]$Handler)
+                if (-not $this.Events.ContainsKey($copy)) { $this.Events[$copy] = New-Object System.Collections.ArrayList }
+                [void]$this.Events[$copy].Add($Handler)
+            }.GetNewClosure())
+    }
+    $form | Add-Member -MemberType ScriptMethod -Name Show -Value { $this.Visible = $true }
+    $form | Add-Member -MemberType ScriptMethod -Name Hide -Value { $this.Visible = $false }
+    $form | Add-Member -MemberType ScriptMethod -Name Activate -Value { $this.WasActivated = $true }
+
+    $view = [pscustomobject]@{
+        Controls = $controls
+        Form = $form
+        TrayIcon = New-ControllerFakeControl
+        TrayMenu = [pscustomobject]@{ Items = @($trayItems.Values); ByName = $trayItems }
+        Timers = [pscustomobject]@{ Status = (New-ControllerFakeControl); Log = (New-ControllerFakeControl) }
+        ExitCount = 0
+    }
+    $view | Add-Member -MemberType ScriptMethod -Name Exit -Value {
+        $this.ExitCount += 1
+        $this.Form.WasDisposed = $true
+    }
+    return $view
+}
+
+function New-ControllerTestConfig {
+    param([string]$Name = '中文 方案')
+    $config = New-AIFishBotDefaultConfig
+    $config.profileName = $Name
+    $config.retail = $true
+    $config.autoStop = $true
+    $config.autoStopTime = 25
+    $config.autoLogout = $true
+    $config.audioSensitivity = 7
+    $config.useWindowFocus = $false
+    $config.useWeakAura = $true
+    $config.fishingRetries = 23
+    $config.castKey = 'F9'
+    $config.bobberKey = 'F10'
+    $config.logoutKey = 'F11'
+    $config.usePi = $true
+    $config.picoComPort = 'COM7'
+    $config.enableNotifications = $true
+    $config.discordWebhook = 'https://discord.com/api/webhooks/123456/secret-token'
+    $config.notifyOnStart = $false
+    $config.notifyOnStop = $true
+    $config.biteResponseMinSeconds = 0.4
+    $config.biteResponseMaxSeconds = 0.8
+    $config.preHookMinSeconds = 0.6
+    $config.preHookMaxSeconds = 0.9
+    $config.postHookMinSeconds = 1.2
+    $config.postHookMaxSeconds = 1.8
+    $config.preCastMinSeconds = 0.3
+    $config.preCastMaxSeconds = 0.7
+    $config.buffs = @([pscustomobject][ordered]@{
+            enabled = $true; name = '帽子'; keybind = 'F12'; castTimeSeconds = 2; durationMinutes = 10
+        })
+    return $config
+}
+
+function New-ControllerForTest {
+    param(
+        [Parameter(Mandatory = $true)]$View,
+        [Parameter(Mandatory = $true)][string]$Root,
+        [scriptblock]$DependencyChecker = { [pscustomobject]@{ Status = 'Available'; IsAvailable = $true } },
+        [scriptblock]$ProcessStarter = { throw '测试必须注入进程启动器。' },
+        [scriptblock]$ProcessLookup = { param($id) [pscustomobject]@{ Id = $id } },
+        [scriptblock]$StatusReader = { param($path) throw '没有状态。' },
+        [scriptblock]$Clock = { [datetimeoffset]'2026-07-13T10:00:00+08:00' },
+        [scriptblock]$Sleeper = { param($milliseconds) },
+        [scriptblock]$ConfirmProvider = { param($purpose) $true },
+        [scriptblock]$ConfirmExitProvider = { param($running) 'Continue' },
+        [scriptblock]$ProfileNameProvider = { param($action, $currentName, $suggestedName) $suggestedName },
+        [scriptblock]$ForceStopper = { param($id) }
+    )
+    $profiles = Join-Path $Root 'profiles'
+    $runtime = Join-Path $Root 'runtime'
+    New-AIFishBotController -View $View -ProfilesDirectory $profiles -RuntimeRoot $runtime `
+        -EngineScriptPath 'C:\测试 目录\AI-FishBot.Engine.ps1' -DependencyChecker $DependencyChecker `
+        -ProcessStarter $ProcessStarter -ProcessLookup $ProcessLookup -StatusReader $StatusReader `
+        -Clock $Clock -Sleeper $Sleeper -ConfirmProvider $ConfirmProvider `
+        -ConfirmExitProvider $ConfirmExitProvider -ProfileNameProvider $ProfileNameProvider `
+        -ForceStopper $ForceStopper -AvailablePortsProvider { @('COM7') }
+}
+
+function Remove-ControllerTestDirectory {
+    param([string]$Path)
+    if (Test-Path -LiteralPath $Path) {
+        Remove-Item -LiteralPath $Path -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+Test-Case 'Controller exports its public commands' {
+    $expected = @(
+        'New-AIFishBotController', 'Set-AIFishBotViewFromConfig', 'Get-AIFishBotConfigFromView',
+        'Test-AIFishBotView', 'Set-AIFishBotRunningState', 'Save-AIFishBotCurrentProfile',
+        'Start-AIFishBotRun', 'Stop-AIFishBotRun', 'Resume-AIFishBotRun',
+        'Update-AIFishBotViewStatus', 'Update-AIFishBotViewLog'
+    )
+    $actual = @(Get-Command -Module AI-FishBot.Controller | Select-Object -ExpandProperty Name)
+    foreach ($name in $expected) {
+        Assert-True -Condition ($actual -contains $name)
+    }
+}
+
+Test-Case 'Controller owns a resolvable default serial-port provider' {
+    $command = & (Get-Module 'AI-FishBot.Controller') {
+        Get-Command 'Get-AIFishBotControllerAvailablePorts' -ErrorAction SilentlyContinue
+    }
+    Assert-True -Condition ($null -ne $command)
+}
+
+Test-Case 'Config and every editable view field round trip without marking a load dirty' {
+    $root = New-TestDirectory
+    try {
+        $view = New-ControllerFakeView
+        $controller = New-ControllerForTest -View $view -Root $root
+        $config = New-ControllerTestConfig
+
+        Set-AIFishBotViewFromConfig -Controller $controller -Config $config
+        $actual = Get-AIFishBotConfigFromView -Controller $controller
+
+        Assert-Equal -Expected (($config | ConvertTo-Json -Depth 10 -Compress)) -Actual (($actual | ConvertTo-Json -Depth 10 -Compress))
+        Assert-Equal -Expected $false -Actual $controller.IsDirty
+        Assert-Equal -Expected '已保存' -Actual $view.Controls.SaveStateLabel.Text
+    }
+    finally { Remove-ControllerTestDirectory $root }
+}
+
+Test-Case 'A user edit marks the profile unsaved' {
+    $root = New-TestDirectory
+    try {
+        $view = New-ControllerFakeView
+        $controller = New-ControllerForTest -View $view -Root $root
+        Set-AIFishBotViewFromConfig -Controller $controller -Config (New-ControllerTestConfig)
+
+        $view.Controls.AutoStop.Checked = $false
+        $view.Controls.AutoStop.InvokeEvent('CheckedChanged')
+
+        Assert-Equal -Expected $true -Actual $controller.IsDirty
+        Assert-Equal -Expected '未保存' -Actual $view.Controls.SaveStateLabel.Text
+    }
+    finally { Remove-ControllerTestDirectory $root }
+}
+
+Test-Case 'Invalid view fields show a Chinese error and disable Start' {
+    $root = New-TestDirectory
+    try {
+        $view = New-ControllerFakeView
+        $controller = New-ControllerForTest -View $view -Root $root
+        Set-AIFishBotViewFromConfig -Controller $controller -Config (New-ControllerTestConfig)
+        $view.Controls.PreHookMin.Value = 2.0
+        $view.Controls.PreHookMax.Value = 1.0
+
+        $validation = Test-AIFishBotView -Controller $controller
+
+        Assert-Equal -Expected $false -Actual $validation.IsValid
+        Assert-Equal -Expected $true -Actual $view.Controls.PreHookMin.HasError
+        Assert-True -Condition (-not [string]::IsNullOrWhiteSpace($view.Controls.PreHookMin.ErrorText))
+        Assert-Equal -Expected $false -Actual $view.Controls.StartStopButton.Enabled
+    }
+    finally { Remove-ControllerTestDirectory $root }
+}
+
+Test-Case 'Running locks fixed settings while live settings remain editable' {
+    $root = New-TestDirectory
+    try {
+        $view = New-ControllerFakeView
+        $controller = New-ControllerForTest -View $view -Root $root
+        Set-AIFishBotRunningState -Controller $controller -Running $true
+
+        foreach ($name in @('Retail', 'UseWindowFocus', 'UseWeakAura', 'FishingRetries', 'CastKey', 'BobberKey', 'LogoutKey', 'UsePi', 'PicoComPort', 'ProfileSelector', 'RenameProfileButton', 'DeleteProfileButton')) {
+            Assert-Equal -Expected $false -Actual $view.Controls[$name].Enabled
+        }
+        foreach ($name in @('AudioSensitivity', 'AutoStop', 'AutoStopTime', 'AutoLogout', 'BiteResponseMin', 'BiteResponseMax', 'PreHookMin', 'PreHookMax', 'PostHookMin', 'PostHookMax', 'PreCastMin', 'PreCastMax', 'BuffGrid', 'EnableNotifications', 'NotifyOnStop')) {
+            Assert-Equal -Expected $true -Actual $view.Controls[$name].Enabled
+        }
+        Assert-Equal -Expected $true -Actual $view.Timers.Status.Enabled
+        Assert-Equal -Expected $true -Actual $view.Timers.Log.Enabled
+    }
+    finally { Remove-ControllerTestDirectory $root }
+}
+
+Test-Case 'Saving a stopped profile uses the profile store and clears dirty state' {
+    $root = New-TestDirectory
+    try {
+        $view = New-ControllerFakeView
+        $controller = New-ControllerForTest -View $view -Root $root
+        Set-AIFishBotViewFromConfig -Controller $controller -Config (New-ControllerTestConfig -Name '保存方案')
+        $controller.MarkDirty()
+
+        $result = Save-AIFishBotCurrentProfile -Controller $controller
+        $saved = Read-AIFishBotProfile -ProfilesDirectory (Join-Path $root 'profiles') -ProfileName '保存方案'
+
+        Assert-Equal -Expected $true -Actual $result.Success
+        Assert-Equal -Expected 25 -Actual $saved.autoStopTime
+        Assert-Equal -Expected $false -Actual $controller.IsDirty
+        Assert-Equal -Expected '已保存' -Actual $view.Controls.SaveStateLabel.Text
+    }
+    finally { Remove-ControllerTestDirectory $root }
+}
+
+Test-Case 'Saving while running persists the profile but writes only live fields with a strict version increment' {
+    $root = New-TestDirectory
+    try {
+        $view = New-ControllerFakeView
+        $controller = New-ControllerForTest -View $view -Root $root
+        $config = New-ControllerTestConfig -Name '运行方案'
+        Set-AIFishBotViewFromConfig -Controller $controller -Config $config
+        Save-AIFishBotCurrentProfile -Controller $controller | Out-Null
+        $runDirectory = New-AIFishBotRunDirectory -RuntimeRoot (Join-Path $root 'runtime') -StartConfig $config -LiveConfig ([pscustomobject]@{ configVersion = 4 })
+        $controller.CurrentRunDirectory = $runDirectory
+        $controller.ConfigVersion = 4
+        Set-AIFishBotRunningState -Controller $controller -Running $true
+        $view.Controls.AudioSensitivity.Value = 8
+        $view.Controls.Retail.Checked = $false
+
+        Save-AIFishBotCurrentProfile -Controller $controller | Out-Null
+        $live = Read-AIFishBotJson -Path (Join-Path $runDirectory 'live-config.json')
+        $saved = Read-AIFishBotProfile -ProfilesDirectory (Join-Path $root 'profiles') -ProfileName '运行方案'
+
+        Assert-Equal -Expected 5 -Actual $live.configVersion
+        Assert-Equal -Expected 8 -Actual $live.audioSensitivity
+        Assert-Equal -Expected $config.discordWebhook -Actual $live.discordWebhook
+        Assert-True -Condition ($null -eq $live.PSObject.Properties['retail'])
+        Assert-True -Condition ($null -eq $live.PSObject.Properties['notifyOnStart'])
+        Assert-Equal -Expected $false -Actual $saved.retail
+    }
+    finally { Remove-ControllerTestDirectory $root }
+}
+
+Test-Case 'Running edits remain unsaved until Save writes one new live version' {
+    $root = New-TestDirectory
+    try {
+        $view = New-ControllerFakeView
+        $controller = New-ControllerForTest -View $view -Root $root
+        $config = New-ControllerTestConfig -Name '实时保存方案'
+        Set-AIFishBotViewFromConfig -Controller $controller -Config $config
+        Save-AIFishBotCurrentProfile -Controller $controller | Out-Null
+        $run = New-AIFishBotRunDirectory -RuntimeRoot (Join-Path $root 'runtime') -StartConfig $config -LiveConfig ([pscustomobject]@{ configVersion = 3 })
+        $controller.CurrentRunDirectory = $run
+        $controller.ConfigVersion = 3
+        Set-AIFishBotRunningState -Controller $controller -Running $true
+
+        $view.Controls.AudioSensitivity.Value = 8
+        $view.Controls.AudioSensitivity.InvokeEvent('ValueChanged')
+        Assert-Equal -Expected 3 -Actual (Read-AIFishBotJson -Path (Join-Path $run 'live-config.json')).configVersion
+        Assert-Equal -Expected $true -Actual $controller.IsDirty
+
+        Save-AIFishBotCurrentProfile -Controller $controller | Out-Null
+        Assert-Equal -Expected 4 -Actual (Read-AIFishBotJson -Path (Join-Path $run 'live-config.json')).configVersion
+    }
+    finally { Remove-ControllerTestDirectory $root }
+}
+
+Test-Case 'Running Save reports when profile persistence succeeds but live persistence fails' {
+    $root = New-TestDirectory
+    try {
+        $view = New-ControllerFakeView
+        $controller = New-ControllerForTest -View $view -Root $root
+        $config = New-ControllerTestConfig -Name '部分保存方案'
+        Set-AIFishBotViewFromConfig -Controller $controller -Config $config
+        Save-AIFishBotCurrentProfile -Controller $controller | Out-Null
+        $run = Join-Path $root 'runtime\broken-run'
+        New-Item -ItemType Directory -Path (Join-Path $run 'live-config.json') -Force | Out-Null
+        $controller.CurrentRunDirectory = $run
+        $controller.ConfigVersion = 1
+        Set-AIFishBotRunningState -Controller $controller -Running $true
+        $view.Controls.AutoStopTime.Value = 33
+        $controller.MarkDirty()
+
+        $result = Save-AIFishBotCurrentProfile -Controller $controller
+        $saved = Read-AIFishBotProfile -ProfilesDirectory (Join-Path $root 'profiles') -ProfileName '部分保存方案'
+
+        Assert-Equal -Expected $false -Actual $result.Success
+        Assert-Equal -Expected $true -Actual $result.ProfileSaved
+        Assert-Equal -Expected $false -Actual $result.LiveConfigSaved
+        Assert-Equal -Expected 33 -Actual $saved.autoStopTime
+        Assert-Equal -Expected $true -Actual $controller.IsDirty
+    }
+    finally { Remove-ControllerTestDirectory $root }
+}
+
+Test-Case 'Profile buttons create copy rename and delete with collision-free copy names' {
+    $root = New-TestDirectory
+    try {
+        $view = New-ControllerFakeView
+        $script:names = @('新建方案', '改名方案')
+        $nameProvider = {
+            param($action, $current, $suggested)
+            if ($action -eq 'New') { return $script:names[0] }
+            if ($action -eq 'Rename') { return $script:names[1] }
+            return $suggested
+        }
+        $controller = New-ControllerForTest -View $view -Root $root -ProfileNameProvider $nameProvider
+        Set-AIFishBotViewFromConfig -Controller $controller -Config (New-ControllerTestConfig -Name '原方案')
+        Save-AIFishBotCurrentProfile -Controller $controller | Out-Null
+
+        $controller.NewProfile() | Out-Null
+        $controller.CopyProfile() | Out-Null
+        $controller.CopyProfile() | Out-Null
+        $controller.RenameProfile() | Out-Null
+        $controller.DeleteProfile() | Out-Null
+        $profiles = @(Get-AIFishBotProfiles -ProfilesDirectory (Join-Path $root 'profiles'))
+
+        Assert-Equal -Expected 3 -Actual $profiles.Count
+        foreach ($name in @('原方案', '新建方案', '新建方案 - 副本')) {
+            Assert-True -Condition ($profiles -contains $name)
+        }
+    }
+    finally { Remove-ControllerTestDirectory $root; Remove-Variable names -Scope Script -ErrorAction SilentlyContinue }
+}
+
+Test-Case 'Deleting a dirty profile confirms once and loads the remaining profile' {
+    $root = New-TestDirectory
+    try {
+        $view = New-ControllerFakeView
+        $script:deleteConfirmCalls = 0
+        $controller = New-ControllerForTest -View $view -Root $root -ConfirmProvider {
+            param($purpose)
+            $script:deleteConfirmCalls += 1
+            return ($script:deleteConfirmCalls -eq 1)
+        }
+        foreach ($name in @('保留方案', '删除方案')) {
+            Set-AIFishBotViewFromConfig -Controller $controller -Config (New-ControllerTestConfig -Name $name)
+            Save-AIFishBotCurrentProfile -Controller $controller | Out-Null
+        }
+        $controller.MarkDirty()
+
+        $result = $controller.DeleteProfile()
+
+        Assert-Equal -Expected $true -Actual $result.Success
+        Assert-Equal -Expected 1 -Actual $script:deleteConfirmCalls
+        Assert-Equal -Expected '保留方案' -Actual $controller.CurrentProfileName
+        Assert-Equal -Expected @('保留方案') -Actual @(Get-AIFishBotProfiles -ProfilesDirectory (Join-Path $root 'profiles'))
+    }
+    finally { Remove-ControllerTestDirectory $root; Remove-Variable deleteConfirmCalls -Scope Script -ErrorAction SilentlyContinue }
+}
+
+Test-Case 'An active run blocks profile switching renaming and deletion' {
+    $root = New-TestDirectory
+    try {
+        $view = New-ControllerFakeView
+        $controller = New-ControllerForTest -View $view -Root $root
+        Set-AIFishBotViewFromConfig -Controller $controller -Config (New-ControllerTestConfig -Name '甲')
+        Save-AIFishBotCurrentProfile -Controller $controller | Out-Null
+        Set-AIFishBotRunningState -Controller $controller -Running $true
+
+        Assert-Equal -Expected $false -Actual ($controller.SwitchProfile('甲')).Success
+        Assert-Equal -Expected $false -Actual ($controller.RenameProfile()).Success
+        Assert-Equal -Expected $false -Actual ($controller.DeleteProfile()).Success
+    }
+    finally { Remove-ControllerTestDirectory $root }
+}
+
+Test-Case 'Unsaved profile switching asks for confirmation and respects rejection' {
+    $root = New-TestDirectory
+    try {
+        $view = New-ControllerFakeView
+        $script:allowSwitch = $false
+        $controller = New-ControllerForTest -View $view -Root $root -ConfirmProvider { param($purpose) $script:allowSwitch }
+        foreach ($name in @('甲', '乙')) {
+            Set-AIFishBotViewFromConfig -Controller $controller -Config (New-ControllerTestConfig -Name $name)
+            Save-AIFishBotCurrentProfile -Controller $controller | Out-Null
+        }
+        $controller.SwitchProfile('甲') | Out-Null
+        $controller.MarkDirty()
+
+        Assert-Equal -Expected $false -Actual ($controller.SwitchProfile('乙')).Success
+        Assert-Equal -Expected '甲' -Actual $controller.CurrentProfileName
+        $script:allowSwitch = $true
+        Assert-Equal -Expected $true -Actual ($controller.SwitchProfile('乙')).Success
+        Assert-Equal -Expected '乙' -Actual $controller.CurrentProfileName
+    }
+    finally { Remove-ControllerTestDirectory $root; Remove-Variable allowSwitch -Scope Script -ErrorAction SilentlyContinue }
+}
+
+Test-Case 'New and copy actions cannot leave an unsaved profile without confirmation' {
+    $root = New-TestDirectory
+    try {
+        $view = New-ControllerFakeView
+        $controller = New-ControllerForTest -View $view -Root $root -ConfirmProvider { param($purpose) $false }
+        Set-AIFishBotViewFromConfig -Controller $controller -Config (New-ControllerTestConfig -Name '未保存方案')
+        Save-AIFishBotCurrentProfile -Controller $controller | Out-Null
+        $controller.MarkDirty()
+
+        Assert-Equal -Expected $false -Actual ($controller.NewProfile()).Success
+        Assert-Equal -Expected $false -Actual ($controller.CopyProfile()).Success
+        Assert-Equal -Expected '未保存方案' -Actual $controller.CurrentProfileName
+        Assert-Equal -Expected @('未保存方案') -Actual @(Get-AIFishBotProfiles -ProfilesDirectory (Join-Path $root 'profiles'))
+    }
+    finally { Remove-ControllerTestDirectory $root }
+}
+
+Test-Case 'Start saves then reports a missing dependency without starting or installing anything' {
+    $root = New-TestDirectory
+    try {
+        $view = New-ControllerFakeView
+        $script:starterCalls = 0
+        $controller = New-ControllerForTest -View $view -Root $root `
+            -DependencyChecker { [pscustomobject]@{ Status = 'Missing'; IsAvailable = $false } } `
+            -ProcessStarter { param($request) $script:starterCalls += 1 }
+        Set-AIFishBotViewFromConfig -Controller $controller -Config (New-ControllerTestConfig -Name '依赖方案')
+
+        $result = Start-AIFishBotRun -Controller $controller
+
+        Assert-Equal -Expected $false -Actual $result.Success
+        Assert-Equal -Expected $true -Actual $result.RequiresDependencyInstall
+        Assert-Equal -Expected 0 -Actual $script:starterCalls
+        Assert-True -Condition (Test-Path -LiteralPath (Join-Path $root 'profiles\依赖方案.json'))
+    }
+    finally { Remove-ControllerTestDirectory $root; Remove-Variable starterCalls -Scope Script -ErrorAction SilentlyContinue }
+}
+
+Test-Case 'Start writes snapshots and passes safely quoted Chinese paths to hidden Windows PowerShell' {
+    $root = New-TestDirectory
+    try {
+        $view = New-ControllerFakeView
+        $script:startRequest = $null
+        $controller = New-ControllerForTest -View $view -Root $root -ProcessStarter {
+            param($request)
+            $script:startRequest = $request
+            [pscustomobject]@{ Id = 4321 }
+        }
+        Set-AIFishBotViewFromConfig -Controller $controller -Config (New-ControllerTestConfig -Name '启动方案')
+
+        $result = Start-AIFishBotRun -Controller $controller
+        $start = Read-AIFishBotJson -Path (Join-Path $result.RunDirectory 'start-config.json')
+        $live = Read-AIFishBotJson -Path (Join-Path $result.RunDirectory 'live-config.json')
+
+        Assert-Equal -Expected $true -Actual $result.Success
+        Assert-Equal -Expected 4321 -Actual $result.Pid
+        Assert-True -Condition ($script:startRequest.FilePath -like '*WindowsPowerShell*v1.0*powershell.exe')
+        Assert-True -Condition ($script:startRequest.ArgumentList -like '*-WindowStyle Hidden*')
+        Assert-True -Condition ($script:startRequest.ArgumentList -like '*"C:\测试 目录\AI-FishBot.Engine.ps1"*')
+        Assert-True -Condition ($script:startRequest.ArgumentList -like ('*"{0}"*' -f $result.RunDirectory))
+        Assert-Equal -Expected '启动方案' -Actual $start.profileName
+        Assert-Equal -Expected 1 -Actual $live.configVersion
+        Assert-True -Condition ($null -eq $live.PSObject.Properties['retail'])
+    }
+    finally { Remove-ControllerTestDirectory $root; Remove-Variable startRequest -Scope Script -ErrorAction SilentlyContinue }
+}
+
+Test-Case 'A starter failure rolls back the new run directory and running state' {
+    $root = New-TestDirectory
+    try {
+        $view = New-ControllerFakeView
+        $controller = New-ControllerForTest -View $view -Root $root -ProcessStarter { param($request) throw '模拟启动失败' }
+        Set-AIFishBotViewFromConfig -Controller $controller -Config (New-ControllerTestConfig -Name '失败方案')
+
+        $result = Start-AIFishBotRun -Controller $controller
+
+        Assert-Equal -Expected $false -Actual $result.Success
+        Assert-Equal -Expected $false -Actual $controller.IsRunning
+        Assert-Equal -Expected 0 -Actual @((Get-ChildItem -LiteralPath (Join-Path $root 'runtime') -Directory -ErrorAction SilentlyContinue)).Count
+    }
+    finally { Remove-ControllerTestDirectory $root }
+}
+
+Test-Case 'A marker write failure after process start keeps the known background run recoverable' {
+    $root = New-TestDirectory
+    try {
+        $view = New-ControllerFakeView
+        $script:markerController = $null
+        $controller = New-ControllerForTest -View $view -Root $root -ProcessStarter {
+            param($request)
+            New-Item -ItemType Directory -Path $script:markerController.ActiveMarkerPath -Force | Out-Null
+            [pscustomobject]@{ Id = 7788 }
+        }
+        $script:markerController = $controller
+        Set-AIFishBotViewFromConfig -Controller $controller -Config (New-ControllerTestConfig -Name '标记失败方案')
+
+        $result = Start-AIFishBotRun -Controller $controller
+
+        Assert-Equal -Expected $true -Actual $result.Success
+        Assert-Equal -Expected $true -Actual $result.MarkerWriteFailed
+        Assert-Equal -Expected $true -Actual $controller.IsRunning
+        Assert-Equal -Expected 7788 -Actual $controller.CurrentProcessId
+        Assert-True -Condition (Test-Path -LiteralPath $controller.CurrentRunDirectory -PathType Container)
+    }
+    finally { Remove-ControllerTestDirectory $root; Remove-Variable markerController -Scope Script -ErrorAction SilentlyContinue }
+}
+
+Test-Case 'Start refuses another valid active run under the runtime root' {
+    $root = New-TestDirectory
+    try {
+        $view = New-ControllerFakeView
+        $runtime = Join-Path $root 'runtime'
+        $existing = New-AIFishBotRunDirectory -RuntimeRoot $runtime -StartConfig (New-ControllerTestConfig) -LiveConfig ([pscustomobject]@{ configVersion = 1 })
+        $now = [datetimeoffset]'2026-07-13T10:00:00+08:00'
+        $status = [pscustomobject]@{ processId = 90; state = 'ready'; heartbeatAt = $now.ToString('o') }
+        $script:starterCalls = 0
+        $controller = New-ControllerForTest -View $view -Root $root -StatusReader { param($path) $status } `
+            -ProcessStarter { param($request) $script:starterCalls += 1 }
+        Set-AIFishBotViewFromConfig -Controller $controller -Config (New-ControllerTestConfig -Name '另一个方案')
+
+        $result = Start-AIFishBotRun -Controller $controller
+
+        Assert-Equal -Expected $false -Actual $result.Success
+        Assert-Equal -Expected $true -Actual $result.AlreadyRunning
+        Assert-Equal -Expected $existing -Actual $result.RunDirectory
+        Assert-Equal -Expected 0 -Actual $script:starterCalls
+    }
+    finally { Remove-ControllerTestDirectory $root; Remove-Variable starterCalls -Scope Script -ErrorAction SilentlyContinue }
+}
+
+Test-Case 'Stop writes a stop command and succeeds after observing stopped state' {
+    $root = New-TestDirectory
+    try {
+        $view = New-ControllerFakeView
+        $script:reads = 0
+        $controller = New-ControllerForTest -View $view -Root $root -StatusReader {
+            param($path)
+            $script:reads += 1
+            [pscustomobject]@{ processId = 222; state = $(if ($script:reads -ge 2) { 'stopped' } else { 'stopping' }); heartbeatAt = '2026-07-13T10:00:00+08:00' }
+        }
+        $run = New-AIFishBotRunDirectory -RuntimeRoot (Join-Path $root 'runtime') -StartConfig (New-ControllerTestConfig) -LiveConfig ([pscustomobject]@{ configVersion = 1 })
+        $controller.CurrentRunDirectory = $run
+        $controller.CurrentProcessId = 222
+        Set-AIFishBotRunningState -Controller $controller -Running $true
+
+        $result = Stop-AIFishBotRun -Controller $controller -TimeoutSeconds 2
+
+        Assert-Equal -Expected $true -Actual $result.Success
+        Assert-Equal -Expected 'stop' -Actual (Read-AIFishBotControlCommand -RunDirectory $run).command
+        Assert-Equal -Expected $false -Actual $controller.IsRunning
+    }
+    finally { Remove-ControllerTestDirectory $root; Remove-Variable reads -Scope Script -ErrorAction SilentlyContinue }
+}
+
+Test-Case 'Stop timeout requests explicit force confirmation and never kills by itself' {
+    $root = New-TestDirectory
+    try {
+        $view = New-ControllerFakeView
+        $script:now = [datetimeoffset]'2026-07-13T10:00:00+08:00'
+        $script:forceCalls = 0
+        $controller = New-ControllerForTest -View $view -Root $root `
+            -StatusReader { param($path) [pscustomobject]@{ processId = 333; state = 'stopping'; heartbeatAt = $script:now.ToString('o') } } `
+            -Clock { $script:now } -Sleeper { param($milliseconds) $script:now = $script:now.AddMilliseconds($milliseconds) } `
+            -ForceStopper { param($id) $script:forceCalls += 1 }
+        $run = New-AIFishBotRunDirectory -RuntimeRoot (Join-Path $root 'runtime') -StartConfig (New-ControllerTestConfig) -LiveConfig ([pscustomobject]@{ configVersion = 1 })
+        $controller.CurrentRunDirectory = $run
+        $controller.CurrentProcessId = 333
+        Set-AIFishBotRunningState -Controller $controller -Running $true
+
+        $result = Stop-AIFishBotRun -Controller $controller -TimeoutSeconds 0.2
+
+        Assert-Equal -Expected $false -Actual $result.Success
+        Assert-Equal -Expected $true -Actual $result.RequiresForceConfirmation
+        Assert-Equal -Expected 333 -Actual $result.Pid
+        Assert-Equal -Expected 0 -Actual $script:forceCalls
+        Assert-Equal -Expected $true -Actual $controller.IsRunning
+    }
+    finally { Remove-ControllerTestDirectory $root; Remove-Variable now, forceCalls -Scope Script -ErrorAction SilentlyContinue }
+}
+
+Test-Case 'Tray Stop force-stops only after injected timeout confirmation' {
+    $root = New-TestDirectory
+    try {
+        $view = New-ControllerFakeView
+        $script:trayNow = [datetimeoffset]'2026-07-13T10:00:00+08:00'
+        $script:trayForcedPid = 0
+        $controller = New-ControllerForTest -View $view -Root $root `
+            -StatusReader { param($path) [pscustomobject]@{ processId = 334; state = 'stopping'; heartbeatAt = $script:trayNow.ToString('o') } } `
+            -Clock { $script:trayNow } -Sleeper { param($milliseconds) $script:trayNow = $script:trayNow.AddSeconds(11) } `
+            -ConfirmProvider { param($purpose) $purpose -eq 'ForceStop' } `
+            -ForceStopper { param($id) $script:trayForcedPid = $id }
+        $run = New-AIFishBotRunDirectory -RuntimeRoot (Join-Path $root 'runtime') -StartConfig (New-ControllerTestConfig) -LiveConfig ([pscustomobject]@{ configVersion = 1 })
+        $controller.CurrentRunDirectory = $run
+        $controller.CurrentProcessId = 334
+        Set-AIFishBotRunningState -Controller $controller -Running $true
+
+        $view.TrayMenu.ByName.StopItem.InvokeEvent('Click')
+
+        Assert-Equal -Expected 334 -Actual $script:trayForcedPid
+        Assert-Equal -Expected $false -Actual $controller.IsRunning
+    }
+    finally {
+        Remove-ControllerTestDirectory $root
+        Remove-Variable trayNow, trayForcedPid -Scope Script -ErrorAction SilentlyContinue
+    }
+}
+
+Test-Case 'Default confirmation refuses a force stop when production wiring omits a dialog' {
+    $root = New-TestDirectory
+    try {
+        $view = New-ControllerFakeView
+        $script:defaultNow = [datetimeoffset]'2026-07-13T10:00:00+08:00'
+        $script:defaultForceCalls = 0
+        $controller = New-AIFishBotController -View $view -ProfilesDirectory (Join-Path $root 'profiles') `
+            -RuntimeRoot (Join-Path $root 'runtime') -EngineScriptPath 'C:\fake\engine.ps1' `
+            -DependencyChecker { [pscustomobject]@{ Status = 'Available'; IsAvailable = $true } } `
+            -ProcessStarter { param($request) throw 'not used' } `
+            -ProcessLookup { param($id) [pscustomobject]@{ Id = $id } } `
+            -StatusReader { param($path) [pscustomobject]@{ processId = 335; state = 'stopping'; heartbeatAt = $script:defaultNow.ToString('o') } } `
+            -Clock { $script:defaultNow } -Sleeper { param($milliseconds) $script:defaultNow = $script:defaultNow.AddSeconds(11) } `
+            -ForceStopper { param($id) $script:defaultForceCalls += 1 } -AvailablePortsProvider { @() }
+        $run = New-AIFishBotRunDirectory -RuntimeRoot (Join-Path $root 'runtime') -StartConfig (New-AIFishBotDefaultConfig) -LiveConfig ([pscustomobject]@{ configVersion = 1 })
+        $controller.CurrentRunDirectory = $run
+        $controller.CurrentProcessId = 335
+        Set-AIFishBotRunningState -Controller $controller -Running $true
+
+        $view.TrayMenu.ByName.StopItem.InvokeEvent('Click')
+
+        Assert-Equal -Expected 0 -Actual $script:defaultForceCalls
+        Assert-Equal -Expected $true -Actual $controller.IsRunning
+    }
+    finally {
+        Remove-ControllerTestDirectory $root
+        Remove-Variable defaultNow, defaultForceCalls -Scope Script -ErrorAction SilentlyContinue
+    }
+}
+
+Test-Case 'Force stop only runs after an explicit method call' {
+    $root = New-TestDirectory
+    try {
+        $view = New-ControllerFakeView
+        $script:forcedPid = 0
+        $controller = New-ControllerForTest -View $view -Root $root -ForceStopper { param($id) $script:forcedPid = $id }
+        $controller.CurrentProcessId = 444
+        Set-AIFishBotRunningState -Controller $controller -Running $true
+
+        $result = $controller.ForceStop()
+
+        Assert-Equal -Expected $true -Actual $result.Success
+        Assert-Equal -Expected 444 -Actual $script:forcedPid
+        Assert-Equal -Expected $false -Actual $controller.IsRunning
+    }
+    finally { Remove-ControllerTestDirectory $root; Remove-Variable forcedPid -Scope Script -ErrorAction SilentlyContinue }
+}
+
+Test-Case 'Resume validates process and fresh heartbeat then restores the running view' {
+    $root = New-TestDirectory
+    try {
+        $view = New-ControllerFakeView
+        $now = [datetimeoffset]'2026-07-13T10:00:00+08:00'
+        $config = New-ControllerTestConfig -Name '恢复方案'
+        $run = New-AIFishBotRunDirectory -RuntimeRoot (Join-Path $root 'runtime') -StartConfig $config -LiveConfig ([pscustomobject]@{ configVersion = 7; audioSensitivity = 9 })
+        $status = [pscustomobject]@{ processId = 555; state = 'ready'; hookCount = 2; retryCount = 1; profileName = '恢复方案'; startedAt = $now.AddMinutes(-1).ToString('o'); remainingSeconds = 60; lastError = $null; heartbeatAt = $now.ToString('o'); configVersion = 7 }
+        $controller = New-ControllerForTest -View $view -Root $root -StatusReader { param($path) $status }
+
+        $result = Resume-AIFishBotRun -Controller $controller -RunDirectory $run
+
+        Assert-Equal -Expected $true -Actual $result.Success
+        Assert-Equal -Expected $true -Actual $controller.IsRunning
+        Assert-Equal -Expected 555 -Actual $controller.CurrentProcessId
+        Assert-Equal -Expected 9 -Actual $view.Controls.AudioSensitivity.Value
+        Assert-Equal -Expected $false -Actual $view.Controls.Retail.Enabled
+    }
+    finally { Remove-ControllerTestDirectory $root }
+}
+
+Test-Case 'Resume clears stale controller state without terminating a process' {
+    $root = New-TestDirectory
+    try {
+        $view = New-ControllerFakeView
+        $script:lookupCalls = 0
+        $now = [datetimeoffset]'2026-07-13T10:00:00+08:00'
+        $run = New-AIFishBotRunDirectory -RuntimeRoot (Join-Path $root 'runtime') -StartConfig (New-ControllerTestConfig) -LiveConfig ([pscustomobject]@{ configVersion = 1 })
+        $status = [pscustomobject]@{ processId = 666; state = 'ready'; heartbeatAt = $now.AddMinutes(-5).ToString('o'); configVersion = 1 }
+        $controller = New-ControllerForTest -View $view -Root $root -StatusReader { param($path) $status } `
+            -ProcessLookup { param($id) $script:lookupCalls += 1; [pscustomobject]@{ Id = $id } }
+        $controller.CurrentRunDirectory = 'stale'
+        $controller.CurrentProcessId = 1
+        Set-AIFishBotRunningState -Controller $controller -Running $false
+
+        $result = Resume-AIFishBotRun -Controller $controller -RunDirectory $run
+
+        Assert-Equal -Expected $false -Actual $result.Success
+        Assert-Equal -Expected $false -Actual $controller.IsRunning
+        Assert-Equal -Expected $null -Actual $controller.CurrentRunDirectory
+        Assert-True -Condition ($script:lookupCalls -ge 1)
+    }
+    finally { Remove-ControllerTestDirectory $root; Remove-Variable lookupCalls -Scope Script -ErrorAction SilentlyContinue }
+}
+
+Test-Case 'Resume never clears an already tracked active run' {
+    $root = New-TestDirectory
+    try {
+        $view = New-ControllerFakeView
+        $controller = New-ControllerForTest -View $view -Root $root
+        $controller.CurrentRunDirectory = 'C:\有效运行'
+        $controller.CurrentProcessId = 777
+        Set-AIFishBotRunningState -Controller $controller -Running $true
+
+        $result = Resume-AIFishBotRun -Controller $controller -RunDirectory (Join-Path $root '不存在')
+
+        Assert-Equal -Expected $true -Actual $result.Success
+        Assert-Equal -Expected $true -Actual $result.AlreadyRunning
+        Assert-Equal -Expected 'C:\有效运行' -Actual $controller.CurrentRunDirectory
+        Assert-Equal -Expected 777 -Actual $controller.CurrentProcessId
+    }
+    finally { Remove-ControllerTestDirectory $root }
+}
+
+Test-Case 'Resume falls back from a stale marker to another valid run' {
+    $root = New-TestDirectory
+    try {
+        $view = New-ControllerFakeView
+        $runtime = Join-Path $root 'runtime'
+        $config = New-ControllerTestConfig -Name '回退恢复方案'
+        $script:staleRun = New-AIFishBotRunDirectory -RuntimeRoot $runtime -StartConfig $config -LiveConfig ([pscustomobject]@{ configVersion = 1 })
+        $script:liveRun = New-AIFishBotRunDirectory -RuntimeRoot $runtime -StartConfig $config -LiveConfig ([pscustomobject]@{ configVersion = 2; audioSensitivity = 8 })
+        $now = [datetimeoffset]'2026-07-13T10:00:00+08:00'
+        $controller = New-ControllerForTest -View $view -Root $root -StatusReader {
+            param($path)
+            if ([System.IO.Path]::GetFullPath($path) -eq [System.IO.Path]::GetFullPath($script:liveRun)) {
+                return [pscustomobject]@{ processId = 991; state = 'ready'; heartbeatAt = '2026-07-13T10:00:00+08:00'; configVersion = 2 }
+            }
+            return [pscustomobject]@{ processId = 990; state = 'ready'; heartbeatAt = '2026-07-13T09:00:00+08:00'; configVersion = 1 }
+        }
+        Write-AIFishBotAtomicJson -Path $controller.ActiveMarkerPath -InputObject ([pscustomobject]@{ runDirectory = $script:staleRun; processId = 990 }) | Out-Null
+
+        $result = Resume-AIFishBotRun -Controller $controller
+
+        Assert-Equal -Expected $true -Actual $result.Success
+        Assert-Equal -Expected ([System.IO.Path]::GetFullPath($script:liveRun)) -Actual $controller.CurrentRunDirectory
+        Assert-Equal -Expected 991 -Actual $controller.CurrentProcessId
+    }
+    finally {
+        Remove-ControllerTestDirectory $root
+        Remove-Variable staleRun, liveRun -Scope Script -ErrorAction SilentlyContinue
+    }
+}
+
+Test-Case 'Resume keeps a validated process tracked when the active marker cannot be written' {
+    $root = New-TestDirectory
+    try {
+        $view = New-ControllerFakeView
+        $now = [datetimeoffset]'2026-07-13T10:00:00+08:00'
+        $config = New-ControllerTestConfig -Name '恢复标记失败'
+        $run = New-AIFishBotRunDirectory -RuntimeRoot (Join-Path $root 'runtime') -StartConfig $config -LiveConfig ([pscustomobject]@{ configVersion = 6 })
+        $status = [pscustomobject]@{ processId = 992; state = 'ready'; heartbeatAt = $now.ToString('o'); configVersion = 6 }
+        $controller = New-ControllerForTest -View $view -Root $root -StatusReader { param($path) $status }
+        New-Item -ItemType Directory -Path $controller.ActiveMarkerPath -Force | Out-Null
+
+        $result = Resume-AIFishBotRun -Controller $controller -RunDirectory $run
+
+        Assert-Equal -Expected $true -Actual $result.Success
+        Assert-Equal -Expected $true -Actual $result.MarkerWriteFailed
+        Assert-Equal -Expected $true -Actual $controller.IsRunning
+        Assert-Equal -Expected 992 -Actual $controller.CurrentProcessId
+        Assert-Equal -Expected ([System.IO.Path]::GetFullPath($run)) -Actual $controller.CurrentRunDirectory
+    }
+    finally { Remove-ControllerTestDirectory $root }
+}
+
+Test-Case 'Status updates Chinese state statistics remaining time and peak value' {
+    $root = New-TestDirectory
+    try {
+        $view = New-ControllerFakeView
+        $controller = New-ControllerForTest -View $view -Root $root
+        $status = [pscustomobject]@{ state = 'waiting-for-bite'; hookCount = 12; retryCount = 3; remainingSeconds = 65; audioPeak = 88 }
+
+        Update-AIFishBotViewStatus -Controller $controller -Status $status | Out-Null
+
+        Assert-Equal -Expected '● 等待咬钩' -Actual $view.Controls.StatusBadge.Text
+        Assert-Equal -Expected '已上钩：12' -Actual $view.Controls.HookCount.Text
+        Assert-Equal -Expected '剩余：01:05' -Actual $view.Controls.RemainingTime.Text
+        Assert-Equal -Expected 88 -Actual $view.Controls.AudioPeakBar.Value
+        Assert-Equal -Expected '状态：等待咬钩' -Actual $view.TrayMenu.ByName.StatusItem.Text
+    }
+    finally { Remove-ControllerTestDirectory $root }
+}
+
+Test-Case 'Terminal status unlocks the view stops timers and clears tracked runtime state' {
+    $root = New-TestDirectory
+    try {
+        $view = New-ControllerFakeView
+        $controller = New-ControllerForTest -View $view -Root $root
+        $controller.CurrentRunDirectory = Join-Path $root 'runtime\run'
+        $controller.CurrentProcessId = 888
+        New-Item -ItemType Directory -Path (Split-Path $controller.ActiveMarkerPath -Parent) -Force | Out-Null
+        Write-AIFishBotAtomicJson -Path $controller.ActiveMarkerPath -InputObject ([pscustomobject]@{ runDirectory = $controller.CurrentRunDirectory; processId = 888 }) | Out-Null
+        Set-AIFishBotRunningState -Controller $controller -Running $true
+
+        Update-AIFishBotViewStatus -Controller $controller -Status ([pscustomobject]@{ state = 'stopped'; hookCount = 4; remainingSeconds = 0 }) | Out-Null
+
+        Assert-Equal -Expected $false -Actual $controller.IsRunning
+        Assert-Equal -Expected $null -Actual $controller.CurrentRunDirectory
+        Assert-Equal -Expected 0 -Actual $controller.CurrentProcessId
+        Assert-Equal -Expected $false -Actual $view.Timers.Status.Enabled
+        Assert-Equal -Expected $false -Actual $view.Timers.Log.Enabled
+        Assert-True -Condition (-not (Test-Path -LiteralPath $controller.ActiveMarkerPath))
+        Assert-Equal -Expected $true -Actual $view.Controls.CastKey.Enabled
+    }
+    finally { Remove-ControllerTestDirectory $root }
+}
+
+Test-Case 'Log update appends only new text caps lines and masks Discord webhooks' {
+    $root = New-TestDirectory
+    try {
+        $view = New-ControllerFakeView
+        $controller = New-ControllerForTest -View $view -Root $root
+        $secret = 'https://discord.com/api/webhooks/123456/secret-token'
+        Update-AIFishBotViewLog -Controller $controller -Content "one $secret`ntwo" -MaximumLines 3 | Out-Null
+        Assert-True -Condition ($view.Controls.LogBox.Text -notlike '*secret-token*')
+        Assert-True -Condition ($view.Controls.LogBox.Text -like '*webhooks/***')
+        Update-AIFishBotViewLog -Controller $controller -Content "one $secret`ntwo`nthree`nfour" -MaximumLines 3 | Out-Null
+
+        Assert-True -Condition ($view.Controls.LogBox.Text -notlike '*secret-token*')
+        Assert-Equal -Expected @('two', 'three', 'four') -Actual @($view.Controls.LogBox.Text -split "`r?`n")
+    }
+    finally { Remove-ControllerTestDirectory $root }
+}
+
+Test-Case 'Log line limits do not count a trailing newline as a visible line' {
+    $root = New-TestDirectory
+    try {
+        $view = New-ControllerFakeView
+        $controller = New-ControllerForTest -View $view -Root $root
+
+        Update-AIFishBotViewLog -Controller $controller -Content "one`ntwo`n" -MaximumLines 2 | Out-Null
+
+        Assert-Equal -Expected @('one', 'two') -Actual @($view.Controls.LogBox.Text -split "`r?`n")
+    }
+    finally { Remove-ControllerTestDirectory $root }
+}
+
+Test-Case 'Webhook masking remains safe when one URL is split across log reads' {
+    $root = New-TestDirectory
+    try {
+        $view = New-ControllerFakeView
+        $controller = New-ControllerForTest -View $view -Root $root
+        $first = 'line https://discord.com/api/webhooks/123456/'
+        Update-AIFishBotViewLog -Controller $controller -Content $first | Out-Null
+        Update-AIFishBotViewLog -Controller $controller -Content ($first + 'secret-token') | Out-Null
+
+        Assert-True -Condition ($view.Controls.LogBox.Text -notlike '*123456*')
+        Assert-True -Condition ($view.Controls.LogBox.Text -notlike '*secret-token*')
+        Assert-True -Condition ($view.Controls.LogBox.Text -like '*webhooks/***')
+    }
+    finally { Remove-ControllerTestDirectory $root }
+}
+
+Test-Case 'Oversized partial log lines are dropped before they can separate a webhook secret from its prefix' {
+    $root = New-TestDirectory
+    try {
+        $view = New-ControllerFakeView
+        $controller = New-ControllerForTest -View $view -Root $root
+        $controller.RawLogHistory = 'https://discord.com/api/webhooks/123456/' + ('x' * 1048576)
+
+        Update-AIFishBotViewLog -Controller $controller -Content 'secret-token' | Out-Null
+
+        Assert-True -Condition ($view.Controls.LogBox.Text -notlike '*secret-token*')
+        Assert-True -Condition ($view.Controls.LogBox.Text -like '*日志行过长*')
+    }
+    finally { Remove-ControllerTestDirectory $root }
+}
+
+Test-Case 'Runtime log polling tracks a file offset and appends without rereading old lines' {
+    $root = New-TestDirectory
+    try {
+        $view = New-ControllerFakeView
+        $controller = New-ControllerForTest -View $view -Root $root
+        $run = New-AIFishBotRunDirectory -RuntimeRoot (Join-Path $root 'runtime') -StartConfig (New-ControllerTestConfig) -LiveConfig ([pscustomobject]@{ configVersion = 1 })
+        $controller.CurrentRunDirectory = $run
+        $firstPath = Write-AIFishBotLog -RunDirectory $run -Level INFO -Message 'first' -Now ([datetimeoffset]'2026-07-13T10:00:00+08:00')
+        Update-AIFishBotViewLog -Controller $controller | Out-Null
+        Write-AIFishBotLog -RunDirectory $run -Level INFO -Message 'second' -Now ([datetimeoffset]'2026-07-13T10:00:01+08:00') | Out-Null
+        Update-AIFishBotViewLog -Controller $controller | Out-Null
+
+        Assert-Equal -Expected ([System.IO.FileInfo]$firstPath).Length -Actual $controller.LastLogFileOffset
+        Assert-Equal -Expected 1 -Actual @([regex]::Matches($view.Controls.LogBox.Text, 'first')).Count
+        Assert-Equal -Expected 1 -Actual @([regex]::Matches($view.Controls.LogBox.Text, 'second')).Count
+        Assert-Equal -Expected 0 -Actual $controller.LastLogSourceLength
+    }
+    finally { Remove-ControllerTestDirectory $root }
+}
+
+Test-Case 'Tray open and background exit events are bound by the controller' {
+    $root = New-TestDirectory
+    try {
+        $view = New-ControllerFakeView
+        $controller = New-ControllerForTest -View $view -Root $root -ConfirmExitProvider { param($running) 'Continue' }
+        $view.Form.Visible = $false
+        $view.TrayIcon.Visible = $true
+
+        $view.TrayMenu.ByName.OpenItem.InvokeEvent('Click')
+        Assert-Equal -Expected $true -Actual $view.Form.Visible
+        Assert-Equal -Expected $false -Actual $view.TrayIcon.Visible
+
+        Set-AIFishBotRunningState -Controller $controller -Running $true
+        $view.TrayMenu.ByName.ExitItem.InvokeEvent('Click')
+        Assert-Equal -Expected 1 -Actual $view.ExitCount
+        Assert-Equal -Expected $true -Actual $controller.IsRunning
+
+        Set-AIFishBotRunningState -Controller $controller -Running $false
+        $view.TrayMenu.ByName.ExitItem.InvokeEvent('Click')
+        Assert-Equal -Expected 2 -Actual $view.ExitCount
+    }
+    finally { Remove-ControllerTestDirectory $root }
+}
+
+Test-Case 'Exit with Stop handles an injected force confirmation before disposing the view' {
+    $root = New-TestDirectory
+    try {
+        $view = New-ControllerFakeView
+        $script:exitNow = [datetimeoffset]'2026-07-13T10:00:00+08:00'
+        $script:exitForcedPid = 0
+        $controller = New-ControllerForTest -View $view -Root $root `
+            -StatusReader { param($path) [pscustomobject]@{ processId = 445; state = 'stopping'; heartbeatAt = $script:exitNow.ToString('o') } } `
+            -Clock { $script:exitNow } -Sleeper { param($milliseconds) $script:exitNow = $script:exitNow.AddSeconds(11) } `
+            -ConfirmProvider { param($purpose) $purpose -eq 'ForceStop' } `
+            -ConfirmExitProvider { param($running) 'Stop' } `
+            -ForceStopper { param($id) $script:exitForcedPid = $id }
+        $run = New-AIFishBotRunDirectory -RuntimeRoot (Join-Path $root 'runtime') -StartConfig (New-ControllerTestConfig) -LiveConfig ([pscustomobject]@{ configVersion = 1 })
+        $controller.CurrentRunDirectory = $run
+        $controller.CurrentProcessId = 445
+        Set-AIFishBotRunningState -Controller $controller -Running $true
+
+        $view.TrayMenu.ByName.ExitItem.InvokeEvent('Click')
+
+        Assert-Equal -Expected 445 -Actual $script:exitForcedPid
+        Assert-Equal -Expected 1 -Actual $view.ExitCount
+    }
+    finally {
+        Remove-ControllerTestDirectory $root
+        Remove-Variable exitNow, exitForcedPid -Scope Script -ErrorAction SilentlyContinue
+    }
+}
+
+Test-Case 'A real hidden WinForms view binds the serial port and user change events' {
+    $root = New-TestDirectory
+    $view = $null
+    try {
+        Import-Module (Join-Path -Path (Split-Path -Path $PSScriptRoot -Parent) -ChildPath 'AI-FishBot.UI.psm1') -Force
+        $view = New-AIFishBotMainView
+        $controller = New-ControllerForTest -View $view -Root $root
+        Set-AIFishBotViewFromConfig -Controller $controller -Config (New-ControllerTestConfig) | Out-Null
+
+        $roundTrip = Get-AIFishBotConfigFromView -Controller $controller
+        Assert-Equal -Expected 'COM7' -Actual $roundTrip.picoComPort
+        Assert-Equal -Expected $false -Actual $controller.IsDirty
+
+        $view.Controls.AutoLogout.Checked = -not $view.Controls.AutoLogout.Checked
+        Assert-Equal -Expected $true -Actual $controller.IsDirty
+        Set-AIFishBotRunningState -Controller $controller -Running $true
+        Assert-Equal -Expected $false -Actual $view.Controls.CastKey.Enabled
+        Assert-Equal -Expected $true -Actual $view.Controls.AudioSensitivity.Enabled
+        Assert-Equal -Expected $true -Actual $view.Timers.Status.Enabled
+        Assert-Equal -Expected $true -Actual $view.Timers.Log.Enabled
+    }
+    finally {
+        if ($null -ne $view) { $view.Dispose() }
+        Remove-ControllerTestDirectory $root
+    }
+}
