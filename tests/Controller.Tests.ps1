@@ -241,6 +241,8 @@ Test-Case 'Invalid view fields show a Chinese error and disable Start' {
         Assert-Equal -Expected $true -Actual $view.Controls.PreHookMin.HasError
         Assert-True -Condition (-not [string]::IsNullOrWhiteSpace($view.Controls.PreHookMin.ErrorText))
         Assert-Equal -Expected $false -Actual $view.Controls.StartStopButton.Enabled
+        $view.Controls.StartStopButton.InvokeEvent('Click')
+        Assert-True -Condition ($view.Controls.SaveStateLabel.Text -like '配置错误：*')
     }
     finally { Remove-ControllerTestDirectory $root }
 }
@@ -252,7 +254,7 @@ Test-Case 'Running locks fixed settings while live settings remain editable' {
         $controller = New-ControllerForTest -View $view -Root $root
         Set-AIFishBotRunningState -Controller $controller -Running $true
 
-        foreach ($name in @('Retail', 'UseWindowFocus', 'UseWeakAura', 'FishingRetries', 'CastKey', 'BobberKey', 'LogoutKey', 'UsePi', 'PicoComPort', 'ProfileSelector', 'RenameProfileButton', 'DeleteProfileButton')) {
+        foreach ($name in @('Retail', 'UseWindowFocus', 'UseWeakAura', 'FishingRetries', 'CastKey', 'BobberKey', 'LogoutKey', 'UsePi', 'PicoComPort', 'WebhookText', 'NotifyOnStart', 'ProfileSelector', 'RenameProfileButton', 'DeleteProfileButton')) {
             Assert-Equal -Expected $false -Actual $view.Controls[$name].Enabled
         }
         foreach ($name in @('AudioSensitivity', 'AutoStop', 'AutoStopTime', 'AutoLogout', 'BiteResponseMin', 'BiteResponseMax', 'PreHookMin', 'PreHookMax', 'PostHookMin', 'PostHookMax', 'PreCastMin', 'PreCastMax', 'BuffGrid', 'EnableNotifications', 'NotifyOnStop')) {
@@ -260,6 +262,24 @@ Test-Case 'Running locks fixed settings while live settings remain editable' {
         }
         Assert-Equal -Expected $true -Actual $view.Timers.Status.Enabled
         Assert-Equal -Expected $true -Actual $view.Timers.Log.Enabled
+
+        $liveControls = @(
+            'AudioSensitivity', 'AutoStop', 'AutoStopTime', 'AutoLogout',
+            'BiteResponseMin', 'BiteResponseMax', 'PreHookMin', 'PreHookMax',
+            'PostHookMin', 'PostHookMax', 'PreCastMin', 'PreCastMax',
+            'BuffGrid', 'EnableNotifications', 'NotifyOnStop'
+        )
+        $allConfigControls = @(
+            'Retail', 'AutoStop', 'AutoStopTime', 'AutoLogout', 'AudioSensitivity',
+            'UseWindowFocus', 'UseWeakAura', 'FishingRetries', 'CastKey', 'BobberKey',
+            'LogoutKey', 'UsePi', 'PicoComPort', 'EnableNotifications', 'WebhookText',
+            'NotifyOnStart', 'NotifyOnStop', 'BiteResponseMin', 'BiteResponseMax',
+            'PreHookMin', 'PreHookMax', 'PostHookMin', 'PostHookMax', 'PreCastMin',
+            'PreCastMax', 'BuffGrid'
+        )
+        foreach ($name in $allConfigControls) {
+            Assert-Equal -Expected ($liveControls -contains $name) -Actual $view.Controls[$name].Enabled
+        }
     }
     finally { Remove-ControllerTestDirectory $root }
 }
@@ -304,10 +324,11 @@ Test-Case 'Saving while running persists the profile but writes only live fields
 
         Assert-Equal -Expected 5 -Actual $live.configVersion
         Assert-Equal -Expected 8 -Actual $live.audioSensitivity
-        Assert-Equal -Expected $config.discordWebhook -Actual $live.discordWebhook
+        Assert-True -Condition ($null -eq $live.PSObject.Properties['discordWebhook'])
         Assert-True -Condition ($null -eq $live.PSObject.Properties['retail'])
         Assert-True -Condition ($null -eq $live.PSObject.Properties['notifyOnStart'])
         Assert-Equal -Expected $false -Actual $saved.retail
+        Assert-Equal -Expected $config.discordWebhook -Actual $saved.discordWebhook
     }
     finally { Remove-ControllerTestDirectory $root }
 }
@@ -806,6 +827,50 @@ Test-Case 'Resume falls back from a stale marker to another valid run' {
     }
 }
 
+Test-Case 'Resume scans a valid run after a readable marker has a missing empty or invalid directory' {
+    $root = New-TestDirectory
+    try {
+        $runtime = Join-Path $root 'runtime'
+        $config = New-ControllerTestConfig -Name '扫描恢复方案'
+        $script:scanCandidate = New-AIFishBotRunDirectory -RuntimeRoot $runtime -StartConfig $config -LiveConfig ([pscustomobject]@{ configVersion = 9 })
+        $status = [pscustomobject]@{
+            processId = 993
+            state = 'ready'
+            heartbeatAt = '2026-07-13T10:00:00+08:00'
+            configVersion = 9
+        }
+        $markers = @(
+            [pscustomobject]@{ processId = 1 },
+            [pscustomobject]@{ runDirectory = ''; processId = 2 },
+            [pscustomobject]@{ runDirectory = ([string][char]0); processId = 3 }
+        )
+        foreach ($marker in $markers) {
+            $view = New-ControllerFakeView
+            $script:scanHits = 0
+            $controller = New-ControllerForTest -View $view -Root $root -StatusReader {
+                param($path)
+                if ([string]$path -eq [string]$script:scanCandidate) {
+                    $script:scanHits += 1
+                    return $status
+                }
+                throw '坏标记路径不可读取。'
+            }
+            Write-AIFishBotAtomicJson -Path $controller.ActiveMarkerPath -InputObject $marker | Out-Null
+
+            $result = Resume-AIFishBotRun -Controller $controller
+
+            Assert-True -Condition ($script:scanHits -ge 1)
+            Assert-Equal -Expected $true -Actual $result.Success
+            Assert-Equal -Expected ([System.IO.Path]::GetFullPath($script:scanCandidate)) -Actual $controller.CurrentRunDirectory
+            Assert-Equal -Expected 993 -Actual $controller.CurrentProcessId
+        }
+    }
+    finally {
+        Remove-ControllerTestDirectory $root
+        Remove-Variable scanCandidate, scanHits -Scope Script -ErrorAction SilentlyContinue
+    }
+}
+
 Test-Case 'Resume keeps a validated process tracked when the active marker cannot be written' {
     $root = New-TestDirectory
     try {
@@ -1023,6 +1088,40 @@ Test-Case 'A real hidden WinForms view binds the serial port and user change eve
         Assert-Equal -Expected $true -Actual $view.Controls.AudioSensitivity.Enabled
         Assert-Equal -Expected $true -Actual $view.Timers.Status.Enabled
         Assert-Equal -Expected $true -Actual $view.Timers.Log.Enabled
+    }
+    finally {
+        if ($null -ne $view) { $view.Dispose() }
+        Remove-ControllerTestDirectory $root
+    }
+}
+
+Test-Case 'A real hidden WinForms view shows and clears Chinese validation errors' {
+    $root = New-TestDirectory
+    $view = $null
+    try {
+        Import-Module (Join-Path -Path (Split-Path -Path $PSScriptRoot -Parent) -ChildPath 'AI-FishBot.UI.psm1') -Force
+        $view = New-AIFishBotMainView
+        Assert-True -Condition ($view.ErrorProvider -is [System.Windows.Forms.ErrorProvider])
+        $controller = New-ControllerForTest -View $view -Root $root
+        Set-AIFishBotViewFromConfig -Controller $controller -Config (New-ControllerTestConfig) | Out-Null
+
+        $view.Controls.PreHookMin.Value = 2.0
+        $view.Controls.PreHookMax.Value = 1.0
+        $validation = Test-AIFishBotView -Controller $controller
+        $startResult = Start-AIFishBotRun -Controller $controller
+
+        Assert-Equal -Expected $false -Actual $validation.IsValid
+        Assert-Equal -Expected $false -Actual $startResult.Success
+        Assert-True -Condition (-not [string]::IsNullOrWhiteSpace($view.ErrorProvider.GetError($view.Controls.PreHookMin)))
+        Assert-True -Condition ($view.Controls.SaveStateLabel.Text -like '配置错误：*')
+
+        $view.Controls.PreHookMin.Value = 0.6
+        $view.Controls.PreHookMax.Value = 0.9
+        $validation = Test-AIFishBotView -Controller $controller
+
+        Assert-Equal -Expected $true -Actual $validation.IsValid
+        Assert-Equal -Expected '' -Actual $view.ErrorProvider.GetError($view.Controls.PreHookMin)
+        Assert-Equal -Expected '未保存' -Actual $view.Controls.SaveStateLabel.Text
     }
     finally {
         if ($null -ne $view) { $view.Dispose() }

@@ -651,6 +651,10 @@ function New-AIFishBotMainView {
     $trayIcon.ContextMenuStrip = $trayMenu
     $trayIcon.Visible = $false
 
+    $errorProvider = New-Object System.Windows.Forms.ErrorProvider
+    $errorProvider.ContainerControl = $form
+    $errorProvider.BlinkStyle = [System.Windows.Forms.ErrorBlinkStyle]::NeverBlink
+
     $statusTimer = New-Object System.Windows.Forms.Timer
     $statusTimer.Interval = 500
     $statusTimer.Enabled = $false
@@ -692,6 +696,7 @@ function New-AIFishBotMainView {
         TrayIcon = $trayIcon
         TrayMenu = $trayMenu
         Timers = $timers
+        ErrorProvider = $errorProvider
         _Lifecycle = $lifecycleState
         _Disposed = $false
     }
@@ -710,6 +715,8 @@ function New-AIFishBotMainView {
             $timer.Stop()
             $timer.Dispose()
         }
+        $this.ErrorProvider.Clear()
+        $this.ErrorProvider.Dispose()
         $this.TrayIcon.Visible = $false
         $this.TrayIcon.ContextMenuStrip = $null
         $this.TrayIcon.Dispose()

@@ -44,20 +44,19 @@ $script:AIFishBotNumericFields = @(
 )
 $script:AIFishBotLockedControls = @(
     'Retail', 'UseWindowFocus', 'UseWeakAura', 'FishingRetries', 'CastKey', 'BobberKey',
-    'LogoutKey', 'UsePi', 'PicoComPort', 'ProfileSelector', 'RenameProfileButton',
-    'DeleteProfileButton'
+    'LogoutKey', 'UsePi', 'PicoComPort', 'WebhookText', 'NotifyOnStart',
+    'ProfileSelector', 'RenameProfileButton', 'DeleteProfileButton'
 )
 $script:AIFishBotLiveFields = @(
     'audioSensitivity', 'autoStop', 'autoStopTime', 'autoLogout',
     'biteResponseMinSeconds', 'biteResponseMaxSeconds', 'preHookMinSeconds',
     'preHookMaxSeconds', 'postHookMinSeconds', 'postHookMaxSeconds',
-    'preCastMinSeconds', 'preCastMaxSeconds', 'buffs', 'enableNotifications',
-    'discordWebhook', 'notifyOnStop'
+    'preCastMinSeconds', 'preCastMaxSeconds', 'buffs', 'enableNotifications', 'notifyOnStop'
 )
 $script:AIFishBotLiveControls = @(
     'AudioSensitivity', 'AutoStop', 'AutoStopTime', 'AutoLogout', 'BiteResponseMin',
     'BiteResponseMax', 'PreHookMin', 'PreHookMax', 'PostHookMin', 'PostHookMax',
-    'PreCastMin', 'PreCastMax', 'BuffGrid', 'EnableNotifications', 'WebhookText', 'NotifyOnStop'
+    'PreCastMin', 'PreCastMax', 'BuffGrid', 'EnableNotifications', 'NotifyOnStop'
 )
 
 function Get-AIFishBotControllerAvailablePorts {
@@ -108,7 +107,11 @@ function Set-AIFishBotControlEnabled {
 }
 
 function Set-AIFishBotControlError {
-    param([AllowNull()]$Control, [AllowNull()][string]$Message)
+    param(
+        [Parameter(Mandatory = $true)]$Controller,
+        [AllowNull()]$Control,
+        [AllowNull()][string]$Message
+    )
     if ($null -eq $Control) { return }
     $hasError = -not [string]::IsNullOrWhiteSpace($Message)
     if ($null -ne $Control.PSObject.Properties['HasError']) { $Control.HasError = $hasError }
@@ -128,6 +131,12 @@ function Set-AIFishBotControlError {
     }
     if ($Control.GetType().FullName -eq 'System.Windows.Forms.DataGridView') {
         $Control.Tag = [string]$Message
+    }
+    $providerProperty = $Controller.View.PSObject.Properties['ErrorProvider']
+    if ($null -ne $providerProperty -and
+        $providerProperty.Value -is [System.Windows.Forms.ErrorProvider] -and
+        $Control -is [System.Windows.Forms.Control]) {
+        $providerProperty.Value.SetError($Control, [string]$Message)
     }
 }
 
@@ -282,7 +291,6 @@ function Set-AIFishBotViewFromConfig {
     }
     finally { $Controller.SuppressDirty = $false }
     [void](Test-AIFishBotView -Controller $Controller)
-    Set-AIFishBotSaveState -Controller $Controller -Dirty $false
 }
 
 function Get-AIFishBotConfigFromView {
@@ -314,15 +322,26 @@ function Test-AIFishBotView {
     $ports = @(& $Controller.AvailablePortsProvider)
     $result = Test-AIFishBotConfig -Config $config -AvailablePorts $ports
     foreach ($controlName in @($script:AIFishBotFieldMap.Values + 'BuffGrid')) {
-        Set-AIFishBotControlError -Control (Get-AIFishBotControllerControl $Controller $controlName) -Message ''
+        Set-AIFishBotControlError -Controller $Controller `
+            -Control (Get-AIFishBotControllerControl $Controller $controlName) -Message ''
     }
-    foreach ($errorEntry in $result.Errors.GetEnumerator()) {
+    $orderedErrors = @($result.Errors.GetEnumerator() | Sort-Object -Property Key)
+    foreach ($errorEntry in $orderedErrors) {
         $controlName = if ([string]$errorEntry.Key -like 'buffs*') { 'BuffGrid' }
         else { $script:AIFishBotFieldMap[$errorEntry.Key] }
         if (-not [string]::IsNullOrWhiteSpace($controlName)) {
-            Set-AIFishBotControlError -Control (Get-AIFishBotControllerControl $Controller $controlName) `
+            Set-AIFishBotControlError -Controller $Controller `
+                -Control (Get-AIFishBotControllerControl $Controller $controlName) `
                 -Message ([string]$errorEntry.Value)
         }
+    }
+    $saveState = Get-AIFishBotControllerControl $Controller 'SaveStateLabel'
+    if ($null -ne $saveState) {
+        $saveState.Text = if ($orderedErrors.Count -gt 0) {
+            '配置错误：{0}' -f [string]$orderedErrors[0].Value
+        }
+        elseif ($Controller.IsDirty) { '未保存' }
+        else { '已保存' }
     }
     $startButton = Get-AIFishBotControllerControl $Controller 'StartStopButton'
     if ($null -ne $startButton) { $startButton.Enabled = $Controller.IsRunning -or $result.IsValid }
@@ -619,11 +638,15 @@ function Resume-AIFishBotRun {
     }
     $allowFallback = -not $PSBoundParameters.ContainsKey('RunDirectory')
     if ($allowFallback) {
+        $markerHasUsableDirectory = $false
         try {
             $marker = Read-AIFishBotJson -Path $Controller.ActiveMarkerPath
             $RunDirectory = [string](Get-AIFishBotObjectPropertyValue $marker 'runDirectory' '')
+            $markerHasUsableDirectory = -not [string]::IsNullOrWhiteSpace($RunDirectory)
         }
-        catch {
+        catch { }
+        if (-not $markerHasUsableDirectory) {
+            Clear-AIFishBotActiveMarker $Controller
             $active = Get-AIFishBotActiveRun $Controller
             if ($null -ne $active) { $RunDirectory = $active.RunDirectory }
         }
@@ -670,11 +693,17 @@ function Resume-AIFishBotRun {
         Clear-AIFishBotStaleRun $Controller
         if ($allowFallback) {
             $active = Get-AIFishBotActiveRun $Controller
-            if ($null -ne $active -and
-                -not [string]::Equals(
-                    [System.IO.Path]::GetFullPath($active.RunDirectory),
-                    [System.IO.Path]::GetFullPath($RunDirectory),
-                    [System.StringComparison]::OrdinalIgnoreCase)) {
+            $sameDirectory = $false
+            if ($null -ne $active) {
+                try {
+                    $sameDirectory = [string]::Equals(
+                        [System.IO.Path]::GetFullPath($active.RunDirectory),
+                        [System.IO.Path]::GetFullPath($RunDirectory),
+                        [System.StringComparison]::OrdinalIgnoreCase)
+                }
+                catch { $sameDirectory = $false }
+            }
+            if ($null -ne $active -and -not $sameDirectory) {
                 return Resume-AIFishBotRun -Controller $Controller -RunDirectory $active.RunDirectory
             }
         }

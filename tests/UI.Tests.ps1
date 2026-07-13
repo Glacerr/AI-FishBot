@@ -220,9 +220,11 @@ Test-Case 'main view can be created in STA without showing the form' {
 }
 
 Test-Case 'view exposes the stable controller contract' {
-    foreach ($propertyName in @('Form', 'Controls', 'TrayIcon', 'TrayMenu', 'Timers')) {
+    foreach ($propertyName in @('Form', 'Controls', 'TrayIcon', 'TrayMenu', 'Timers', 'ErrorProvider')) {
         Assert-True -Condition ($script:View.PSObject.Properties.Name -contains $propertyName)
     }
+    Assert-True -Condition ($script:View.ErrorProvider -is [System.Windows.Forms.ErrorProvider])
+    Assert-True -Condition ([object]::ReferenceEquals($script:View.Form, $script:View.ErrorProvider.ContainerControl))
 
     foreach ($controlName in @(
             'ProfileSelector', 'NewProfileButton', 'CopyProfileButton', 'RenameProfileButton',
