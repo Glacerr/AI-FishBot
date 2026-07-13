@@ -218,12 +218,19 @@ function New-AIFishBotMainView {
     $headerPanel.Controls.Add($deleteProfileButton)
     $controls.DeleteProfileButton = $deleteProfileButton
 
-    $statusBadge = New-AIFishBotLabel -Text '● 已停止' -X 614 -Y 19 -Width 112 -Height 34 -ForeColor $script:AIFishBotColors.Success
-    $statusBadge.Anchor = [System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Right
+    $statusHost = New-Object System.Windows.Forms.Panel
+    $statusHost.Dock = [System.Windows.Forms.DockStyle]::Right
+    $statusHost.Width = 144
+    $statusHost.Padding = New-Object System.Windows.Forms.Padding(16, 9, 16, 35)
+    $statusHost.BackColor = $script:AIFishBotColors.Card
+    $headerPanel.Controls.Add($statusHost)
+
+    $statusBadge = New-AIFishBotLabel -Text '● 已停止' -X 0 -Y 0 -Width 112 -Height 34 -ForeColor $script:AIFishBotColors.Success
+    $statusBadge.Dock = [System.Windows.Forms.DockStyle]::Fill
     $statusBadge.BackColor = $script:AIFishBotColors.Input
     $statusBadge.TextAlign = [System.Drawing.ContentAlignment]::MiddleCenter
     $statusBadge.BorderStyle = [System.Windows.Forms.BorderStyle]::FixedSingle
-    $headerPanel.Controls.Add($statusBadge)
+    $statusHost.Controls.Add($statusBadge)
     $controls.StatusBadge = $statusBadge
 
     $footerPanel = New-Object System.Windows.Forms.Panel
@@ -238,17 +245,24 @@ function New-AIFishBotMainView {
     $footerPanel.Controls.Add($saveStateLabel)
     $controls.SaveStateLabel = $saveStateLabel
 
+    $footerButtonHost = New-Object System.Windows.Forms.FlowLayoutPanel
+    $footerButtonHost.Dock = [System.Windows.Forms.DockStyle]::Right
+    $footerButtonHost.Width = 226
+    $footerButtonHost.Padding = New-Object System.Windows.Forms.Padding(8, 8, 0, 0)
+    $footerButtonHost.FlowDirection = [System.Windows.Forms.FlowDirection]::LeftToRight
+    $footerButtonHost.WrapContents = $false
+    $footerButtonHost.BackColor = $script:AIFishBotColors.Card
+    $footerPanel.Controls.Add($footerButtonHost)
+
     $saveButton = New-AIFishBotButton -Text '保存' -Width 92 -Height 38
-    Set-AIFishBotControlLocation -Control $saveButton -X 526 -Y 14
-    $saveButton.Anchor = [System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Right
-    $footerPanel.Controls.Add($saveButton)
+    $saveButton.Margin = New-Object System.Windows.Forms.Padding(3, 0, 3, 0)
+    $footerButtonHost.Controls.Add($saveButton)
     $controls.SaveButton = $saveButton
 
     $startStopButton = New-AIFishBotButton -Text '开始钓鱼' -Width 104 -Height 38 -BackColor $script:AIFishBotColors.Accent -ForeColor $script:AIFishBotColors.Background
-    Set-AIFishBotControlLocation -Control $startStopButton -X 624 -Y 14
-    $startStopButton.Anchor = [System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Right
+    $startStopButton.Margin = New-Object System.Windows.Forms.Padding(3, 0, 3, 0)
     $startStopButton.FlatAppearance.BorderColor = $script:AIFishBotColors.Accent
-    $footerPanel.Controls.Add($startStopButton)
+    $footerButtonHost.Controls.Add($startStopButton)
     $controls.StartStopButton = $startStopButton
 
     $mainTabs = New-Object System.Windows.Forms.TabControl
@@ -257,6 +271,7 @@ function New-AIFishBotMainView {
     $mainTabs.BackColor = $script:AIFishBotColors.Background
     $mainTabs.ForeColor = $script:AIFishBotColors.Text
     $controls.MainTabs = $mainTabs
+    $controls.TabControl = $mainTabs
 
     $pages = @{}
     foreach ($pageName in @('基础', '按键与设备', '增益', '通知', '日志')) {
@@ -515,7 +530,7 @@ function New-AIFishBotMainView {
 
     $notificationCard = New-AIFishBotCard -Text 'Discord 通知'
     $notificationCard.Dock = [System.Windows.Forms.DockStyle]::Fill
-    $notificationCard.Padding = New-Object System.Windows.Forms.Padding(18)
+    $notificationCard.Padding = New-Object System.Windows.Forms.Padding(18, 145, 18, 18)
     $pages['通知'].Padding = New-Object System.Windows.Forms.Padding(16)
     $pages['通知'].Controls.Add($notificationCard)
 
@@ -528,23 +543,44 @@ function New-AIFishBotMainView {
     $controls.NotifyOnStop = $notifyOnStop
 
     $notificationCard.Controls.Add((New-AIFishBotLabel -Text 'Webhook 地址' -X 22 -Y 130 -Width 110))
+    $webhookHost = New-Object System.Windows.Forms.Panel
+    $webhookHost.Dock = [System.Windows.Forms.DockStyle]::Top
+    $webhookHost.Height = 32
+    $webhookHost.BackColor = [System.Drawing.Color]::Transparent
+    $notificationCard.Controls.Add($webhookHost)
+
     $webhookText = New-Object System.Windows.Forms.TextBox
-    $webhookText.Location = New-Object System.Drawing.Point(22, 162)
-    $webhookText.Size = New-Object System.Drawing.Size(545, 28)
-    $webhookText.Anchor = [System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Left -bor [System.Windows.Forms.AnchorStyles]::Right
+    $webhookText.Dock = [System.Windows.Forms.DockStyle]::Fill
     $webhookText.BackColor = $script:AIFishBotColors.Input
     $webhookText.ForeColor = $script:AIFishBotColors.Text
     $webhookText.BorderStyle = [System.Windows.Forms.BorderStyle]::FixedSingle
     $webhookText.PasswordChar = [char]0x25CF
     $webhookText.UseSystemPasswordChar = $false
-    $notificationCard.Controls.Add($webhookText)
+    $webhookHost.Controls.Add($webhookText)
     $controls.WebhookText = $webhookText
 
     $showWebhookButton = New-AIFishBotButton -Text '按住显示' -Width 92 -Height 28
-    Set-AIFishBotControlLocation -Control $showWebhookButton -X 580 -Y 160
-    $showWebhookButton.Anchor = [System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Right
-    $notificationCard.Controls.Add($showWebhookButton)
+    $showWebhookButton.Dock = [System.Windows.Forms.DockStyle]::Right
+    $webhookHost.Controls.Add($showWebhookButton)
     $controls.ShowWebhookButton = $showWebhookButton
+
+    $webhookMask = [char]0x25CF
+    $revealWebhook = {
+        param($sender, $eventArgs)
+
+        if ($eventArgs.Button -eq [System.Windows.Forms.MouseButtons]::Left) {
+            $webhookText.UseSystemPasswordChar = $false
+            $webhookText.PasswordChar = [char]0
+        }
+    }.GetNewClosure()
+    $maskWebhook = {
+        $webhookText.UseSystemPasswordChar = $false
+        $webhookText.PasswordChar = $webhookMask
+    }.GetNewClosure()
+    $showWebhookButton.Add_MouseDown($revealWebhook)
+    $showWebhookButton.Add_MouseUp($maskWebhook)
+    $showWebhookButton.Add_MouseLeave($maskWebhook)
+    $showWebhookButton.Add_LostFocus($maskWebhook)
 
     $webhookHelp = New-AIFishBotLabel -Text '地址默认隐藏；按住显示按钮时可临时查看。' -X 22 -Y 199 -Width 440 -ForeColor $script:AIFishBotColors.Muted
     $notificationCard.Controls.Add($webhookHelp)
@@ -616,7 +652,7 @@ function New-AIFishBotMainView {
     $logTimer = New-Object System.Windows.Forms.Timer
     $logTimer.Interval = 250
     $logTimer.Enabled = $false
-    $timers = @{
+    $timers = [pscustomobject]@{
         Status = $statusTimer
         Log = $logTimer
     }
@@ -636,7 +672,7 @@ function New-AIFishBotMainView {
         }
 
         $this._Disposed = $true
-        foreach ($timer in $this.Timers.Values) {
+        foreach ($timer in $this.Timers.PSObject.Properties.Value) {
             $timer.Stop()
             $timer.Dispose()
         }
