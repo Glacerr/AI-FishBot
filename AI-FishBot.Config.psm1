@@ -771,8 +771,12 @@ function Import-AIFishBotLegacyConfig {
     $enabledNumber = 0
     $enableText = [string]$legacy.EnableBuffsText
     $rangeMatch = [regex]::Match($enableText, '^\(\s*1\s*\.\.\s*([1-9][0-9]*)\s*\)$')
+    $singleMatch = [regex]::Match($enableText, '^\(\s*([1-9][0-9]*)\s*\)$')
     if ($rangeMatch.Success -and [int]::TryParse($rangeMatch.Groups[1].Value, [ref]$enabledNumber)) {
         $enabledMode = 'Range'
+    }
+    elseif ($singleMatch.Success -and [int]::TryParse($singleMatch.Groups[1].Value, [ref]$enabledNumber)) {
+        $enabledMode = 'Single'
     }
 
     $keybinds = @{}
@@ -805,7 +809,8 @@ function Import-AIFishBotLegacyConfig {
             continue
         }
 
-        $isEnabled = $enabledMode -eq 'Range' -and $index -le $enabledNumber
+        $isEnabled = ($enabledMode -eq 'Range' -and $index -le $enabledNumber) -or
+            ($enabledMode -eq 'Single' -and $index -eq $enabledNumber)
         $buffs += [pscustomobject][ordered]@{
             enabled = [bool]$isEnabled
             name = '增益 {0}' -f $index

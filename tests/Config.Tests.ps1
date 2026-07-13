@@ -512,18 +512,64 @@ $buffDuration0 = 1
     }
 }
 
-Test-Case 'legacy import accepts only zero or one-through-N buff syntax' {
+Test-Case 'legacy import enables buff one from a parenthesized single value' {
+    $directory = New-TestDirectory
+    try {
+        $legacyPath = Join-Path -Path $directory -ChildPath 'legacy.ps1'
+        Write-TestTextFile -Path $legacyPath -Content @'
+$enableBuffs = (1)
+$buffKeybind1 = "F9"
+$buffCastTime1 = 2
+$buffDuration1 = 10
+'@
+
+        $config = Import-AIFishBotLegacyConfig -ScriptPath $legacyPath -ProfileName '单个增益'
+
+        Assert-Equal -Expected 1 -Actual @($config.buffs).Count
+        Assert-Equal -Expected $true -Actual $config.buffs[0].enabled
+    }
+    finally {
+        Remove-TestDirectory -Path $directory
+    }
+}
+
+Test-Case 'legacy import supports any parenthesized positive buff number' {
     $directory = New-TestDirectory
     try {
         $legacyPath = Join-Path -Path $directory -ChildPath 'legacy.ps1'
         Write-TestTextFile -Path $legacyPath -Content @'
 $enableBuffs = (2)
+$buffKeybind1 = "F9"
+$buffCastTime1 = 2
+$buffDuration1 = 10
 $buffKeybind2 = "F10"
 $buffCastTime2 = 3
 $buffDuration2 = 20
 '@
 
         $config = Import-AIFishBotLegacyConfig -ScriptPath $legacyPath -ProfileName '严格格式'
+
+        Assert-Equal -Expected 2 -Actual @($config.buffs).Count
+        Assert-Equal -Expected $false -Actual $config.buffs[0].enabled
+        Assert-Equal -Expected $true -Actual $config.buffs[1].enabled
+    }
+    finally {
+        Remove-TestDirectory -Path $directory
+    }
+}
+
+Test-Case 'legacy import rejects an unparenthesized single buff number' {
+    $directory = New-TestDirectory
+    try {
+        $legacyPath = Join-Path -Path $directory -ChildPath 'legacy.ps1'
+        Write-TestTextFile -Path $legacyPath -Content @'
+$enableBuffs = 1
+$buffKeybind1 = "F9"
+$buffCastTime1 = 2
+$buffDuration1 = 10
+'@
+
+        $config = Import-AIFishBotLegacyConfig -ScriptPath $legacyPath -ProfileName '非法格式'
 
         Assert-Equal -Expected 1 -Actual @($config.buffs).Count
         Assert-Equal -Expected $false -Actual $config.buffs[0].enabled
