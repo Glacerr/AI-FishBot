@@ -662,6 +662,36 @@ Test-Case 'legacy import rejects invalid UTF-8 bytes' {
     }
 }
 
+Test-Case 'legacy import rejects a UTF-32 BOM' {
+    $directory = New-TestDirectory
+    try {
+        $legacyPath = Join-Path -Path $directory -ChildPath 'legacy.ps1'
+        $encoding = [System.Text.Encoding]::UTF32
+        $bytes = [byte[]]@($encoding.GetPreamble() + $encoding.GetBytes('$retail = $True'))
+        [System.IO.File]::WriteAllBytes($legacyPath, $bytes)
+
+        Assert-Throws -ScriptBlock { Import-AIFishBotLegacyConfig -ScriptPath $legacyPath -ProfileName '错误编码' } -MessageLike '*UTF-32*'
+    }
+    finally {
+        Remove-TestDirectory -Path $directory
+    }
+}
+
+Test-Case 'legacy import accepts a UTF-8 BOM' {
+    $directory = New-TestDirectory
+    try {
+        $legacyPath = Join-Path -Path $directory -ChildPath 'legacy.ps1'
+        $encoding = New-Object System.Text.UTF8Encoding($true, $true)
+        $bytes = [byte[]]@($encoding.GetPreamble() + $encoding.GetBytes('$retail = $True'))
+        [System.IO.File]::WriteAllBytes($legacyPath, $bytes)
+
+        Assert-Equal -Expected $true -Actual (Import-AIFishBotLegacyConfig -ScriptPath $legacyPath -ProfileName '正确编码').retail
+    }
+    finally {
+        Remove-TestDirectory -Path $directory
+    }
+}
+
 Test-Case 'profiles save and read UTF-8 JSON without losing nested values' {
     $directory = New-TestDirectory
     try {
@@ -699,6 +729,55 @@ Test-Case 'profile read rejects a JSON profile name that differs from its file n
 
         Assert-Throws -ScriptBlock { Read-AIFishBotProfile -ProfilesDirectory $directory -ProfileName '文件方案' } -MessageLike '*名称*不一致*'
         Assert-Equal -Expected $originalText -Actual ([System.IO.File]::ReadAllText($profilePath))
+    }
+    finally {
+        Remove-TestDirectory -Path $directory
+    }
+}
+
+Test-Case 'profile read matches Windows file names without case sensitivity' {
+    $directory = New-TestDirectory
+    try {
+        $config = New-AIFishBotDefaultConfig
+        $config.profileName = 'Foo'
+        Save-AIFishBotProfile -ProfilesDirectory $directory -Config $config | Out-Null
+
+        $loaded = Read-AIFishBotProfile -ProfilesDirectory $directory -ProfileName 'foo'
+
+        Assert-Equal -Expected 'Foo' -Actual $loaded.profileName
+    }
+    finally {
+        Remove-TestDirectory -Path $directory
+    }
+}
+
+Test-Case 'profile read rejects a non-string JSON profile name' {
+    $directory = New-TestDirectory
+    try {
+        $config = New-AIFishBotDefaultConfig
+        $config.profileName = 123
+        $profilePath = Get-AIFishBotProfilePath -ProfilesDirectory $directory -ProfileName '123'
+        Write-TestTextFile -Path $profilePath -Content ($config | ConvertTo-Json -Depth 20)
+
+        Assert-Throws -ScriptBlock { Read-AIFishBotProfile -ProfilesDirectory $directory -ProfileName '123' } -MessageLike '*字符串*'
+    }
+    finally {
+        Remove-TestDirectory -Path $directory
+    }
+}
+
+Test-Case 'profile read rejects a UTF-16 BOM' {
+    $directory = New-TestDirectory
+    try {
+        $config = New-AIFishBotDefaultConfig
+        $config.profileName = 'UTF16方案'
+        $profilePath = Get-AIFishBotProfilePath -ProfilesDirectory $directory -ProfileName 'UTF16方案'
+        $encoding = [System.Text.Encoding]::Unicode
+        $json = $config | ConvertTo-Json -Depth 20
+        $bytes = [byte[]]@($encoding.GetPreamble() + $encoding.GetBytes($json))
+        [System.IO.File]::WriteAllBytes($profilePath, $bytes)
+
+        Assert-Throws -ScriptBlock { Read-AIFishBotProfile -ProfilesDirectory $directory -ProfileName 'UTF16方案' } -MessageLike '*UTF-16*'
     }
     finally {
         Remove-TestDirectory -Path $directory
@@ -1024,6 +1103,58 @@ Test-Case 'create-new profile saves never overwrite an existing target' {
         Assert-Equal -Expected 10 -Actual (Read-AIFishBotProfile -ProfilesDirectory $directory -ProfileName '不可覆盖').autoStopTime
     }
     finally {
+        Remove-TestDirectory -Path $directory
+    }
+}
+
+Test-Case 'create-new failure preserves a stale backup until the final move succeeds' {
+    $directory = New-TestDirectory
+    $job = $null
+    try {
+        $config = New-AIFishBotDefaultConfig
+        $config.profileName = '并发失败'
+        $config | Add-Member -MemberType NoteProperty -Name extra -Value ('x' * 5000000)
+        $profilePath = Get-AIFishBotProfilePath -ProfilesDirectory $directory -ProfileName '并发失败'
+        $backupPath = $profilePath + '.backup'
+        Write-TestTextFile -Path $backupPath -Content 'backup sentinel'
+        $readyPath = Join-Path -Path $directory -ChildPath 'move-watcher.ready'
+
+        $job = Start-Job -ScriptBlock {
+            param($targetPath, $ready)
+            [System.IO.File]::WriteAllText($ready, 'ready')
+            $directoryPath = Split-Path -Path $targetPath -Parent
+            $temporaryFilter = ([System.IO.Path]::GetFileName($targetPath)) + '.*.tmp'
+            $deadline = [DateTime]::UtcNow.AddSeconds(15)
+            while ([DateTime]::UtcNow -lt $deadline) {
+                if (@(Get-ChildItem -LiteralPath $directoryPath -Filter $temporaryFilter -File).Count -gt 0) {
+                    [System.IO.File]::WriteAllText($targetPath, 'concurrent target')
+                    'CREATED'
+                    return
+                }
+                Start-Sleep -Milliseconds 5
+            }
+            'TIMEOUT'
+        } -ArgumentList $profilePath, $readyPath
+
+        $deadline = [DateTime]::UtcNow.AddSeconds(10)
+        while (-not (Test-Path -LiteralPath $readyPath) -and [DateTime]::UtcNow -lt $deadline) {
+            Start-Sleep -Milliseconds 50
+        }
+        Assert-True -Condition (Test-Path -LiteralPath $readyPath)
+
+        Assert-Throws -ScriptBlock { Save-AIFishBotProfile -ProfilesDirectory $directory -Config $config -CreateNew }
+        Wait-Job -Job $job -Timeout 15 | Out-Null
+        Assert-Equal -Expected @('CREATED') -Actual @(Receive-Job -Job $job -ErrorAction Stop)
+        Assert-True -Condition (Test-Path -LiteralPath $backupPath -PathType Leaf)
+        Assert-Equal -Expected 'backup sentinel' -Actual ([System.IO.File]::ReadAllText($backupPath))
+    }
+    finally {
+        if ($null -ne $job) {
+            if ($job.State -eq 'Running') {
+                Stop-Job -Job $job
+            }
+            Remove-Job -Job $job -Force
+        }
         Remove-TestDirectory -Path $directory
     }
 }

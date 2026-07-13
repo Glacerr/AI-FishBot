@@ -550,8 +550,31 @@ function Read-AIFishBotUtf8Text {
         [string]$Description
     )
 
+    $bytes = [System.IO.File]::ReadAllBytes($Path)
+    $offset = 0
+    if ($bytes.Length -ge 4 -and
+        (($bytes[0] -eq 0xFF -and $bytes[1] -eq 0xFE -and $bytes[2] -eq 0x00 -and $bytes[3] -eq 0x00) -or
+            ($bytes[0] -eq 0x00 -and $bytes[1] -eq 0x00 -and $bytes[2] -eq 0xFE -and $bytes[3] -eq 0xFF))) {
+        $invalidEncodingError = New-Object System.IO.InvalidDataException(
+            ('{0}不能使用UTF-32编码，只允许UTF-8。' -f $Description))
+        throw $invalidEncodingError
+    }
+
+    if ($bytes.Length -ge 2 -and
+        (($bytes[0] -eq 0xFF -and $bytes[1] -eq 0xFE) -or
+            ($bytes[0] -eq 0xFE -and $bytes[1] -eq 0xFF))) {
+        $invalidEncodingError = New-Object System.IO.InvalidDataException(
+            ('{0}不能使用UTF-16编码，只允许UTF-8。' -f $Description))
+        throw $invalidEncodingError
+    }
+
+    if ($bytes.Length -ge 3 -and
+        $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF) {
+        $offset = 3
+    }
+
     try {
-        return [System.IO.File]::ReadAllText($Path, $script:AIFishBotUtf8Encoding)
+        return $script:AIFishBotUtf8Encoding.GetString($bytes, $offset, $bytes.Length - $offset)
     }
     catch [System.Text.DecoderFallbackException] {
         $invalidEncodingError = New-Object System.IO.InvalidDataException(
@@ -574,11 +597,14 @@ function Read-AIFishBotConfigFile {
     try {
         $config = $json | ConvertFrom-Json -ErrorAction Stop
         Assert-AIFishBotPersistableConfig -Config $config
-        $actualProfileName = [string](Get-AIFishBotConfigValue -InputObject $config -Name 'profileName')
+        $actualProfileName = Get-AIFishBotConfigValue -InputObject $config -Name 'profileName'
+        if ($actualProfileName -isnot [string]) {
+            throw 'JSON内的方案名称必须是字符串。'
+        }
         if (-not [string]::Equals(
                 $actualProfileName,
                 $ExpectedProfileName,
-                [System.StringComparison]::Ordinal)) {
+                [System.StringComparison]::OrdinalIgnoreCase)) {
             throw ('JSON内的方案名称“{0}”与文件名“{1}”不一致。' -f $actualProfileName, $ExpectedProfileName)
         }
         return $config
@@ -747,10 +773,10 @@ function Save-AIFishBotProfileCore {
 
         if ($CreateNew) {
             $staleBackupPath = $profilePath + '.backup'
+            [System.IO.File]::Move($temporaryPath, $profilePath)
             if (Test-Path -LiteralPath $staleBackupPath -PathType Leaf) {
                 Remove-Item -LiteralPath $staleBackupPath -Force -ErrorAction Stop
             }
-            [System.IO.File]::Move($temporaryPath, $profilePath)
         }
         elseif (Test-Path -LiteralPath $profilePath -PathType Leaf) {
             [System.IO.File]::Replace($temporaryPath, $profilePath, ($profilePath + '.backup'))
