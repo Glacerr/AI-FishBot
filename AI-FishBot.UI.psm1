@@ -213,7 +213,8 @@ function New-AIFishBotMainView {
     $headerPanel.Controls.Add($renameProfileButton)
     $controls.RenameProfileButton = $renameProfileButton
 
-    $deleteProfileButton = New-AIFishBotButton -Text '删除' -Width 58 -Height 28 -ForeColor $script:AIFishBotColors.Error
+    $deleteProfileButton = New-AIFishBotButton -Text '删除' -Width 58 -Height 28 -BackColor $script:AIFishBotColors.Error -ForeColor $script:AIFishBotColors.Background
+    $deleteProfileButton.FlatAppearance.BorderColor = $script:AIFishBotColors.Error
     Set-AIFishBotControlLocation -Control $deleteProfileButton -X 424 -Y 53
     $headerPanel.Controls.Add($deleteProfileButton)
     $controls.DeleteProfileButton = $deleteProfileButton
@@ -423,7 +424,8 @@ function New-AIFishBotMainView {
     $buffButtonBar.Padding = New-Object System.Windows.Forms.Padding(8)
 
     $addBuffButton = New-AIFishBotButton -Text '新增' -Width 74 -Height 30 -BackColor $script:AIFishBotColors.Accent -ForeColor $script:AIFishBotColors.Background
-    $removeBuffButton = New-AIFishBotButton -Text '删除' -Width 74 -Height 30 -ForeColor $script:AIFishBotColors.Error
+    $removeBuffButton = New-AIFishBotButton -Text '删除' -Width 74 -Height 30 -BackColor $script:AIFishBotColors.Error -ForeColor $script:AIFishBotColors.Background
+    $removeBuffButton.FlatAppearance.BorderColor = $script:AIFishBotColors.Error
     $moveBuffUpButton = New-AIFishBotButton -Text '上移' -Width 74 -Height 30
     $moveBuffDownButton = New-AIFishBotButton -Text '下移' -Width 74 -Height 30
     $buffButtonBar.Controls.AddRange([System.Windows.Forms.Control[]]@($addBuffButton, $removeBuffButton, $moveBuffUpButton, $moveBuffDownButton))
@@ -580,7 +582,10 @@ function New-AIFishBotMainView {
     $showWebhookButton.Add_MouseDown($revealWebhook)
     $showWebhookButton.Add_MouseUp($maskWebhook)
     $showWebhookButton.Add_MouseLeave($maskWebhook)
+    $showWebhookButton.Add_MouseCaptureChanged($maskWebhook)
     $showWebhookButton.Add_LostFocus($maskWebhook)
+    $form.Add_Deactivate($maskWebhook)
+    $form.Add_VisibleChanged($maskWebhook)
 
     $webhookHelp = New-AIFishBotLabel -Text '地址默认隐藏；按住显示按钮时可临时查看。' -X 22 -Y 199 -Width 440 -ForeColor $script:AIFishBotColors.Muted
     $notificationCard.Controls.Add($webhookHelp)
@@ -657,21 +662,50 @@ function New-AIFishBotMainView {
         Log = $logTimer
     }
 
+    $lifecycleState = [pscustomobject]@{
+        AllowClose = $false
+        Disposed = $false
+    }
+    $form.Add_FormClosing({
+            param($sender, $eventArgs)
+
+            & $maskWebhook
+            if (-not $lifecycleState.AllowClose -and
+                $eventArgs.CloseReason -eq [System.Windows.Forms.CloseReason]::UserClosing) {
+                $eventArgs.Cancel = $true
+                $form.Hide()
+                $trayIcon.Visible = $true
+            }
+        }.GetNewClosure())
+    $form.Add_Resize({
+            if (-not $lifecycleState.AllowClose -and
+                $form.WindowState -eq [System.Windows.Forms.FormWindowState]::Minimized) {
+                & $maskWebhook
+                $form.Hide()
+                $trayIcon.Visible = $true
+            }
+        }.GetNewClosure())
+
     $view = [pscustomobject]@{
         Form = $form
         Controls = $controls
         TrayIcon = $trayIcon
         TrayMenu = $trayMenu
         Timers = $timers
+        _Lifecycle = $lifecycleState
         _Disposed = $false
     }
 
-    $view | Add-Member -MemberType ScriptMethod -Name Dispose -Value {
-        if ($this._Disposed) {
+    $disposeView = {
+        if ($this._Lifecycle.Disposed) {
             return
         }
 
+        $this._Lifecycle.AllowClose = $true
+        $this._Lifecycle.Disposed = $true
         $this._Disposed = $true
+        $this.Controls.WebhookText.UseSystemPasswordChar = $false
+        $this.Controls.WebhookText.PasswordChar = [char]0x25CF
         foreach ($timer in $this.Timers.PSObject.Properties.Value) {
             $timer.Stop()
             $timer.Dispose()
@@ -682,6 +716,8 @@ function New-AIFishBotMainView {
         $this.TrayMenu.Dispose()
         $this.Form.Dispose()
     }
+    $view | Add-Member -MemberType ScriptMethod -Name Exit -Value $disposeView
+    $view | Add-Member -MemberType ScriptMethod -Name Dispose -Value $disposeView
 
     return $view
 }

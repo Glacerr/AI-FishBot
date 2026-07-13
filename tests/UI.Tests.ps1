@@ -18,6 +18,40 @@ function Assert-ColorHex {
     Assert-Equal -Expected $Expected.ToUpperInvariant() -Actual $actualHex
 }
 
+function Get-TestRelativeLuminance {
+    param(
+        [Parameter(Mandatory = $true)]
+        [System.Drawing.Color]$Color
+    )
+
+    $linear = foreach ($component in @($Color.R, $Color.G, $Color.B)) {
+        $value = $component / 255.0
+        if ($value -le 0.03928) {
+            $value / 12.92
+        }
+        else {
+            [Math]::Pow((($value + 0.055) / 1.055), 2.4)
+        }
+    }
+    return (0.2126 * $linear[0]) + (0.7152 * $linear[1]) + (0.0722 * $linear[2])
+}
+
+function Get-TestContrastRatio {
+    param(
+        [Parameter(Mandatory = $true)]
+        [System.Drawing.Color]$First,
+
+        [Parameter(Mandatory = $true)]
+        [System.Drawing.Color]$Second
+    )
+
+    $firstLuminance = Get-TestRelativeLuminance -Color $First
+    $secondLuminance = Get-TestRelativeLuminance -Color $Second
+    $lighter = [Math]::Max($firstLuminance, $secondLuminance)
+    $darker = [Math]::Min($firstLuminance, $secondLuminance)
+    return ($lighter + 0.05) / ($darker + 0.05)
+}
+
 function Invoke-TestButtonClick {
     param(
         [Parameter(Mandatory = $true)]
@@ -406,6 +440,84 @@ Test-Case 'webhook reveals only while the show button is held' {
     Invoke-TestProtectedEvent -Control $showButton -MethodName 'OnMouseDown' -EventArgs $mouseDown
     Invoke-TestProtectedEvent -Control $showButton -MethodName 'OnLostFocus' -EventArgs ([System.EventArgs]::Empty)
     Assert-Equal -Expected $mask -Actual $webhook.PasswordChar
+}
+
+Test-Case 'webhook remasks after capture loss window deactivation and hiding' {
+    $view = New-AIFishBotMainView
+    try {
+        $webhook = $view.Controls.WebhookText
+        $showButton = $view.Controls.ShowWebhookButton
+        $mask = $webhook.PasswordChar
+        $mouseDown = New-Object System.Windows.Forms.MouseEventArgs(
+            [System.Windows.Forms.MouseButtons]::Left, 1, 2, 2, 0)
+
+        Invoke-TestProtectedEvent -Control $showButton -MethodName 'OnMouseDown' -EventArgs $mouseDown
+        Invoke-TestProtectedEvent -Control $showButton -MethodName 'OnMouseCaptureChanged' -EventArgs ([System.EventArgs]::Empty)
+        Assert-Equal -Expected $mask -Actual $webhook.PasswordChar
+
+        Invoke-TestProtectedEvent -Control $showButton -MethodName 'OnMouseDown' -EventArgs $mouseDown
+        Invoke-TestProtectedEvent -Control $view.Form -MethodName 'OnDeactivate' -EventArgs ([System.EventArgs]::Empty)
+        Assert-Equal -Expected $mask -Actual $webhook.PasswordChar
+
+        Invoke-TestProtectedEvent -Control $showButton -MethodName 'OnMouseDown' -EventArgs $mouseDown
+        Invoke-TestProtectedEvent -Control $view.Form -MethodName 'OnVisibleChanged' -EventArgs ([System.EventArgs]::Empty)
+        Assert-Equal -Expected $mask -Actual $webhook.PasswordChar
+    }
+    finally {
+        $view.Dispose()
+    }
+}
+
+Test-Case 'user close and minimize hide to tray while explicit exit disposes' {
+    $view = New-AIFishBotMainView
+    try {
+        $form = $view.Form
+        $null = $form.Handle
+        $webhook = $view.Controls.WebhookText
+        $webhook.PasswordChar = [char]0
+        $closing = [System.Windows.Forms.FormClosingEventArgs]::new(
+            [System.Windows.Forms.CloseReason]::UserClosing,
+            $false)
+
+        Invoke-TestProtectedEvent -Control $form -MethodName 'OnFormClosing' -EventArgs $closing
+
+        Assert-Equal -Expected $true -Actual $closing.Cancel
+        Assert-Equal -Expected $false -Actual $form.IsDisposed
+        Assert-Equal -Expected $false -Actual $form.Visible
+        Assert-Equal -Expected $true -Actual $view.TrayIcon.Visible
+        Assert-True -Condition ($webhook.PasswordChar -ne [char]0)
+
+        $view.TrayIcon.Visible = $false
+        $form.WindowState = [System.Windows.Forms.FormWindowState]::Minimized
+        $view.TrayIcon.Visible = $false
+        Invoke-TestProtectedEvent -Control $form -MethodName 'OnResize' -EventArgs ([System.EventArgs]::Empty)
+
+        Assert-Equal -Expected $false -Actual $form.IsDisposed
+        Assert-Equal -Expected $false -Actual $form.Visible
+        Assert-Equal -Expected $true -Actual $view.TrayIcon.Visible
+        Assert-True -Condition ($view.PSObject.Methods.Name -contains 'Exit')
+
+        $view.Exit()
+        $view.Exit()
+        $view.Dispose()
+
+        Assert-Equal -Expected $true -Actual $form.IsDisposed
+        Assert-Equal -Expected $false -Actual $view.TrayIcon.Visible
+        Assert-Equal -Expected $false -Actual $view.Timers.Status.Enabled
+        Assert-Equal -Expected $false -Actual $view.Timers.Log.Enabled
+    }
+    finally {
+        $view.Dispose()
+    }
+}
+
+Test-Case 'danger buttons use the error color as a high contrast surface' {
+    foreach ($name in @('DeleteProfileButton', 'RemoveBuffButton')) {
+        $button = $script:View.Controls[$name]
+        Assert-ColorHex -Actual $button.BackColor -Expected '#F05A67'
+        Assert-ColorHex -Actual $button.ForeColor -Expected '#071522'
+        Assert-True -Condition ((Get-TestContrastRatio -First $button.BackColor -Second $button.ForeColor) -ge 4.5)
+    }
 }
 
 Test-Case 'basic controls expose counters audio meter and safe input ranges' {
