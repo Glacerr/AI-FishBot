@@ -278,7 +278,9 @@ function New-TransactionalDependencyScenario {
 function New-DependencyMutexHarness {
     param(
         [switch]$AbandonFirstWait,
-        [string]$WaitFailure
+        [string]$WaitFailure,
+        [string]$ReleaseFailure,
+        [string]$DisposeFailure
     )
 
     $context = [pscustomobject]@{
@@ -288,6 +290,8 @@ function New-DependencyMutexHarness {
         DisposeCount = 0
         AbandonNext = [bool]$AbandonFirstWait
         WaitFailure = $WaitFailure
+        ReleaseFailure = $ReleaseFailure
+        DisposeFailure = $DisposeFailure
     }
     $captured = $context
     $factory = ({
@@ -308,9 +312,15 @@ function New-DependencyMutexHarness {
                 }
             $mutex | Add-Member -MemberType ScriptMethod -Name ReleaseMutex -Value {
                     $this.Context.ReleaseCount += 1
+                    if (-not [string]::IsNullOrWhiteSpace($this.Context.ReleaseFailure)) {
+                        throw $this.Context.ReleaseFailure
+                    }
                 }
             $mutex | Add-Member -MemberType ScriptMethod -Name Dispose -Value {
                     $this.Context.DisposeCount += 1
+                    if (-not [string]::IsNullOrWhiteSpace($this.Context.DisposeFailure)) {
+                        throw $this.Context.DisposeFailure
+                    }
                 }
             return $mutex
         }.GetNewClosure())
@@ -400,6 +410,29 @@ Test-Case 'dependency check rejects explanatory text alone or mixed with one com
     Assert-Equal -Expected $false -Actual $mixed.Available
 }
 
+Test-Case 'dependency check rejects a single object without the exact command name' {
+    $explanationObject = Test-AIFishBotAudioDependency -CommandFinder {
+        param($name)
+        return [pscustomobject]@{ Message = 'mock command lookup explanation' }
+    }
+    $wrongCommand = Test-AIFishBotAudioDependency -CommandFinder {
+        param($name)
+        return [pscustomobject]@{ Name = 'Get-AudioDevice' }
+    }
+    $wrongCase = Test-AIFishBotAudioDependency -CommandFinder {
+        param($name)
+        return [pscustomobject]@{ Name = 'write-audiodevice' }
+    }
+
+    Assert-Equal -Expected 'Error' -Actual $explanationObject.Status
+    Assert-Equal -Expected $false -Actual $explanationObject.Available
+    Assert-Equal -Expected 'Error' -Actual $wrongCommand.Status
+    Assert-Equal -Expected $false -Actual $wrongCommand.Available
+    Assert-Equal -Expected 'Error' -Actual $wrongCase.Status
+    Assert-Equal -Expected $false -Actual $wrongCase.Available
+    Assert-True -Condition ($wrongCommand.Details -like '*Write-AudioDevice*')
+}
+
 Test-Case 'dependency check masks the user profile path in error details' {
     $userProfile = [Environment]::GetFolderPath([Environment+SpecialFolder]::UserProfile)
     $privatePath = Join-Path -Path $userProfile -ChildPath 'private\lookup.txt'
@@ -474,6 +507,30 @@ Test-Case 'missing dependency contains profile provider exceptions in a failure 
     Assert-True -Condition ($result.Summary -like '*目标目录*')
     Assert-True -Condition ($result.Details -like '*mock profile lookup exploded*')
     Assert-Equal -Expected '' -Actual $result.ModulePath
+}
+
+Test-Case 'invalid explicit source path returns a failure object before path testing' {
+    $result = Install-AIFishBotAudioDependency `
+        -SourceDirectory 'AIFishBotMissingDrive:\source' `
+        -ModulePath 'C:\AI-FishBot.Tests.Mock\profile\Modules\AudioDeviceCmdlets' `
+        -CommandFinder { param($name) return $null } `
+        -TestPathProvider { throw 'path testing must not run' }
+
+    Assert-Equal -Expected $false -Actual $result.Success
+    Assert-True -Condition ($result.Summary -like '*源文件*位置*')
+    Assert-True -Condition ($result.Details -like '*AIFishBotMissingDrive*')
+}
+
+Test-Case 'default source provider exceptions return a failure object' {
+    $result = Install-AIFishBotAudioDependency `
+        -ModulePath 'C:\AI-FishBot.Tests.Mock\profile\Modules\AudioDeviceCmdlets' `
+        -CommandFinder { param($name) return $null } `
+        -SourceDirectoryProvider { throw 'mock default source resolution failed' } `
+        -TestPathProvider { throw 'path testing must not run' }
+
+    Assert-Equal -Expected $false -Actual $result.Success
+    Assert-True -Condition ($result.Summary -like '*源文件*位置*')
+    Assert-True -Condition ($result.Details -like '*mock default source resolution failed*')
 }
 
 Test-Case 'transactional install stages both files before swapping an existing target' {
@@ -663,6 +720,46 @@ Test-Case 'mutex wait exceptions return a failure object and still dispose the l
     Assert-True -Condition ($result.Summary -like '*安装锁*')
     Assert-True -Condition ($result.Details -like '*mock mutex wait failed*')
     Assert-Equal -Expected 0 -Actual $mutex.Context.ReleaseCount
+    Assert-Equal -Expected 1 -Actual $mutex.Context.DisposeCount
+}
+
+Test-Case 'lock wait provider rejects string and numeric false values without installing' {
+    foreach ($invalidWaitValue in @('False', 0)) {
+        $scenario = New-TransactionalDependencyScenario
+        $mutex = New-DependencyMutexHarness
+        $scenario.Options.MutexFactory = $mutex.Factory
+        $waitContext = [pscustomobject]@{ Value = $invalidWaitValue }
+        $capturedWait = $waitContext
+        $scenario.Options.LockWaitProvider = ({
+                param($mutexObject, $timeoutMilliseconds)
+                return $capturedWait.Value
+            }.GetNewClosure())
+        $options = $scenario.Options
+
+        $result = Install-AIFishBotAudioDependency @options
+
+        Assert-Equal -Expected $false -Actual $result.Success
+        Assert-True -Condition ($result.Details -like '*实际布尔值*')
+        Assert-Equal -Expected 0 -Actual @($scenario.Context.Calls | Where-Object { $_ -like 'mkdir:*' }).Count
+        Assert-Equal -Expected 0 -Actual $mutex.Context.ReleaseCount
+        Assert-Equal -Expected 1 -Actual $mutex.Context.DisposeCount
+    }
+}
+
+Test-Case 'lock cleanup failures are included before the final failure result is built' {
+    $scenario = New-TransactionalDependencyScenario -TargetExists $false
+    $mutex = New-DependencyMutexHarness `
+        -ReleaseFailure 'mock release failed' -DisposeFailure 'mock dispose failed'
+    $scenario.Options.MutexFactory = $mutex.Factory
+    $options = $scenario.Options
+
+    $result = Install-AIFishBotAudioDependency @options
+
+    Assert-Equal -Expected $false -Actual $result.Success
+    Assert-True -Condition ($result.Summary -like '*安装锁*清理失败*')
+    Assert-True -Condition ($result.Details -like '*mock release failed*')
+    Assert-True -Condition ($result.Details -like '*mock dispose failed*')
+    Assert-Equal -Expected 1 -Actual $mutex.Context.ReleaseCount
     Assert-Equal -Expected 1 -Actual $mutex.Context.DisposeCount
 }
 

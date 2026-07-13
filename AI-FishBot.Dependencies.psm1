@@ -137,6 +137,20 @@ function Test-AIFishBotAudioDependency {
                 -Details 'Write-AudioDevice 查询必须只返回一个有效命令对象，不能返回说明文字或普通值。'
         }
 
+        $nameProperty = $command.PSObject.Properties['Name']
+        $commandName = $null
+        if ($null -ne $nameProperty -and $nameProperty.Value -is [string]) {
+            $commandName = [string]$nameProperty.Value
+        }
+        if (-not [string]::Equals(
+                $commandName,
+                'Write-AudioDevice',
+                [System.StringComparison]::Ordinal)) {
+            return New-AIFishBotDependencyCheckResult -Status 'Error' -Available $false `
+                -Summary '声音组件检查失败。' `
+                -Details '命令查询结果的 Name 必须准确等于 Write-AudioDevice。'
+        }
+
         return New-AIFishBotDependencyCheckResult -Status 'Available' -Available $true `
             -Summary '声音组件已经可用。' `
             -Details '已找到 Write-AudioDevice 命令。'
@@ -228,11 +242,15 @@ function Install-AIFishBotAudioDependency {
 
         [scriptblock]$CommandFinder,
 
+        [scriptblock]$SourceDirectoryProvider,
+
         [scriptblock]$ProfileProvider,
 
         [scriptblock]$OperationIdProvider,
 
         [scriptblock]$MutexFactory,
+
+        [scriptblock]$LockWaitProvider,
 
         [ValidateRange(1, 300000)]
         [int]$MutexTimeoutMilliseconds = 30000
@@ -247,6 +265,11 @@ function Install-AIFishBotAudioDependency {
     if ($null -eq $ProfileProvider) {
         $ProfileProvider = {
             return $PROFILE
+        }
+    }
+    if ($null -eq $SourceDirectoryProvider) {
+        $SourceDirectoryProvider = {
+            return Join-Path -Path $PSScriptRoot -ChildPath 'AudioModule'
         }
     }
 
@@ -270,8 +293,28 @@ function Install-AIFishBotAudioDependency {
 
     try {
         if ([string]::IsNullOrWhiteSpace($SourceDirectory)) {
-            $SourceDirectory = Join-Path -Path $PSScriptRoot -ChildPath 'AudioModule'
+            $rawSourceOutput = & $SourceDirectoryProvider
+            if ($null -eq $rawSourceOutput) {
+                $sourceOutput = @()
+            }
+            else {
+                $sourceOutput = @($rawSourceOutput)
+            }
+            if ($sourceOutput.Count -ne 1 -or $sourceOutput[0] -isnot [string] -or
+                [string]::IsNullOrWhiteSpace([string]$sourceOutput[0])) {
+                throw '默认源目录必须返回一个有效路径。'
+            }
+            $SourceDirectory = [string]$sourceOutput[0]
         }
+    }
+    catch {
+        [void]$details.Add(('无法确定声音组件源文件位置：{0}' -f $_.Exception.Message))
+        return New-AIFishBotDependencyInstallResult -Success $false `
+            -Summary '无法确定声音组件源文件位置。' `
+            -DetailLines @($details) -ModulePath $resultModulePath
+    }
+
+    try {
         if ([string]::IsNullOrWhiteSpace($ModulePath)) {
             $profileOutput = @(& $ProfileProvider)
             if ($profileOutput.Count -ne 1 -or $profileOutput[0] -isnot [string] -or
@@ -348,11 +391,25 @@ function Install-AIFishBotAudioDependency {
             return New-Object System.Threading.Mutex($false, $name)
         }
     }
+    if ($null -eq $LockWaitProvider) {
+        $LockWaitProvider = {
+            param($mutexObject, $timeoutMilliseconds)
+            return $mutexObject.WaitOne($timeoutMilliseconds)
+        }
+    }
 
-    $sourceFiles = @(
-        (Join-Path -Path $SourceDirectory -ChildPath 'AudioDeviceCmdlets.dll'),
-        (Join-Path -Path $SourceDirectory -ChildPath 'AudioDeviceCmdlets.psd1')
-    )
+    try {
+        $sourceFiles = @(
+            (Join-Path -Path $SourceDirectory -ChildPath 'AudioDeviceCmdlets.dll'),
+            (Join-Path -Path $SourceDirectory -ChildPath 'AudioDeviceCmdlets.psd1')
+        )
+    }
+    catch {
+        [void]$details.Add(('无法构造声音组件源文件位置：{0}' -f $_.Exception.Message))
+        return New-AIFishBotDependencyInstallResult -Success $false `
+            -Summary '无法确定声音组件源文件位置。' `
+            -DetailLines @($details) -ModulePath $ModulePath
+    }
     $missingSourceFiles = New-Object 'System.Collections.Generic.List[string]'
     foreach ($sourceFile in $sourceFiles) {
         try {
@@ -395,10 +452,24 @@ function Install-AIFishBotAudioDependency {
             -DetailLines @($details) -ModulePath $ModulePath
     }
 
-    $mutexAcquired = $false
+    $lockState = [pscustomobject]@{ Acquired = $false }
+    $lockedResult = $null
+    $lockCleanupErrors = New-Object 'System.Collections.Generic.List[string]'
     try {
+        $lockedResult = & {
         try {
-            $mutexAcquired = [bool]$mutex.WaitOne($MutexTimeoutMilliseconds)
+        try {
+            $rawWaitOutput = & $LockWaitProvider $mutex $MutexTimeoutMilliseconds
+            if ($null -eq $rawWaitOutput) {
+                $waitOutput = @()
+            }
+            else {
+                $waitOutput = @($rawWaitOutput)
+            }
+            if ($waitOutput.Count -ne 1 -or $waitOutput[0] -isnot [bool]) {
+                throw '安装锁等待动作必须只返回一个实际布尔值。'
+            }
+            $lockState.Acquired = [bool]$waitOutput[0]
         }
         catch {
             $waitException = $_.Exception
@@ -414,11 +485,11 @@ function Install-AIFishBotAudioDependency {
             if (-not $abandoned) {
                 throw
             }
-            $mutexAcquired = $true
+            $lockState.Acquired = $true
             [void]$details.Add('检测到已废弃的安装锁，已安全接管。')
         }
 
-        if (-not $mutexAcquired) {
+        if (-not $lockState.Acquired) {
             [void]$details.Add(('等待声音组件安装锁超过 {0} 毫秒。' -f $MutexTimeoutMilliseconds))
             return New-AIFishBotDependencyInstallResult -Success $false `
                 -Summary '等待声音组件安装锁超时。' `
@@ -581,29 +652,62 @@ function Install-AIFishBotAudioDependency {
             return New-AIFishBotDependencyInstallResult -Success $false `
                 -Summary $failureSummary -DetailLines @($details) -ModulePath $ModulePath
         }
-    }
-    catch {
+        }
+        catch {
         [void]$details.Add(('声音组件安装锁处理失败：{0}' -f $_.Exception.Message))
         return New-AIFishBotDependencyInstallResult -Success $false `
             -Summary '声音组件安装锁处理失败。' `
             -DetailLines @($details) -ModulePath $ModulePath
+        }
+        }
+    }
+    catch {
+        [void]$details.Add(('声音组件安装锁处理失败：{0}' -f $_.Exception.Message))
+        $lockedResult = New-AIFishBotDependencyInstallResult -Success $false `
+            -Summary '声音组件安装锁处理失败。' `
+            -DetailLines @($details) -ModulePath $ModulePath
     }
     finally {
-        if ($mutexAcquired) {
+        if ($lockState.Acquired) {
             try {
                 $null = $mutex.ReleaseMutex()
             }
             catch {
-                [void]$details.Add(('释放声音组件安装锁失败：{0}' -f $_.Exception.Message))
+                [void]$lockCleanupErrors.Add(('释放声音组件安装锁失败：{0}' -f $_.Exception.Message))
             }
         }
         try {
             $null = $mutex.Dispose()
         }
         catch {
-            [void]$details.Add(('销毁声音组件安装锁失败：{0}' -f $_.Exception.Message))
+            [void]$lockCleanupErrors.Add(('销毁声音组件安装锁失败：{0}' -f $_.Exception.Message))
         }
     }
+
+    if ($null -eq $lockedResult) {
+        $lockedResult = New-AIFishBotDependencyInstallResult -Success $false `
+            -Summary '声音组件安装没有产生有效结果。' `
+            -DetailLines @($details) -ModulePath $ModulePath
+    }
+    if ($lockCleanupErrors.Count -gt 0) {
+        $finalDetailLines = New-Object 'System.Collections.Generic.List[string]'
+        if (-not [string]::IsNullOrWhiteSpace([string]$lockedResult.Details)) {
+            [void]$finalDetailLines.Add([string]$lockedResult.Details)
+        }
+        foreach ($cleanupError in $lockCleanupErrors) {
+            [void]$finalDetailLines.Add($cleanupError)
+        }
+        if ($lockedResult.Success) {
+            $cleanupSummary = '声音组件操作完成，但安装锁清理失败。'
+        }
+        else {
+            $cleanupSummary = '声音组件安装失败，且安装锁清理失败。'
+        }
+        return New-AIFishBotDependencyInstallResult -Success $false `
+            -Summary $cleanupSummary -DetailLines @($finalDetailLines) -ModulePath $ModulePath
+    }
+
+    return $lockedResult
 }
 
 Export-ModuleMember -Function @(
