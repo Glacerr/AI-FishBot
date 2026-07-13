@@ -34,7 +34,31 @@ function Assert-Equal {
         [object]$Actual
     )
 
-    if (-not [object]::Equals($Expected, $Actual)) {
+    $expectedIsArray = $Expected -is [System.Array]
+    $actualIsArray = $Actual -is [System.Array]
+
+    if ($expectedIsArray -or $actualIsArray) {
+        if (-not ($expectedIsArray -and $actualIsArray)) {
+            throw "Expected '$Expected', but received '$Actual'."
+        }
+
+        if ($Expected.Count -ne $Actual.Count) {
+            throw "Expected array length $($Expected.Count), but received $($Actual.Count)."
+        }
+
+        for ($index = 0; $index -lt $Expected.Count; $index += 1) {
+            try {
+                Assert-Equal -Expected $Expected[$index] -Actual $Actual[$index]
+            }
+            catch {
+                throw "Arrays differ at index ${index}: $($_.Exception.Message)"
+            }
+        }
+
+        return
+    }
+
+    if ($Expected -ne $Actual) {
         throw "Expected '$Expected', but received '$Actual'."
     }
 }
@@ -53,20 +77,26 @@ function Assert-True {
 function Assert-Throws {
     param(
         [Parameter(Mandatory = $true)]
-        [scriptblock]$ScriptBlock
+        [scriptblock]$ScriptBlock,
+
+        [string]$MessageLike
     )
 
-    $exceptionWasThrown = $false
+    $caughtException = $null
 
     try {
         & $ScriptBlock
     }
     catch {
-        $exceptionWasThrown = $true
+        $caughtException = $_.Exception
     }
 
-    if (-not $exceptionWasThrown) {
+    if ($null -eq $caughtException) {
         throw 'Expected the script block to throw an exception.'
+    }
+
+    if ($PSBoundParameters.ContainsKey('MessageLike') -and $caughtException.Message -notlike $MessageLike) {
+        throw "Expected exception message like '$MessageLike', but received '$($caughtException.Message)'."
     }
 }
 

@@ -6,6 +6,13 @@ $testFiles = @(Get-ChildItem -LiteralPath $PSScriptRoot -Filter '*.Tests.ps1' -F
         Sort-Object -Property Name)
 $loadFailures = 0
 
+if ($testFiles.Count -eq 0) {
+    Write-Host 'FAIL: no test files were found.'
+    Write-Host ''
+    Write-Host 'Tests: 0; Passed: 0; Failed: 1'
+    exit 1
+}
+
 foreach ($testFile in $testFiles) {
     try {
         . $testFile.FullName
@@ -20,6 +27,11 @@ foreach ($testFile in $testFiles) {
 $total = $script:TestTotal + $loadFailures
 $failed = $script:TestFailed + $loadFailures
 $passed = $total - $failed
+
+if ($total -eq 0) {
+    Write-Host 'FAIL: no test cases were found.'
+    $failed = 1
+}
 
 Write-Host ''
 Write-Host ('Tests: {0}; Passed: {1}; Failed: {2}' -f $total, $passed, $failed)
