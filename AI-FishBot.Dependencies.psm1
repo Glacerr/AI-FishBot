@@ -90,6 +90,7 @@ function Install-AIFishBotAudioDependency {
         [AllowEmptyString()]
         [string]$ModulePath,
 
+        [Alias('TestPathProvider')]
         [scriptblock]$PathTester,
 
         [scriptblock]$DirectoryCreator,

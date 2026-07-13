@@ -156,6 +156,55 @@ Test-Case 'dependency check reports finder errors with full details' {
     Assert-True -Condition ($result.Details -like '*mock command lookup failed*')
 }
 
+Test-Case 'explicit install stops when its initial command check throws' {
+    $result = Install-AIFishBotAudioDependency `
+        -SourceDirectory 'C:\AI-FishBot.Tests.Mock\source' `
+        -ModulePath 'C:\AI-FishBot.Tests.Mock\profile\Modules\AudioDeviceCmdlets' `
+        -CommandFinder {
+            param($name)
+            throw 'mock pre-install lookup exploded'
+        } `
+        -TestPathProvider { throw 'source validation must not run' } `
+        -DirectoryCreator { throw 'directory creation must not run' } `
+        -CopyProvider { throw 'copy must not run' } `
+        -UnblockProvider { throw 'unblock must not run' } `
+        -ModuleImporter { throw 'import must not run' }
+
+    Assert-Equal -Expected $false -Actual $result.Success
+    Assert-True -Condition ($result.Summary -like '*确认*状态*')
+    Assert-True -Condition ($result.Details -like '*mock pre-install lookup exploded*')
+}
+
+Test-Case 'explicit install reports an injected source validation exception' {
+    $context = [pscustomobject]@{ FinderCalls = 0; ValidatedPath = $null; PathType = $null }
+    $captured = $context
+    $result = Install-AIFishBotAudioDependency `
+        -SourceDirectory 'C:\AI-FishBot.Tests.Mock\source' `
+        -ModulePath 'C:\AI-FishBot.Tests.Mock\profile\Modules\AudioDeviceCmdlets' `
+        -CommandFinder ({
+                param($name)
+                $captured.FinderCalls += 1
+                return $null
+            }.GetNewClosure()) `
+        -TestPathProvider ({
+                param($path, $pathType)
+                $captured.ValidatedPath = $path
+                $captured.PathType = $pathType
+                throw 'mock source validation exploded'
+            }.GetNewClosure()) `
+        -DirectoryCreator { throw 'directory creation must not run' } `
+        -CopyProvider { throw 'copy must not run' } `
+        -UnblockProvider { throw 'unblock must not run' } `
+        -ModuleImporter { throw 'import must not run' }
+
+    Assert-Equal -Expected $false -Actual $result.Success
+    Assert-True -Condition ($result.Summary -like '*校验*源文件*')
+    Assert-True -Condition ($result.Details -like '*mock source validation exploded*')
+    Assert-True -Condition ($context.ValidatedPath -like '*AudioDeviceCmdlets.dll')
+    Assert-Equal -Expected 'Leaf' -Actual $context.PathType
+    Assert-Equal -Expected 1 -Actual $context.FinderCalls
+}
+
 Test-Case 'explicit install is idempotent when dependency is already available' {
     $scenario = New-DependencyInstallScenario -InitiallyAvailable $true
     $options = $scenario.Options
@@ -243,6 +292,30 @@ Test-Case 'explicit install fails when command is still missing after import' {
     Assert-Equal -Expected 2 -Actual $scenario.Context.FinderCalls
 }
 
+Test-Case 'explicit install reports a command finder exception during its final recheck' {
+    $scenario = New-DependencyInstallScenario
+    $context = $scenario.Context
+    $captured = $context
+    $scenario.Options.CommandFinder = ({
+            param($name)
+            $captured.FinderCalls += 1
+            [void]$captured.Steps.Add(('check:{0}' -f $name))
+            if ($captured.FinderCalls -eq 1) {
+                return $null
+            }
+            throw 'mock post-install lookup exploded'
+        }.GetNewClosure())
+    $options = $scenario.Options
+
+    $result = Install-AIFishBotAudioDependency @options
+
+    Assert-Equal -Expected $false -Actual $result.Success
+    Assert-True -Condition ($result.Summary -like '*复查失败*')
+    Assert-True -Condition ($result.Details -like '*mock post-install lookup exploded*')
+    Assert-Equal -Expected 2 -Actual $context.FinderCalls
+    Assert-True -Condition (@($context.Steps) -contains 'import:AudioDeviceCmdlets.psd1')
+}
+
 Test-Case 'explicit install supports Installer as the injected import action' {
     $scenario = New-DependencyInstallScenario
     $captured = $scenario.Context
@@ -276,6 +349,67 @@ Test-Case 'explicit install returns one result even when injected actions produc
 
     Assert-Equal -Expected 1 -Actual $results.Count
     Assert-Equal -Expected $true -Actual $results[0].Success
+}
+
+Test-Case 'explicit install resolves default project sources and profile target using only captured paths' {
+    $context = [pscustomobject]@{
+        FinderCalls = 0
+        ValidatedPaths = New-Object 'System.Collections.Generic.List[string]'
+        CreatedPaths = New-Object 'System.Collections.Generic.List[string]'
+        Copies = New-Object 'System.Collections.Generic.List[string]'
+        UnblockedPaths = New-Object 'System.Collections.Generic.List[string]'
+        ImportedPaths = New-Object 'System.Collections.Generic.List[string]'
+    }
+    $captured = $context
+    $result = Install-AIFishBotAudioDependency `
+        -CommandFinder ({
+                param($name)
+                $captured.FinderCalls += 1
+                if ($captured.FinderCalls -eq 1) { return $null }
+                return [pscustomobject]@{ Name = $name }
+            }.GetNewClosure()) `
+        -TestPathProvider ({
+                param($path, $pathType)
+                [void]$captured.ValidatedPaths.Add([string]$path)
+                Assert-Equal -Expected 'Leaf' -Actual $pathType
+                return $true
+            }.GetNewClosure()) `
+        -DirectoryCreator ({
+                param($path)
+                [void]$captured.CreatedPaths.Add([string]$path)
+            }.GetNewClosure()) `
+        -CopyProvider ({
+                param($source, $destination)
+                [void]$captured.Copies.Add(('{0}|{1}' -f $source, $destination))
+            }.GetNewClosure()) `
+        -UnblockProvider ({
+                param($path)
+                [void]$captured.UnblockedPaths.Add([string]$path)
+            }.GetNewClosure()) `
+        -ModuleImporter ({
+                param($path)
+                [void]$captured.ImportedPaths.Add([string]$path)
+            }.GetNewClosure())
+
+    $expectedSourceDirectory = Join-Path -Path $script:DependenciesTestRoot -ChildPath 'AudioModule'
+    $expectedDll = Join-Path -Path $expectedSourceDirectory -ChildPath 'AudioDeviceCmdlets.dll'
+    $expectedManifest = Join-Path -Path $expectedSourceDirectory -ChildPath 'AudioDeviceCmdlets.psd1'
+    $expectedModulePath = Join-Path -Path (Join-Path -Path (Split-Path -Path $PROFILE -Parent) `
+            -ChildPath 'Modules') -ChildPath 'AudioDeviceCmdlets'
+    $expectedTargetDll = Join-Path -Path $expectedModulePath -ChildPath 'AudioDeviceCmdlets.dll'
+    $expectedTargetManifest = Join-Path -Path $expectedModulePath -ChildPath 'AudioDeviceCmdlets.psd1'
+
+    Assert-Equal -Expected $true -Actual $result.Success
+    Assert-Equal -Expected $expectedModulePath -Actual $result.ModulePath
+    Assert-Equal -Expected @($expectedDll, $expectedManifest) -Actual @($context.ValidatedPaths)
+    Assert-Equal -Expected @($expectedModulePath) -Actual @($context.CreatedPaths)
+    Assert-Equal -Expected @(
+        ('{0}|{1}' -f $expectedDll, $expectedTargetDll),
+        ('{0}|{1}' -f $expectedManifest, $expectedTargetManifest)
+    ) -Actual @($context.Copies)
+    Assert-Equal -Expected @($expectedTargetDll, $expectedTargetManifest) -Actual @($context.UnblockedPaths)
+    Assert-Equal -Expected @($expectedTargetManifest) -Actual @($context.ImportedPaths)
+    Assert-Equal -Expected 2 -Actual $context.FinderCalls
 }
 
 Test-Case 'explicit install succeeds in order while all filesystem work remains simulated' {
