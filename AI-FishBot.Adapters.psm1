@@ -43,8 +43,17 @@ function Write-AIFishBotAdapterLogSafely {
     if ($null -eq $LogProvider) {
         return
     }
+    $safeMessage = 'Adapter operation failed.'
     try {
-        & $LogProvider $Level $Message | Out-Null
+        $protectedValues = @(Protect-AIFishBotSecret -Text $Message)
+        if ($protectedValues.Count -eq 1) {
+            $safeMessage = [string]$protectedValues[0]
+        }
+    }
+    catch {
+    }
+    try {
+        & $LogProvider $Level $safeMessage | Out-Null
     }
     catch {
     }
@@ -54,6 +63,19 @@ function Test-AIFishBotAdapterFunctionKey {
     param([AllowNull()][object]$Key)
 
     return $null -ne $Key -and ([string]$Key -cmatch '^F(?:[5-9]|1[0-2])$')
+}
+
+function Test-AIFishBotAdapterTimeoutException {
+    param([AllowNull()][System.Exception]$Exception)
+
+    $current = $Exception
+    while ($null -ne $current) {
+        if ($current -is [System.TimeoutException]) {
+            return $true
+        }
+        $current = $current.InnerException
+    }
+    return $false
 }
 
 function ConvertTo-AIFishBotAudioPeak {
@@ -115,11 +137,16 @@ function New-AIFishBotKeySender {
         [scriptblock]$SendKeysProvider,
 
         [Alias('SerialPortProvider')]
-        [scriptblock]$SerialPortFactory
+        [scriptblock]$SerialPortFactory,
+
+        [Alias('PicoWriteTimeoutMilliseconds')]
+        [ValidateRange(1, 60000)]
+        [int]$WriteTimeoutMilliseconds = 2000
     )
 
     $invokeObjectMember = ${function:Invoke-AIFishBotAdapterObjectMember}
     $testFunctionKey = ${function:Test-AIFishBotAdapterFunctionKey}
+    $testTimeoutException = ${function:Test-AIFishBotAdapterTimeoutException}
     $effectiveMode = if ($UsePico) { 'Pico' } else { $Mode }
     $context = [pscustomobject]@{
         Lock = New-Object object
@@ -127,6 +154,8 @@ function New-AIFishBotKeySender {
         Opened = $false
         SerialPort = $null
         Mode = $effectiveMode
+        ComPort = $ComPort
+        WriteTimeoutMilliseconds = $WriteTimeoutMilliseconds
     }
 
     if ($effectiveMode -eq 'Pico') {
@@ -148,6 +177,7 @@ function New-AIFishBotKeySender {
                 throw 'The serial port factory must return exactly one port object.'
             }
             $port = $ports[0]
+            $port.WriteTimeout = $WriteTimeoutMilliseconds
             Invoke-AIFishBotAdapterObjectMember -Object $port -Name Open | Out-Null
             $context.SerialPort = $port
             $context.Opened = $true
@@ -186,8 +216,19 @@ function New-AIFishBotKeySender {
                     throw 'The key sender has been disposed.'
                 }
                 if ($captured.Mode -eq 'Pico') {
-                    & $invokeObjectMember -Object $captured.SerialPort `
-                        -Name WriteLine -ArgumentList @([string]$key) | Out-Null
+                    try {
+                        & $invokeObjectMember -Object $captured.SerialPort `
+                            -Name WriteLine -ArgumentList @([string]$key) | Out-Null
+                    }
+                    catch {
+                        if (& $testTimeoutException -Exception $_.Exception) {
+                            throw (New-Object System.InvalidOperationException(
+                                    ('Pico serial write to {0} timed out after {1} ms.' -f
+                                        $captured.ComPort, $captured.WriteTimeoutMilliseconds),
+                                    $_.Exception))
+                        }
+                        throw
+                    }
                 }
                 else {
                     & $capturedSendKeys ('{{{0}}}' -f [string]$key) | Out-Null
@@ -300,18 +341,22 @@ function Test-AIFishBotDiscordWebhook {
 function New-AIFishBotNotifier {
     [CmdletBinding()]
     param(
+        [Alias('HttpProvider')]
         [scriptblock]$InvokeRestMethodProvider,
         [scriptblock]$LogProvider,
-        [scriptblock]$ProtectProvider
+        [scriptblock]$ProtectProvider,
+
+        [ValidateRange(1, 60)]
+        [int]$TimeoutSec = 10
     )
 
     $testWebhook = ${function:Test-AIFishBotDiscordWebhook}
     $writeLogSafely = ${function:Write-AIFishBotAdapterLogSafely}
     if ($null -eq $InvokeRestMethodProvider) {
         $InvokeRestMethodProvider = {
-            param($Uri, $Method, $ContentType, $Body)
+            param($Uri, $Method, $ContentType, $Body, $TimeoutSec)
             Invoke-RestMethod -Uri $Uri -Method $Method -ContentType $ContentType `
-                -Body $Body -ErrorAction Stop
+                -Body $Body -TimeoutSec $TimeoutSec -ErrorAction Stop
         }
     }
     if ($null -eq $ProtectProvider) {
@@ -320,6 +365,7 @@ function New-AIFishBotNotifier {
     $capturedRest = $InvokeRestMethodProvider
     $capturedLog = $LogProvider
     $capturedProtect = $ProtectProvider
+    $capturedTimeout = $TimeoutSec
     $notifyAction = ({
             param($eventName, $webhook)
             if (-not (& $testWebhook -Webhook ([string]$webhook))) {
@@ -333,18 +379,20 @@ function New-AIFishBotNotifier {
             }
             $body = $payload | ConvertTo-Json -Compress
             try {
-                & $capturedRest -Uri ([string]$webhook) -Method Post `
-                    -ContentType 'application/json' -Body $body | Out-Null
+                & $capturedRest ([string]$webhook) 'Post' 'application/json' `
+                    $body $capturedTimeout | Out-Null
                 return $true
             }
             catch {
                 $rawMessage = 'Notification request failed: {0}' -f $_.Exception.Message
-                $safeValues = @(& $capturedProtect $rawMessage)
-                $safeMessage = if ($safeValues.Count -eq 1) {
-                    [string]$safeValues[0]
+                $safeMessage = $rawMessage
+                try {
+                    $safeValues = @(& $capturedProtect $rawMessage)
+                    if ($safeValues.Count -eq 1) {
+                        $safeMessage = [string]$safeValues[0]
+                    }
                 }
-                else {
-                    'Notification request failed.'
+                catch {
                 }
                 & $writeLogSafely -LogProvider $capturedLog -Level Warning `
                     -Message $safeMessage
@@ -518,7 +566,12 @@ function New-AIFishBotEngineAdapter {
         [scriptblock]$LogProvider,
         [AllowNull()][object[]]$SimulationPeaks = @(),
         [scriptblock]$SimulationEventSink,
-        [datetimeoffset]$SimulationNow = $([datetimeoffset]'2026-07-13T00:00:00Z')
+        [AllowNull()][Nullable[datetimeoffset]]$SimulationNow = $null,
+        [scriptblock]$SimulationNowProvider,
+        [scriptblock]$SimulationThrottleProvider,
+
+        [ValidateRange(1, 5)]
+        [int]$SimulationThrottleMilliseconds = 1
     )
 
     $invokeObjectMember = ${function:Invoke-AIFishBotAdapterObjectMember}
@@ -526,35 +579,60 @@ function New-AIFishBotEngineAdapter {
     $convertAudioPeak = ${function:ConvertTo-AIFishBotAudioPeak}
     $writeLogSafely = ${function:Write-AIFishBotAdapterLogSafely}
     if ($Simulation) {
+        if ($null -eq $SimulationNowProvider) {
+            if ($PSBoundParameters.ContainsKey('SimulationNow') -and $null -ne $SimulationNow) {
+                $fixedSimulationNow = ([datetimeoffset]$SimulationNow).ToUniversalTime()
+                $SimulationNowProvider = ({ return $fixedSimulationNow }.GetNewClosure())
+            }
+            else {
+                $SimulationNowProvider = { return [datetimeoffset]::UtcNow }
+            }
+        }
+        if ($null -eq $SimulationThrottleProvider) {
+            $SimulationThrottleProvider = {
+                param($milliseconds)
+                Start-Sleep -Milliseconds ([int]$milliseconds)
+            }
+        }
+        $initialSimulationNow = ([datetimeoffset](& $SimulationNowProvider)).ToUniversalTime()
         $peakQueue = New-Object 'System.Collections.Generic.Queue[object]'
         foreach ($peak in @($SimulationPeaks)) {
             $peakQueue.Enqueue($peak)
         }
         $context = [pscustomobject]@{
             Lock = New-Object object
-            Now = $SimulationNow
+            Now = $initialSimulationNow
             MonotonicMilliseconds = [double]0
             Peaks = $peakQueue
-            Events = New-Object 'System.Collections.Generic.List[string]'
+            Events = New-Object 'System.Collections.Generic.Queue[string]'
             DisposeCount = 0
             Disposed = $false
         }
         $captured = $context
         $capturedSink = $SimulationEventSink
+        $capturedNowProvider = $SimulationNowProvider
+        $capturedThrottle = $SimulationThrottleProvider
+        $capturedThrottleMilliseconds = $SimulationThrottleMilliseconds
         $emit = ({
                 param($eventName)
-                [void]$captured.Events.Add([string]$eventName)
+                if ($captured.Events.Count -ge 1000) {
+                    [void]$captured.Events.Dequeue()
+                }
+                $captured.Events.Enqueue([string]$eventName)
                 if ($null -ne $capturedSink) {
                     & $capturedSink ([string]$eventName) | Out-Null
                 }
             }.GetNewClosure())
-        $nowAction = ({ return [datetimeoffset]$captured.Now }.GetNewClosure())
+        $nowAction = ({
+                $value = ([datetimeoffset](& $capturedNowProvider)).ToUniversalTime()
+                $captured.Now = $value
+                return $value
+            }.GetNewClosure())
         $millisecondsAction = ({ return [double]$captured.MonotonicMilliseconds }.GetNewClosure())
         $sleepAction = ({
                 param($milliseconds)
                 $value = [int]$milliseconds
                 if ($value -lt 0) { throw 'Sleep milliseconds cannot be negative.' }
-                $captured.Now = $captured.Now.AddMilliseconds($value)
                 $captured.MonotonicMilliseconds += [double]$value
                 & $emit ('sleep:{0}' -f $value) | Out-Null
             }.GetNewClosure())
@@ -567,6 +645,7 @@ function New-AIFishBotEngineAdapter {
             }.GetNewClosure())
         $focusAction = ({ & $emit 'focus' | Out-Null; return $true }.GetNewClosure())
         $peakAction = ({
+                & $capturedThrottle $capturedThrottleMilliseconds | Out-Null
                 $value = if ($captured.Peaks.Count -gt 0) {
                     & $convertAudioPeak -Values @($captured.Peaks.Dequeue())
                 }
@@ -620,40 +699,53 @@ function New-AIFishBotEngineAdapter {
         }
     }
 
-    if ($null -eq $LogProvider) {
-        if ([string]::IsNullOrWhiteSpace($RunDirectory)) {
-            $LogProvider = { param($level, $message) }
+    $owned = New-Object 'System.Collections.Generic.List[object]'
+    $takeOwnership = ({
+            param($dependency)
+            foreach ($existing in $owned) {
+                if ([object]::ReferenceEquals($existing, $dependency)) {
+                    return
+                }
+            }
+            [void]$owned.Add($dependency)
+        }.GetNewClosure())
+    foreach ($injectedDependency in @($AudioMonitor, $KeySender, $GameFocuser, $Notifier)) {
+        if ($null -ne $injectedDependency) {
+            & $takeOwnership $injectedDependency
         }
-        else {
-            $capturedRunDirectory = [System.IO.Path]::GetFullPath($RunDirectory)
-            $LogProvider = ({
-                    param($level, $message)
-                    Write-AIFishBotLog -RunDirectory $capturedRunDirectory `
-                        -Level $level -Message $message | Out-Null
-                }.GetNewClosure())
-        }
-    }
-    if ($null -eq $SleepProvider) {
-        $SleepProvider = { param($milliseconds) Start-Sleep -Milliseconds ([int]$milliseconds) }
-    }
-    if ($null -eq $NowProvider) {
-        $NowProvider = { return [datetimeoffset]::Now }
     }
     $stopwatch = $null
-    if ($null -eq $MonotonicMillisecondsProvider) {
-        $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
-        $capturedStopwatch = $stopwatch
-        $MonotonicMillisecondsProvider = ({
-                return [double]$capturedStopwatch.Elapsed.TotalMilliseconds
-            }.GetNewClosure())
-    }
-
-    $created = New-Object 'System.Collections.Generic.List[object]'
     try {
+        if ($null -eq $LogProvider) {
+            if ([string]::IsNullOrWhiteSpace($RunDirectory)) {
+                $LogProvider = { param($level, $message) }
+            }
+            else {
+                $capturedRunDirectory = [System.IO.Path]::GetFullPath($RunDirectory)
+                $LogProvider = ({
+                        param($level, $message)
+                        Write-AIFishBotLog -RunDirectory $capturedRunDirectory `
+                            -Level $level -Message $message | Out-Null
+                    }.GetNewClosure())
+            }
+        }
+        if ($null -eq $SleepProvider) {
+            $SleepProvider = { param($milliseconds) Start-Sleep -Milliseconds ([int]$milliseconds) }
+        }
+        if ($null -eq $NowProvider) {
+            $NowProvider = { return [datetimeoffset]::Now }
+        }
+        if ($null -eq $MonotonicMillisecondsProvider) {
+            $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+            $capturedStopwatch = $stopwatch
+            $MonotonicMillisecondsProvider = ({
+                    return [double]$capturedStopwatch.Elapsed.TotalMilliseconds
+                }.GetNewClosure())
+        }
         if ($null -eq $AudioMonitor) {
             $AudioMonitor = New-AIFishBotAudioMonitor
-            [void]$created.Add($AudioMonitor)
         }
+        & $takeOwnership $AudioMonitor
         if ($null -eq $KeySender) {
             $usePico = $false
             $comPort = ''
@@ -664,24 +756,26 @@ function New-AIFishBotEngineAdapter {
                 if ($null -ne $portProperty) { $comPort = [string]$portProperty.Value }
             }
             $KeySender = New-AIFishBotKeySender -UsePico:$usePico -ComPort $comPort
-            [void]$created.Add($KeySender)
         }
+        & $takeOwnership $KeySender
         if ($null -eq $GameFocuser) {
             $GameFocuser = New-AIFishBotGameFocuser -LogProvider $LogProvider
-            [void]$created.Add($GameFocuser)
         }
+        & $takeOwnership $GameFocuser
         if ($null -eq $Notifier) {
             $Notifier = New-AIFishBotNotifier -LogProvider $LogProvider
-            [void]$created.Add($Notifier)
         }
+        & $takeOwnership $Notifier
         Invoke-AIFishBotAdapterObjectMember -Object $AudioMonitor -Name Start | Out-Null
     }
     catch {
-        foreach ($dependency in $created) {
+        foreach ($dependency in $owned) {
             try {
                 Invoke-AIFishBotAdapterObjectMember -Object $dependency -Name Dispose | Out-Null
             }
             catch {
+                & $writeLogSafely -LogProvider $LogProvider -Level Warning `
+                    -Message ('Adapter dependency disposal failed: {0}' -f $_.Exception.Message)
             }
         }
         if ($null -ne $stopwatch) { $stopwatch.Stop() }
@@ -695,6 +789,7 @@ function New-AIFishBotEngineAdapter {
         KeySender = $KeySender
         GameFocuser = $GameFocuser
         Notifier = $Notifier
+        OwnedDependencies = $owned.ToArray()
         Stopwatch = $stopwatch
     }
     $captured = $context
@@ -727,12 +822,7 @@ function New-AIFishBotEngineAdapter {
             try {
                 if ($captured.Disposed) { return }
                 $captured.Disposed = $true
-                foreach ($dependency in @(
-                        $captured.AudioMonitor,
-                        $captured.KeySender,
-                        $captured.GameFocuser,
-                        $captured.Notifier
-                    )) {
+                foreach ($dependency in $captured.OwnedDependencies) {
                     try {
                         & $invokeObjectMember -Object $dependency -Name Dispose | Out-Null
                     }

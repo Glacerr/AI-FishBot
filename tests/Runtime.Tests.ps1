@@ -887,6 +887,16 @@ Test-Case 'secret protection and logs mask common Discord webhook URL variants' 
                 Url = 'https:\/\/discord.com\/api\/v10\/webhooks\/444ddd\/tokenFour'
                 Id = '444ddd'
                 Token = 'tokenFour'
+            },
+            [pscustomobject]@{
+                Url = 'https://discord.com:443/api/v10/webhooks/555eee/tokenFive'
+                Id = '555eee'
+                Token = 'tokenFive'
+            },
+            [pscustomobject]@{
+                Url = 'https:\/\/canary.discordapp.com:8443\/api\/v11\/webhooks\/666fff\/tokenSix'
+                Id = '666fff'
+                Token = 'tokenSix'
             }
         )
 

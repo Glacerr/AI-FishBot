@@ -90,7 +90,7 @@ Test-Case 'Pico key sender opens with fixed serial settings sends lines and clos
         IsOpen = $false
     }
     $captured = $context
-    $serial = [pscustomobject]@{ IsOpen = $false }
+    $serial = [pscustomobject]@{ IsOpen = $false; WriteTimeout = 0 }
     $serial | Add-Member -MemberType ScriptMethod -Name Open -Value {
         $captured.OpenCount += 1
         $this.IsOpen = $true
@@ -124,8 +124,43 @@ Test-Case 'Pico key sender opens with fixed serial settings sends lines and clos
     Assert-Equal -Expected ([System.IO.Ports.Parity]::None) -Actual $context.Arguments[2]
     Assert-Equal -Expected 8 -Actual $context.Arguments[3]
     Assert-Equal -Expected ([System.IO.Ports.StopBits]::One) -Actual $context.Arguments[4]
+    Assert-Equal -Expected 2000 -Actual $serial.WriteTimeout
     Assert-Equal -Expected @('F12') -Actual @($context.Lines)
     Assert-Equal -Expected 1 -Actual $context.OpenCount
+    Assert-Equal -Expected 1 -Actual $context.CloseCount
+    Assert-Equal -Expected 1 -Actual $context.DisposeCount
+}
+
+Test-Case 'Pico key sender bounds writes and reports timeout details before disposing once' {
+    $context = [pscustomobject]@{ CloseCount = 0; DisposeCount = 0 }
+    $captured = $context
+    $serial = [pscustomobject]@{ IsOpen = $false; WriteTimeout = 0 }
+    $serial | Add-Member -MemberType ScriptMethod -Name Open -Value { $this.IsOpen = $true }
+    $serial | Add-Member -MemberType ScriptMethod -Name WriteLine -Value {
+        param($line)
+        throw (New-Object System.TimeoutException('serial write blocked'))
+    }
+    $serial | Add-Member -MemberType ScriptMethod -Name Close -Value {
+        $captured.CloseCount += 1
+        $this.IsOpen = $false
+    }.GetNewClosure()
+    $serial | Add-Member -MemberType ScriptMethod -Name Dispose -Value {
+        $captured.DisposeCount += 1
+    }.GetNewClosure()
+    $factory = {
+        param($portName, $baudRate, $parity, $dataBits, $stopBits)
+        return $serial
+    }.GetNewClosure()
+    $sender = New-AIFishBotKeySender -UsePico -ComPort 'COM8' `
+        -WriteTimeoutMilliseconds 1500 -SerialPortFactory $factory
+
+    Assert-Throws -ScriptBlock {
+        Invoke-AdaptersMember -Object $sender -Name Send -Arguments @('F8') | Out-Null
+    } -MessageLike '*COM8*timed out*1500*'
+    Invoke-AdaptersMember -Object $sender -Name Dispose | Out-Null
+    Invoke-AdaptersMember -Object $sender -Name Dispose | Out-Null
+
+    Assert-Equal -Expected 1500 -Actual $serial.WriteTimeout
     Assert-Equal -Expected 1 -Actual $context.CloseCount
     Assert-Equal -Expected 1 -Actual $context.DisposeCount
 }
@@ -133,7 +168,7 @@ Test-Case 'Pico key sender opens with fixed serial settings sends lines and clos
 Test-Case 'Pico key sender reports a clear open failure and disposes the failed port' {
     $context = [pscustomobject]@{ DisposeCount = 0 }
     $captured = $context
-    $serial = [pscustomobject]@{}
+    $serial = [pscustomobject]@{ WriteTimeout = 0 }
     $serial | Add-Member -MemberType ScriptMethod -Name Open -Value { throw 'access denied' }
     $serial | Add-Member -MemberType ScriptMethod -Name Dispose -Value {
         $captured.DisposeCount += 1
@@ -186,9 +221,10 @@ Test-Case 'notifier posts JSON to a valid Discord webhook' {
     $requests = New-Object 'System.Collections.Generic.List[object]'
     $captured = $requests
     $rest = {
-        param($Uri, $Method, $ContentType, $Body)
+        param($Uri, $Method, $ContentType, $Body, $TimeoutSec)
         [void]$captured.Add([pscustomobject]@{
-                Uri = $Uri; Method = $Method; ContentType = $ContentType; Body = $Body
+                Uri = $Uri; Method = $Method; ContentType = $ContentType
+                Body = $Body; TimeoutSec = $TimeoutSec
             })
         return [pscustomobject]@{ ok = $true }
     }.GetNewClosure()
@@ -203,7 +239,80 @@ Test-Case 'notifier posts JSON to a valid Discord webhook' {
     Assert-Equal -Expected $webhook -Actual $requests[0].Uri
     Assert-Equal -Expected 'Post' -Actual $requests[0].Method
     Assert-Equal -Expected 'application/json' -Actual $requests[0].ContentType
+    Assert-Equal -Expected 10 -Actual $requests[0].TimeoutSec
     Assert-Equal -Expected 'start' -Actual (($requests[0].Body | ConvertFrom-Json).event)
+}
+
+Test-Case 'notifier passes an injected timeout from one through sixty seconds' {
+    $timeouts = New-Object 'System.Collections.Generic.List[int]'
+    $captured = $timeouts
+    $http = {
+        param($Uri, $Method, $ContentType, $Body, $TimeoutSec)
+        [void]$captured.Add([int]$TimeoutSec)
+    }.GetNewClosure()
+    $webhook = 'https://discord.com/api/webhooks/timeout-id/timeout-token'
+
+    foreach ($timeout in @(1, 60)) {
+        $notifier = New-AIFishBotNotifier -HttpProvider $http -TimeoutSec $timeout `
+            -LogProvider { param($level, $message) }
+        Assert-Equal -Expected $true -Actual (Invoke-AdaptersMember -Object $notifier `
+                -Name Notify -Arguments @('start', $webhook))
+    }
+
+    Assert-Equal -Expected @(1, 60) -Actual @($timeouts)
+    Assert-Throws -ScriptBlock {
+        New-AIFishBotNotifier -HttpProvider $http -TimeoutSec 0 | Out-Null
+    } -MessageLike '*minimum*1*'
+    Assert-Throws -ScriptBlock {
+        New-AIFishBotNotifier -HttpProvider $http -TimeoutSec 61 | Out-Null
+    } -MessageLike '*maximum*60*'
+}
+
+Test-Case 'notifier contains an injected request timeout without exposing its webhook' {
+    $logs = New-Object 'System.Collections.Generic.List[string]'
+    $capturedLogs = $logs
+    $webhook = 'https://discord.com:443/api/v10/webhooks/timeout-id/timeout-secret-token'
+    $http = {
+        param($Uri, $Method, $ContentType, $Body, $TimeoutSec)
+        throw (New-Object System.TimeoutException(('timed out after {0}s at {1}' -f $TimeoutSec, $Uri)))
+    }
+    $notifier = New-AIFishBotNotifier -HttpProvider $http -TimeoutSec 3 -LogProvider ({
+            param($level, $message)
+            [void]$capturedLogs.Add(('{0}:{1}' -f $level, $message))
+        }.GetNewClosure())
+
+    $result = Invoke-AdaptersMember -Object $notifier -Name Notify -Arguments @('stop', $webhook)
+    $logText = $logs -join "`n"
+
+    Assert-Equal -Expected $false -Actual $result
+    Assert-True -Condition ($logText -like '*timed out after 3s*')
+    Assert-Equal -Expected $false -Actual $logText.Contains('timeout-id')
+    Assert-Equal -Expected $false -Actual $logText.Contains('timeout-secret-token')
+}
+
+Test-Case 'notifier contains a timeout even when an injected protector fails' {
+    $logs = New-Object 'System.Collections.Generic.List[string]'
+    $capturedLogs = $logs
+    $webhook = 'https://discord.com:443/api/v10/webhooks/protect-id/protect-secret-token'
+    $http = {
+        param($Uri, $Method, $ContentType, $Body, $TimeoutSec)
+        throw (New-Object System.TimeoutException(('request timed out at {0}' -f $Uri)))
+    }
+    $notifier = New-AIFishBotNotifier -HttpProvider $http -ProtectProvider {
+        param($text)
+        throw 'protector failed'
+    } -LogProvider ({
+            param($level, $message)
+            [void]$capturedLogs.Add(('{0}:{1}' -f $level, $message))
+        }.GetNewClosure())
+
+    $result = Invoke-AdaptersMember -Object $notifier -Name Notify -Arguments @('stop', $webhook)
+    $logText = $logs -join "`n"
+
+    Assert-Equal -Expected $false -Actual $result
+    Assert-True -Condition ($logText -like '*request timed out*')
+    Assert-Equal -Expected $false -Actual $logText.Contains('protect-id')
+    Assert-Equal -Expected $false -Actual $logText.Contains('protect-secret-token')
 }
 
 Test-Case 'notifier rejects empty and non-Discord webhook values without a request' {
@@ -242,6 +351,28 @@ Test-Case 'notifier contains network errors and masks webhook tokens in logs' {
     Assert-Equal -Expected $false -Actual $result
     Assert-True -Condition ($logText -like '*webhooks/***')
     Assert-Equal -Expected $false -Actual $logText.Contains('secret-token')
+}
+
+Test-Case 'notifier masks a port-bearing webhook when an injected request fails' {
+    $logs = New-Object 'System.Collections.Generic.List[string]'
+    $capturedLogs = $logs
+    $webhook = 'https://canary.discordapp.com:8443/api/v11/webhooks/port-id/port-secret-token'
+    $rest = {
+        param($Uri, $Method, $ContentType, $Body)
+        throw ('request failed: {0}' -f $Uri)
+    }
+    $notifier = New-AIFishBotNotifier -InvokeRestMethodProvider $rest -LogProvider ({
+            param($level, $message)
+            [void]$capturedLogs.Add([string]$message)
+        }.GetNewClosure())
+
+    $result = Invoke-AdaptersMember -Object $notifier -Name Notify -Arguments @('stop', $webhook)
+    $logText = $logs -join "`n"
+
+    Assert-Equal -Expected $false -Actual $result
+    Assert-True -Condition ($logText -like '*webhooks/***')
+    Assert-Equal -Expected $false -Actual $logText.Contains('port-id')
+    Assert-Equal -Expected $false -Actual $logText.Contains('port-secret-token')
 }
 
 Test-Case 'audio monitor returns one numeric peak clamped to zero through one hundred' {
@@ -327,6 +458,52 @@ Test-Case 'engine adapter simulation is memory-only and records injected events'
         -Actual @($events)
 }
 
+Test-Case 'simulation wall clock is current UTC and independent from virtual monotonic time' {
+    $before = [datetimeoffset]::UtcNow
+    $adapter = New-AIFishBotEngineAdapter -Simulation
+
+    $wallBefore = Invoke-AdaptersMember -Object $adapter -Name Now
+    Invoke-AdaptersMember -Object $adapter -Name SleepMilliseconds -Arguments @(60000) | Out-Null
+    $wallAfter = Invoke-AdaptersMember -Object $adapter -Name Now
+    $after = [datetimeoffset]::UtcNow
+
+    Assert-Equal -Expected ([timespan]::Zero) -Actual $wallBefore.Offset
+    Assert-Equal -Expected ([timespan]::Zero) -Actual $wallAfter.Offset
+    Assert-True -Condition ($wallBefore -ge $before -and $wallBefore -le $after)
+    Assert-True -Condition ($wallAfter -ge $before -and $wallAfter -le $after)
+    Assert-True -Condition (($wallAfter - $wallBefore).TotalSeconds -lt 5)
+    Assert-Equal -Expected ([double]60000) `
+        -Actual (Invoke-AdaptersMember -Object $adapter -Name MonotonicMilliseconds)
+}
+
+Test-Case 'simulation read points use a short injectable throttle' {
+    $throttles = New-Object 'System.Collections.Generic.List[int]'
+    $captured = $throttles
+    $adapter = New-AIFishBotEngineAdapter -Simulation -SimulationThrottleProvider ({
+            param($milliseconds)
+            [void]$captured.Add([int]$milliseconds)
+        }.GetNewClosure())
+
+    Invoke-AdaptersMember -Object $adapter -Name ReadPeak | Out-Null
+    Invoke-AdaptersMember -Object $adapter -Name ReadPeak | Out-Null
+
+    Assert-Equal -Expected @(1, 1) -Actual @($throttles)
+}
+
+Test-Case 'simulation event history keeps only its newest one thousand entries' {
+    $adapter = New-AIFishBotEngineAdapter -Simulation `
+        -SimulationThrottleProvider { param($milliseconds) }
+
+    foreach ($index in 0..1004) {
+        Invoke-AdaptersMember -Object $adapter -Name Log -Arguments @('Info', [string]$index) | Out-Null
+    }
+    $events = @($adapter.Context.Events)
+
+    Assert-Equal -Expected 1000 -Actual $events.Count
+    Assert-Equal -Expected 'log:Info:5' -Actual $events[0]
+    Assert-Equal -Expected 'log:Info:1004' -Actual $events[999]
+}
+
 Test-Case 'engine adapter delegates every core operation through injected components' {
     $events = New-Object 'System.Collections.Generic.List[string]'
     $captured = $events
@@ -370,6 +547,155 @@ Test-Case 'engine adapter delegates every core operation through injected compon
         'audio:start', 'sleep:10', 'key:F6', 'focus', 'audio:read', 'notify:stop',
         'log:Info:message', 'audio:dispose', 'key:dispose', 'focus:dispose', 'notify:dispose'
     ) -Actual @($events)
+}
+
+Test-Case 'engine adapter disposes every injected component once when startup fails' {
+    $counts = [pscustomobject]@{ Audio = 0; Key = 0; Focus = 0; Notify = 0 }
+    $captured = $counts
+    $monitor = [pscustomobject]@{
+        Start = { throw 'audio startup failed' }
+        ReadPeak = { return [double]0 }
+        Dispose = ({ $captured.Audio += 1 }.GetNewClosure())
+    }
+    $sender = [pscustomobject]@{
+        Send = { param($key) }
+        Dispose = ({ $captured.Key += 1 }.GetNewClosure())
+    }
+    $focuser = [pscustomobject]@{
+        Focus = { return $true }
+        Dispose = ({ $captured.Focus += 1 }.GetNewClosure())
+    }
+    $notifier = [pscustomobject]@{
+        Notify = { param($eventName, $webhook) return $true }
+        Dispose = ({ $captured.Notify += 1 }.GetNewClosure())
+    }
+
+    Assert-Throws -ScriptBlock {
+        New-AIFishBotEngineAdapter -AudioMonitor $monitor -KeySender $sender `
+            -GameFocuser $focuser -Notifier $notifier `
+            -SleepProvider { param($milliseconds) } `
+            -NowProvider { return [datetimeoffset]::UtcNow } `
+            -MonotonicMillisecondsProvider { return [double]0 } `
+            -LogProvider { param($level, $message) } | Out-Null
+    } -MessageLike '*audio startup failed*'
+
+    Assert-Equal -Expected 1 -Actual $counts.Audio
+    Assert-Equal -Expected 1 -Actual $counts.Key
+    Assert-Equal -Expected 1 -Actual $counts.Focus
+    Assert-Equal -Expected 1 -Actual $counts.Notify
+}
+
+Test-Case 'engine adapter owns later injected components before an internal component fails' {
+    $counts = [pscustomobject]@{ Audio = 0; Focus = 0; Notify = 0 }
+    $captured = $counts
+    $monitor = [pscustomobject]@{
+        Start = { }
+        ReadPeak = { return [double]0 }
+        Dispose = ({ $captured.Audio += 1 }.GetNewClosure())
+    }
+    $focuser = [pscustomobject]@{
+        Focus = { return $true }
+        Dispose = ({ $captured.Focus += 1 }.GetNewClosure())
+    }
+    $notifier = [pscustomobject]@{
+        Notify = { param($eventName, $webhook) return $true }
+        Dispose = ({ $captured.Notify += 1 }.GetNewClosure())
+    }
+    $config = [pscustomobject]@{ usePi = $true; picoComPort = '' }
+
+    Assert-Throws -ScriptBlock {
+        New-AIFishBotEngineAdapter -Config $config -AudioMonitor $monitor `
+            -GameFocuser $focuser -Notifier $notifier `
+            -SleepProvider { param($milliseconds) } `
+            -NowProvider { return [datetimeoffset]::UtcNow } `
+            -MonotonicMillisecondsProvider { return [double]0 } `
+            -LogProvider { param($level, $message) } | Out-Null
+    } -MessageLike '*Pico COM port*blank*'
+
+    Assert-Equal -Expected 1 -Actual $counts.Audio
+    Assert-Equal -Expected 1 -Actual $counts.Focus
+    Assert-Equal -Expected 1 -Actual $counts.Notify
+}
+
+Test-Case 'engine adapter owns injected components before run directory setup fails' {
+    $counts = [pscustomobject]@{ Audio = 0; Key = 0; Focus = 0; Notify = 0 }
+    $captured = $counts
+    $monitor = [pscustomobject]@{
+        Start = { }
+        ReadPeak = { return [double]0 }
+        Dispose = ({ $captured.Audio += 1 }.GetNewClosure())
+    }
+    $sender = [pscustomobject]@{
+        Send = { param($key) }
+        Dispose = ({ $captured.Key += 1 }.GetNewClosure())
+    }
+    $focuser = [pscustomobject]@{
+        Focus = { return $true }
+        Dispose = ({ $captured.Focus += 1 }.GetNewClosure())
+    }
+    $notifier = [pscustomobject]@{
+        Notify = { param($eventName, $webhook) return $true }
+        Dispose = ({ $captured.Notify += 1 }.GetNewClosure())
+    }
+
+    Assert-Throws -ScriptBlock {
+        New-AIFishBotEngineAdapter -RunDirectory ([string][char]0) `
+            -AudioMonitor $monitor -KeySender $sender -GameFocuser $focuser `
+            -Notifier $notifier | Out-Null
+    }
+
+    Assert-Equal -Expected 1 -Actual $counts.Audio
+    Assert-Equal -Expected 1 -Actual $counts.Key
+    Assert-Equal -Expected 1 -Actual $counts.Focus
+    Assert-Equal -Expected 1 -Actual $counts.Notify
+}
+
+Test-Case 'engine adapter masks disposal errors and continues cleaning each component once' {
+    $counts = [pscustomobject]@{ Audio = 0; Key = 0; Focus = 0; Notify = 0 }
+    $logs = New-Object 'System.Collections.Generic.List[string]'
+    $capturedCounts = $counts
+    $capturedLogs = $logs
+    $monitor = [pscustomobject]@{
+        Start = { }
+        ReadPeak = { return [double]0 }
+        Dispose = ({
+                $capturedCounts.Audio += 1
+                throw 'cleanup failed at https://discord.com:443/api/v10/webhooks/dispose-id/dispose-secret-token'
+            }.GetNewClosure())
+    }
+    $sender = [pscustomobject]@{
+        Send = { param($key) }
+        Dispose = ({ $capturedCounts.Key += 1 }.GetNewClosure())
+    }
+    $focuser = [pscustomobject]@{
+        Focus = { return $true }
+        Dispose = ({ $capturedCounts.Focus += 1 }.GetNewClosure())
+    }
+    $notifier = [pscustomobject]@{
+        Notify = { param($eventName, $webhook) return $true }
+        Dispose = ({ $capturedCounts.Notify += 1 }.GetNewClosure())
+    }
+    $adapter = New-AIFishBotEngineAdapter -AudioMonitor $monitor -KeySender $sender `
+        -GameFocuser $focuser -Notifier $notifier `
+        -SleepProvider { param($milliseconds) } `
+        -NowProvider { return [datetimeoffset]::UtcNow } `
+        -MonotonicMillisecondsProvider { return [double]0 } `
+        -LogProvider ({
+            param($level, $message)
+            [void]$capturedLogs.Add(('{0}:{1}' -f $level, $message))
+        }.GetNewClosure())
+
+    Invoke-AdaptersMember -Object $adapter -Name Dispose | Out-Null
+    Invoke-AdaptersMember -Object $adapter -Name Dispose | Out-Null
+    $logText = $logs -join "`n"
+
+    Assert-Equal -Expected 1 -Actual $counts.Audio
+    Assert-Equal -Expected 1 -Actual $counts.Key
+    Assert-Equal -Expected 1 -Actual $counts.Focus
+    Assert-Equal -Expected 1 -Actual $counts.Notify
+    Assert-True -Condition ($logText -like '*webhooks/***')
+    Assert-Equal -Expected $false -Actual $logText.Contains('dispose-id')
+    Assert-Equal -Expected $false -Actual $logText.Contains('dispose-secret-token')
 }
 
 if (-not (Test-Path -LiteralPath $script:AdaptersEngineScriptPath -PathType Leaf)) {

@@ -26,7 +26,7 @@ function Protect-AIFishBotEngineEntryMessage {
     if ($null -ne (Get-Command -Name Protect-AIFishBotSecret -ErrorAction SilentlyContinue)) {
         return Protect-AIFishBotSecret -Text $Message
     }
-    $pattern = '(?<prefix>https:(?:\\/|/){2}(?:(?:canary|ptb)\.)?discord(?:app)?\.com' +
+    $pattern = '(?<prefix>https:(?:\\/|/){2}(?:(?:canary|ptb)\.)?discord(?:app)?\.com(?::[0-9]{1,5})?' +
         '(?:\\/|/)api(?:(?:\\/|/)v[0-9]+)?(?:\\/|/)webhooks(?:\\/|/))' +
         '[A-Za-z0-9_-]+(?:\\/|/)[A-Za-z0-9._-]+(?:\?[^\s<>"'']*)?'
     return [regex]::Replace(
