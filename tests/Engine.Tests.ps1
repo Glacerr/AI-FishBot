@@ -907,6 +907,46 @@ Test-Case 'multiple buff rows keep separate keys and cast durations' {
     }
 }
 
+Test-Case 'stop arriving during one buff is honored before the next row sends a key' {
+    $signal = @{ Stop = $false }
+    $capturedSignal = $signal
+    $onSleep = {
+        param($milliseconds)
+        $capturedSignal.Stop = $true
+    }.GetNewClosure()
+    $adapter = New-SimulatedAdapter -OnSleep $onSleep
+    $reader = {
+        param($state)
+        if ($capturedSignal.Stop) {
+            return [pscustomobject]@{ command = 'stop' }
+        }
+        return $null
+    }.GetNewClosure()
+    $buffs = @(
+        [pscustomobject]@{
+            name = 'first'; enabled = $true; keybind = 'F9'
+            castTimeSeconds = 1; durationMinutes = 10
+        },
+        [pscustomobject]@{
+            name = 'second'; enabled = $true; keybind = 'F10'
+            castTimeSeconds = 2; durationMinutes = 10
+        }
+    )
+    $config = New-EngineConfig -Values @{ buffs = $buffs }
+    $state = $null
+    try {
+        $state = New-EngineTestState -Config $config -Adapter $adapter -ControlReader $reader
+        Assert-Equal -Expected $false -Actual (Invoke-AIFishBotBuffCheck -State $state)
+
+        Assert-Equal -Expected @('key:F9', 'sleep:1000') -Actual @($adapter.Context.Events)
+        Assert-Equal -Expected @('ready', 'casting', 'stopping', 'stopped') `
+            -Actual @($state.StateHistory)
+    }
+    finally {
+        Remove-EngineTestState -State $state
+    }
+}
+
 Test-Case 'duplicate buff keys remain two independent scheduled rows' {
     $adapter = New-SimulatedAdapter
     $buffs = @(
@@ -970,6 +1010,7 @@ Test-Case 'buff duration live update recomputes next due from last application' 
         $state = New-EngineTestState -Config $config -Adapter $adapter
         Invoke-AIFishBotBuffCheck -State $state | Out-Null
         $lastApplied = [double]$state.BuffSchedule[0].LastAppliedMonotonicMilliseconds
+        $originalIdentity = $state.BuffSchedule[0].Identity
         $adapter.Context.MonotonicMilliseconds = $lastApplied + 120000
         $adapter.Context.Now = $adapter.Context.Now.AddMinutes(2)
 
@@ -980,6 +1021,7 @@ Test-Case 'buff duration live update recomputes next due from last application' 
         Invoke-AIFishBotBuffCheck -State $state | Out-Null
 
         Assert-Equal -Expected 2 -Actual (Get-EventCount -Adapter $adapter -Event 'key:F9')
+        Assert-Equal -Expected $originalIdentity -Actual $state.BuffSchedule[0].Identity
         Assert-True -Condition ($state.BuffSchedule[0].LastAppliedMonotonicMilliseconds `
                 -ge ($lastApplied + 120000))
     }
@@ -1019,7 +1061,161 @@ Test-Case 'deleted then re-added buff key is treated as a new row' {
     }
 }
 
-Test-Case 'reordered buff rows reset only through their new row positions' {
+Test-Case 'inserting a legacy buff at the front preserves unchanged row schedules' {
+    $adapter = New-SimulatedAdapter
+    $first = [pscustomobject]@{
+        name = 'first'; enabled = $true; keybind = 'F9'
+        castTimeSeconds = 1; durationMinutes = 10
+    }
+    $second = [pscustomobject]@{
+        name = 'second'; enabled = $true; keybind = 'F10'
+        castTimeSeconds = 1; durationMinutes = 10
+    }
+    $config = New-EngineConfig -Values @{ buffs = @($first, $second) }
+    $state = $null
+    try {
+        $state = New-EngineTestState -Config $config -Adapter $adapter
+        Invoke-AIFishBotBuffCheck -State $state | Out-Null
+        $oldByKey = @{}
+        foreach ($scheduled in $state.BuffSchedule) {
+            $oldByKey[$scheduled.Keybind] = $scheduled.Identity
+        }
+
+        $updated = Copy-EngineConfig -Config $config
+        $inserted = [pscustomobject]@{
+            name = 'inserted'; enabled = $true; keybind = 'F8'
+            castTimeSeconds = 1; durationMinutes = 10
+        }
+        $updated.buffs = @($inserted) + @($updated.buffs)
+        Assert-Equal -Expected $true -Actual (Update-AIFishBotLiveConfig -State $state `
+                -CandidateConfig $updated -ConfigVersion 1)
+        Invoke-AIFishBotBuffCheck -State $state | Out-Null
+
+        Assert-Equal -Expected 1 -Actual (Get-EventCount -Adapter $adapter -Event 'key:F8')
+        Assert-Equal -Expected 1 -Actual (Get-EventCount -Adapter $adapter -Event 'key:F9')
+        Assert-Equal -Expected 1 -Actual (Get-EventCount -Adapter $adapter -Event 'key:F10')
+        Assert-Equal -Expected $oldByKey['F9'] -Actual $state.BuffSchedule[1].Identity
+        Assert-Equal -Expected $oldByKey['F10'] -Actual $state.BuffSchedule[2].Identity
+    }
+    finally {
+        Remove-EngineTestState -State $state
+    }
+}
+
+Test-Case 'deleting a legacy buff preserves every remaining row schedule' {
+    $adapter = New-SimulatedAdapter
+    $buffs = @(
+        [pscustomobject]@{
+            name = 'remove'; enabled = $true; keybind = 'F8'
+            castTimeSeconds = 1; durationMinutes = 10
+        },
+        [pscustomobject]@{
+            name = 'keep-one'; enabled = $true; keybind = 'F9'
+            castTimeSeconds = 1; durationMinutes = 10
+        },
+        [pscustomobject]@{
+            name = 'keep-two'; enabled = $true; keybind = 'F10'
+            castTimeSeconds = 1; durationMinutes = 10
+        }
+    )
+    $config = New-EngineConfig -Values @{ buffs = $buffs }
+    $state = $null
+    try {
+        $state = New-EngineTestState -Config $config -Adapter $adapter
+        Invoke-AIFishBotBuffCheck -State $state | Out-Null
+        $oldByKey = @{}
+        foreach ($scheduled in $state.BuffSchedule) {
+            $oldByKey[$scheduled.Keybind] = $scheduled.Identity
+        }
+
+        $updated = Copy-EngineConfig -Config $config
+        $updated.buffs = @($updated.buffs[1], $updated.buffs[2])
+        Assert-Equal -Expected $true -Actual (Update-AIFishBotLiveConfig -State $state `
+                -CandidateConfig $updated -ConfigVersion 1)
+        Invoke-AIFishBotBuffCheck -State $state | Out-Null
+
+        Assert-Equal -Expected 1 -Actual (Get-EventCount -Adapter $adapter -Event 'key:F9')
+        Assert-Equal -Expected 1 -Actual (Get-EventCount -Adapter $adapter -Event 'key:F10')
+        Assert-Equal -Expected $oldByKey['F9'] -Actual $state.BuffSchedule[0].Identity
+        Assert-Equal -Expected $oldByKey['F10'] -Actual $state.BuffSchedule[1].Identity
+    }
+    finally {
+        Remove-EngineTestState -State $state
+    }
+}
+
+Test-Case 'identical legacy rows match old schedules one-to-one without sharing' {
+    $adapter = New-SimulatedAdapter
+    $duplicate = [pscustomobject]@{
+        name = 'same'; enabled = $true; keybind = 'F9'
+        castTimeSeconds = 1; durationMinutes = 10
+    }
+    $config = New-EngineConfig -Values @{
+        buffs = @((Copy-EngineConfig -Config $duplicate), (Copy-EngineConfig -Config $duplicate))
+    }
+    $state = $null
+    try {
+        $state = New-EngineTestState -Config $config -Adapter $adapter
+        Invoke-AIFishBotBuffCheck -State $state | Out-Null
+        $oldIdentities = @($state.BuffSchedule | ForEach-Object { $_.Identity })
+
+        $updated = Copy-EngineConfig -Config $config
+        $updated.buffs = @($updated.buffs) + @((Copy-EngineConfig -Config $duplicate))
+        Assert-Equal -Expected $true -Actual (Update-AIFishBotLiveConfig -State $state `
+                -CandidateConfig $updated -ConfigVersion 1)
+        Invoke-AIFishBotBuffCheck -State $state | Out-Null
+
+        Assert-Equal -Expected 3 -Actual (Get-EventCount -Adapter $adapter -Event 'key:F9')
+        $newIdentities = @($state.BuffSchedule | ForEach-Object { $_.Identity })
+        Assert-Equal -Expected 3 -Actual @($newIdentities | Select-Object -Unique).Count
+        foreach ($oldIdentity in $oldIdentities) {
+            Assert-Equal -Expected 1 -Actual @(
+                $newIdentities | Where-Object { $_ -eq $oldIdentity }
+            ).Count
+        }
+    }
+    finally {
+        Remove-EngineTestState -State $state
+    }
+}
+
+Test-Case 'stable buff ids preserve schedules across reorder before legacy matching' {
+    $adapter = New-SimulatedAdapter
+    $first = [pscustomobject]@{
+        id = 'buff-a'; name = 'same'; enabled = $true; keybind = 'F9'
+        castTimeSeconds = 1; durationMinutes = 10
+    }
+    $second = [pscustomobject]@{
+        id = 'buff-b'; name = 'same'; enabled = $true; keybind = 'F10'
+        castTimeSeconds = 1; durationMinutes = 10
+    }
+    $config = New-EngineConfig -Values @{ buffs = @($first, $second) }
+    $state = $null
+    try {
+        $state = New-EngineTestState -Config $config -Adapter $adapter
+        Invoke-AIFishBotBuffCheck -State $state | Out-Null
+        $oldByStableId = @{
+            'buff-a' = $state.BuffSchedule[0].Identity
+            'buff-b' = $state.BuffSchedule[1].Identity
+        }
+
+        $updated = Copy-EngineConfig -Config $config
+        $updated.buffs = @($updated.buffs[1], $updated.buffs[0])
+        Assert-Equal -Expected $true -Actual (Update-AIFishBotLiveConfig -State $state `
+                -CandidateConfig $updated -ConfigVersion 1)
+        Invoke-AIFishBotBuffCheck -State $state | Out-Null
+
+        Assert-Equal -Expected 1 -Actual (Get-EventCount -Adapter $adapter -Event 'key:F9')
+        Assert-Equal -Expected 1 -Actual (Get-EventCount -Adapter $adapter -Event 'key:F10')
+        Assert-Equal -Expected $oldByStableId['buff-b'] -Actual $state.BuffSchedule[0].Identity
+        Assert-Equal -Expected $oldByStableId['buff-a'] -Actual $state.BuffSchedule[1].Identity
+    }
+    finally {
+        Remove-EngineTestState -State $state
+    }
+}
+
+Test-Case 'reordered legacy buff rows preserve their schedules without replay' {
     $adapter = New-SimulatedAdapter
     $first = [pscustomobject]@{
         enabled = $true; keybind = 'F9'; castTimeSeconds = 1; durationMinutes = 10
@@ -1032,7 +1228,10 @@ Test-Case 'reordered buff rows reset only through their new row positions' {
     try {
         $state = New-EngineTestState -Config $config -Adapter $adapter
         Invoke-AIFishBotBuffCheck -State $state | Out-Null
-        $oldIdentities = @($state.BuffSchedule | ForEach-Object { $_.Identity })
+        $identityByKey = @{}
+        foreach ($scheduled in $state.BuffSchedule) {
+            $identityByKey[$scheduled.Keybind] = $scheduled.Identity
+        }
 
         $updated = Copy-EngineConfig -Config $config
         $updated.buffs = @($updated.buffs[1], $updated.buffs[0])
@@ -1040,10 +1239,10 @@ Test-Case 'reordered buff rows reset only through their new row positions' {
                 -CandidateConfig $updated -ConfigVersion 1)
         Invoke-AIFishBotBuffCheck -State $state | Out-Null
 
-        Assert-Equal -Expected 2 -Actual (Get-EventCount -Adapter $adapter -Event 'key:F9')
-        Assert-Equal -Expected 2 -Actual (Get-EventCount -Adapter $adapter -Event 'key:F10')
-        Assert-True -Condition ($state.BuffSchedule[0].Identity -notin $oldIdentities)
-        Assert-True -Condition ($state.BuffSchedule[1].Identity -notin $oldIdentities)
+        Assert-Equal -Expected 1 -Actual (Get-EventCount -Adapter $adapter -Event 'key:F9')
+        Assert-Equal -Expected 1 -Actual (Get-EventCount -Adapter $adapter -Event 'key:F10')
+        Assert-Equal -Expected $identityByKey['F10'] -Actual $state.BuffSchedule[0].Identity
+        Assert-Equal -Expected $identityByKey['F9'] -Actual $state.BuffSchedule[1].Identity
     }
     finally {
         Remove-EngineTestState -State $state

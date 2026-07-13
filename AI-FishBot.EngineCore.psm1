@@ -852,10 +852,29 @@ function Get-AIFishBotBuffRowSignature {
         [object]$Buff
     )
 
+    $nameFound = $false
+    $name = Get-AIFishBotEngineProperty -InputObject $Buff -Name 'name' -Found ([ref]$nameFound)
+    if (-not $nameFound -or $null -eq $name) {
+        $name = ''
+    }
     $castTimeText = [convert]::ToString(
         [double]$Buff.castTimeSeconds,
         [System.Globalization.CultureInfo]::InvariantCulture)
-    return '{0}|{1}|{2}' -f ([bool]$Buff.enabled), ([string]$Buff.keybind), $castTimeText
+    return '{0}|{1}|{2}' -f ([string]$name), ([string]$Buff.keybind), $castTimeText
+}
+
+function Get-AIFishBotBuffStableId {
+    param(
+        [Parameter(Mandatory = $true)]
+        [object]$Buff
+    )
+
+    $found = $false
+    $value = Get-AIFishBotEngineProperty -InputObject $Buff -Name 'id' -Found ([ref]$found)
+    if (-not $found -or [string]::IsNullOrWhiteSpace([string]$value)) {
+        return $null
+    }
+    return ([string]$value).Trim()
 }
 
 function Update-AIFishBotBuffSchedule {
@@ -871,22 +890,40 @@ function Update-AIFishBotBuffSchedule {
 
     $previousSchedule = @($State.BuffSchedule)
     $updatedSchedule = New-Object 'System.Collections.Generic.List[object]'
+    $usedIdentities = @{}
     $monotonicNow = Get-AIFishBotEngineMonotonicMilliseconds -State $State
     $wallNow = Get-AIFishBotEngineNow -State $State
     for ($index = 0; $index -lt $Buffs.Count; $index += 1) {
         $buff = $Buffs[$index]
         $signature = Get-AIFishBotBuffRowSignature -Buff $buff
+        $stableId = Get-AIFishBotBuffStableId -Buff $buff
         $scheduled = $null
-        if ($index -lt $previousSchedule.Count -and
-            $previousSchedule[$index].Signature -eq $signature) {
-            $scheduled = $previousSchedule[$index]
+        foreach ($candidate in $previousSchedule) {
+            if ($usedIdentities.ContainsKey([string]$candidate.Identity)) {
+                continue
+            }
+            $candidateStableId = [string]$candidate.StableId
+            if ($null -ne $stableId) {
+                if ($candidateStableId -eq $stableId) {
+                    $scheduled = $candidate
+                    break
+                }
+                continue
+            }
+            if ([string]::IsNullOrWhiteSpace($candidateStableId) -and
+                $candidate.Signature -eq $signature) {
+                $scheduled = $candidate
+                break
+            }
         }
         if ($null -eq $scheduled) {
             $State.BuffIdentityCounter += 1
             $scheduled = [pscustomobject][ordered]@{
                 Identity = 'buff-{0}' -f $State.BuffIdentityCounter
                 Index = $index
+                StableId = $stableId
                 Signature = $signature
+                Name = if ($null -eq $buff.PSObject.Properties['name']) { '' } else { [string]$buff.name }
                 Enabled = [bool]$buff.enabled
                 Keybind = [string]$buff.keybind
                 CastTimeSeconds = [double]$buff.castTimeSeconds
@@ -899,6 +936,12 @@ function Update-AIFishBotBuffSchedule {
         }
         else {
             $scheduled.Index = $index
+            $scheduled.StableId = $stableId
+            $scheduled.Signature = $signature
+            $scheduled.Name = if ($null -eq $buff.PSObject.Properties['name']) { '' } else { [string]$buff.name }
+            $scheduled.Enabled = [bool]$buff.enabled
+            $scheduled.Keybind = [string]$buff.keybind
+            $scheduled.CastTimeSeconds = [double]$buff.castTimeSeconds
             $scheduled.DurationMinutes = [double]$buff.durationMinutes
             if ($null -ne $scheduled.LastAppliedMonotonicMilliseconds) {
                 $scheduled.NextDueMonotonicMilliseconds =
@@ -908,6 +951,7 @@ function Update-AIFishBotBuffSchedule {
                     [double]$scheduled.DurationMinutes)
             }
         }
+        $usedIdentities[[string]$scheduled.Identity] = $true
         [void]$updatedSchedule.Add($scheduled)
     }
     $State.BuffSchedule = $updatedSchedule.ToArray()
@@ -974,6 +1018,10 @@ function Invoke-AIFishBotBuffCheck {
         $scheduled.NextDue = ([datetimeoffset]$scheduled.LastAppliedAt).AddMinutes(
             [double]$scheduled.DurationMinutes)
         $castAny = $true
+        Update-AIFishBotBuffExpirationView -State $State
+        if (-not (Test-AIFishBotEngineCheckpoint -State $State)) {
+            return $false
+        }
     }
     Update-AIFishBotBuffExpirationView -State $State
     if ($castAny -and -not $State.StopRequested) {
