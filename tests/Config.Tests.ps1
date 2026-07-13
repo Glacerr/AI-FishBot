@@ -357,3 +357,456 @@ Test-Case 'an empty configuration returns keyed errors without throwing' {
 
     Assert-ConfigError -Result $result -Field 'config'
 }
+
+function Write-TestTextFile {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Content
+    )
+
+    [System.IO.File]::WriteAllText($Path, $Content, (New-Object System.Text.UTF8Encoding($false)))
+}
+
+function Remove-TestDirectory {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path
+    )
+
+    if (Test-Path -LiteralPath $Path) {
+        Remove-Item -LiteralPath $Path -Recurse -Force
+    }
+}
+
+Test-Case 'legacy import maps every supported setting and numbered buffs' {
+    $directory = New-TestDirectory
+    try {
+        $legacyPath = Join-Path -Path $directory -ChildPath 'legacy.ps1'
+        Write-TestTextFile -Path $legacyPath -Content @'
+$retail = $True
+$autoStop = $False
+$autoStopTime = 75
+$autoLogout = $True
+$audioSensitivity = 7
+$UseWindowFocus = $False
+$fishingRetries = 21
+$usePi = $True
+$picoComPort = "COM9"
+$useWeakAura = $True
+$cast = "F5"
+$bobber = "F11"
+$logout = "F12"
+$enableNotifications = $True
+$discordWebhook = "https://example.invalid/hook"
+$onStart = $False
+$onStop = $True
+$enableBuffs = (1..2)
+$buffKeybind1 = "F9"
+$buffCastTime1 = 2
+$buffDuration1 = 10
+$buffKeybind2 = "F10"
+$buffCastTime2 = 3
+$buffDuration2 = 20
+'@
+
+        $config = Import-AIFishBotLegacyConfig -ScriptPath $legacyPath -ProfileName ' 时光服 '
+        $defaults = New-AIFishBotDefaultConfig
+
+        Assert-Equal -Expected '时光服' -Actual $config.profileName
+        Assert-Equal -Expected $true -Actual $config.retail
+        Assert-Equal -Expected $false -Actual $config.autoStop
+        Assert-Equal -Expected 75 -Actual $config.autoStopTime
+        Assert-Equal -Expected $true -Actual $config.autoLogout
+        Assert-Equal -Expected 7 -Actual $config.audioSensitivity
+        Assert-Equal -Expected $false -Actual $config.useWindowFocus
+        Assert-Equal -Expected 21 -Actual $config.fishingRetries
+        Assert-Equal -Expected $true -Actual $config.usePi
+        Assert-Equal -Expected 'COM9' -Actual $config.picoComPort
+        Assert-Equal -Expected $true -Actual $config.useWeakAura
+        Assert-Equal -Expected 'F5' -Actual $config.castKey
+        Assert-Equal -Expected 'F11' -Actual $config.bobberKey
+        Assert-Equal -Expected 'F12' -Actual $config.logoutKey
+        Assert-Equal -Expected $true -Actual $config.enableNotifications
+        Assert-Equal -Expected 'https://example.invalid/hook' -Actual $config.discordWebhook
+        Assert-Equal -Expected $false -Actual $config.notifyOnStart
+        Assert-Equal -Expected $true -Actual $config.notifyOnStop
+        foreach ($delayName in @(
+                'biteResponseMinSeconds', 'biteResponseMaxSeconds',
+                'preHookMinSeconds', 'preHookMaxSeconds',
+                'postHookMinSeconds', 'postHookMaxSeconds',
+                'preCastMinSeconds', 'preCastMaxSeconds'
+            )) {
+            Assert-Equal -Expected $defaults.$delayName -Actual $config.$delayName
+        }
+
+        Assert-Equal -Expected 2 -Actual @($config.buffs).Count
+        Assert-Equal -Expected $true -Actual $config.buffs[0].enabled
+        Assert-Equal -Expected '增益 1' -Actual $config.buffs[0].name
+        Assert-Equal -Expected 'F9' -Actual $config.buffs[0].keybind
+        Assert-Equal -Expected 2 -Actual $config.buffs[0].castTimeSeconds
+        Assert-Equal -Expected 10 -Actual $config.buffs[0].durationMinutes
+        Assert-Equal -Expected $true -Actual $config.buffs[1].enabled
+        Assert-Equal -Expected '增益 2' -Actual $config.buffs[1].name
+        Assert-Equal -Expected 'F10' -Actual $config.buffs[1].keybind
+        Assert-Equal -Expected 3 -Actual $config.buffs[1].castTimeSeconds
+        Assert-Equal -Expected 20 -Actual $config.buffs[1].durationMinutes
+    }
+    finally {
+        Remove-TestDirectory -Path $directory
+    }
+}
+
+Test-Case 'legacy import never executes script commands' {
+    $directory = New-TestDirectory
+    try {
+        $legacyPath = Join-Path -Path $directory -ChildPath 'malicious.ps1'
+        $markerPath = Join-Path -Path $directory -ChildPath 'executed.txt'
+        $escapedMarkerPath = $markerPath.Replace("'", "''")
+        Write-TestTextFile -Path $legacyPath -Content @"
+`$retail = `$False
+throw 'legacy script must not run'
+Set-Content -LiteralPath '$escapedMarkerPath' -Value 'executed'
+`$cast = (Get-Process | Select-Object -First 1)
+"@
+
+        $config = Import-AIFishBotLegacyConfig -ScriptPath $legacyPath -ProfileName '安全导入'
+
+        Assert-Equal -Expected $false -Actual $config.retail
+        Assert-Equal -Expected 'F6' -Actual $config.castKey
+        Assert-True -Condition (-not (Test-Path -LiteralPath $markerPath))
+    }
+    finally {
+        Remove-TestDirectory -Path $directory
+    }
+}
+
+Test-Case 'legacy zero buff marker creates no buff zero and disables configured buffs' {
+    $directory = New-TestDirectory
+    try {
+        $legacyPath = Join-Path -Path $directory -ChildPath 'legacy.ps1'
+        Write-TestTextFile -Path $legacyPath -Content @'
+$enableBuffs = (0)
+$buffKeybind1 = "F9"
+$buffCastTime1 = 2
+$buffDuration1 = 10
+$buffKeybind2 = "F10"
+$buffCastTime2 = 3
+$buffDuration2 = 20
+$buffKeybind0 = "F8"
+$buffCastTime0 = 1
+$buffDuration0 = 1
+'@
+
+        $config = Import-AIFishBotLegacyConfig -ScriptPath $legacyPath -ProfileName '无增益'
+
+        Assert-Equal -Expected 2 -Actual @($config.buffs).Count
+        Assert-Equal -Expected $false -Actual $config.buffs[0].enabled
+        Assert-Equal -Expected $false -Actual $config.buffs[1].enabled
+        Assert-True -Condition (@($config.buffs | Where-Object { $_.name -eq '增益 0' }).Count -eq 0)
+    }
+    finally {
+        Remove-TestDirectory -Path $directory
+    }
+}
+
+Test-Case 'legacy import accepts only zero or one-through-N buff syntax' {
+    $directory = New-TestDirectory
+    try {
+        $legacyPath = Join-Path -Path $directory -ChildPath 'legacy.ps1'
+        Write-TestTextFile -Path $legacyPath -Content @'
+$enableBuffs = (2)
+$buffKeybind2 = "F10"
+$buffCastTime2 = 3
+$buffDuration2 = 20
+'@
+
+        $config = Import-AIFishBotLegacyConfig -ScriptPath $legacyPath -ProfileName '严格格式'
+
+        Assert-Equal -Expected 1 -Actual @($config.buffs).Count
+        Assert-Equal -Expected $false -Actual $config.buffs[0].enabled
+    }
+    finally {
+        Remove-TestDirectory -Path $directory
+    }
+}
+
+Test-Case 'legacy import ignores oversized buff numbers without failing' {
+    $directory = New-TestDirectory
+    try {
+        $legacyPath = Join-Path -Path $directory -ChildPath 'legacy.ps1'
+        Write-TestTextFile -Path $legacyPath -Content @'
+$enableBuffs = (1..1)
+$buffKeybind1 = "F9"
+$buffCastTime1 = 2
+$buffDuration1 = 10
+$buffKeybind999999999999999999999999 = "F10"
+$buffCastTime999999999999999999999999 = 3
+$buffDuration999999999999999999999999 = 20
+'@
+
+        $config = Import-AIFishBotLegacyConfig -ScriptPath $legacyPath -ProfileName '超大编号'
+
+        Assert-Equal -Expected 1 -Actual @($config.buffs).Count
+        Assert-Equal -Expected '增益 1' -Actual $config.buffs[0].name
+    }
+    finally {
+        Remove-TestDirectory -Path $directory
+    }
+}
+
+Test-Case 'profiles save and read UTF-8 JSON without losing nested values' {
+    $directory = New-TestDirectory
+    try {
+        $config = New-AIFishBotDefaultConfig
+        $config.profileName = ' 钓鱼方案 '
+        $config.discordWebhook = '中文通知'
+        $config.buffs = @(New-TestBuff -Name '烹饪帽')
+
+        $saved = Save-AIFishBotProfile -ProfilesDirectory $directory -Config $config
+        $loaded = Read-AIFishBotProfile -ProfilesDirectory $directory -ProfileName '钓鱼方案'
+
+        Assert-Equal -Expected '钓鱼方案' -Actual $saved.profileName
+        Assert-Equal -Expected '钓鱼方案' -Actual $loaded.profileName
+        Assert-Equal -Expected '中文通知' -Actual $loaded.discordWebhook
+        Assert-Equal -Expected '烹饪帽' -Actual $loaded.buffs[0].name
+        Assert-True -Condition (Test-Path -LiteralPath (Get-AIFishBotProfilePath -ProfilesDirectory $directory -ProfileName '钓鱼方案'))
+    }
+    finally {
+        Remove-TestDirectory -Path $directory
+    }
+}
+
+Test-Case 'profile listing is sorted and excludes backup files' {
+    $directory = New-TestDirectory
+    try {
+        foreach ($name in @('乙', '甲')) {
+            $config = New-AIFishBotDefaultConfig
+            $config.profileName = $name
+            Save-AIFishBotProfile -ProfilesDirectory $directory -Config $config | Out-Null
+        }
+        Write-TestTextFile -Path (Join-Path $directory '忽略.json.backup') -Content '{}'
+
+        Assert-Equal -Expected @('甲', '乙') -Actual @(Get-AIFishBotProfiles -ProfilesDirectory $directory)
+    }
+    finally {
+        Remove-TestDirectory -Path $directory
+    }
+}
+
+Test-Case 'profiles can be copied renamed and deleted' {
+    $directory = New-TestDirectory
+    try {
+        $config = New-AIFishBotDefaultConfig
+        $config.profileName = '原方案'
+        Save-AIFishBotProfile -ProfilesDirectory $directory -Config $config | Out-Null
+
+        $copy = Copy-AIFishBotProfile -ProfilesDirectory $directory -SourceProfileName '原方案' -DestinationProfileName '副本'
+        Assert-Equal -Expected '副本' -Actual $copy.profileName
+
+        $renamed = Rename-AIFishBotProfile -ProfilesDirectory $directory -ProfileName '副本' -NewProfileName '新名称'
+        Assert-Equal -Expected '新名称' -Actual $renamed.profileName
+        Assert-True -Condition (-not (Test-Path -LiteralPath (Get-AIFishBotProfilePath -ProfilesDirectory $directory -ProfileName '副本')))
+
+        Remove-AIFishBotProfile -ProfilesDirectory $directory -ProfileName '新名称'
+        Assert-Equal -Expected @('原方案') -Actual @(Get-AIFishBotProfiles -ProfilesDirectory $directory)
+    }
+    finally {
+        Remove-TestDirectory -Path $directory
+    }
+}
+
+Test-Case 'copy and rename reject an existing destination' {
+    $directory = New-TestDirectory
+    try {
+        foreach ($name in @('方案一', '方案二')) {
+            $config = New-AIFishBotDefaultConfig
+            $config.profileName = $name
+            Save-AIFishBotProfile -ProfilesDirectory $directory -Config $config | Out-Null
+        }
+
+        Assert-Throws -ScriptBlock { Copy-AIFishBotProfile -ProfilesDirectory $directory -SourceProfileName '方案一' -DestinationProfileName '方案二' } -MessageLike '*已存在*'
+        Assert-Throws -ScriptBlock { Rename-AIFishBotProfile -ProfilesDirectory $directory -ProfileName '方案一' -NewProfileName '方案二' } -MessageLike '*已存在*'
+        $profiles = @(Get-AIFishBotProfiles -ProfilesDirectory $directory)
+        Assert-Equal -Expected 2 -Actual $profiles.Count
+        Assert-True -Condition ($profiles -contains '方案一')
+        Assert-True -Condition ($profiles -contains '方案二')
+    }
+    finally {
+        Remove-TestDirectory -Path $directory
+    }
+}
+
+Test-Case 'profile names reject blanks traversal separators and invalid Windows characters' {
+    $directory = New-TestDirectory
+    try {
+        foreach ($name in @('   ', '.', '..', '..\逃逸', '../逃逸', '坏:名字', '坏|名字', 'CON', 'COM¹', 'LPT²', '结尾.')) {
+            Assert-Throws -ScriptBlock { Get-AIFishBotProfilePath -ProfilesDirectory $directory -ProfileName $name } -MessageLike '*方案名称*'
+        }
+
+        $outsidePath = Join-Path -Path (Split-Path -Path $directory -Parent) -ChildPath '逃逸.json'
+        Assert-True -Condition (-not (Test-Path -LiteralPath $outsidePath))
+    }
+    finally {
+        Remove-TestDirectory -Path $directory
+    }
+}
+
+Test-Case 'corrupt JSON is restored from a valid backup' {
+    $directory = New-TestDirectory
+    try {
+        $config = New-AIFishBotDefaultConfig
+        $config.profileName = '可恢复'
+        $config.autoStopTime = 10
+        Save-AIFishBotProfile -ProfilesDirectory $directory -Config $config | Out-Null
+        $config.autoStopTime = 20
+        Save-AIFishBotProfile -ProfilesDirectory $directory -Config $config | Out-Null
+
+        $profilePath = Get-AIFishBotProfilePath -ProfilesDirectory $directory -ProfileName '可恢复'
+        Write-TestTextFile -Path $profilePath -Content '{ broken json'
+
+        $restored = Read-AIFishBotProfile -ProfilesDirectory $directory -ProfileName '可恢复'
+        $readAgain = Read-AIFishBotProfile -ProfilesDirectory $directory -ProfileName '可恢复'
+
+        Assert-Equal -Expected 10 -Actual $restored.autoStopTime
+        Assert-Equal -Expected 10 -Actual $readAgain.autoStopTime
+    }
+    finally {
+        Remove-TestDirectory -Path $directory
+    }
+}
+
+Test-Case 'corrupt JSON without a valid backup reports clearly and preserves the file' {
+    $directory = New-TestDirectory
+    try {
+        $profilePath = Get-AIFishBotProfilePath -ProfilesDirectory $directory -ProfileName '损坏方案'
+        Write-TestTextFile -Path $profilePath -Content '{ broken json'
+        Write-TestTextFile -Path ($profilePath + '.backup') -Content '{ also broken'
+
+        Assert-Throws -ScriptBlock { Read-AIFishBotProfile -ProfilesDirectory $directory -ProfileName '损坏方案' } -MessageLike '*损坏*'
+        Assert-Equal -Expected '{ broken json' -Actual ([System.IO.File]::ReadAllText($profilePath))
+    }
+    finally {
+        Remove-TestDirectory -Path $directory
+    }
+}
+
+Test-Case 'a new profile discards a stale backup with the same name' {
+    $directory = New-TestDirectory
+    try {
+        $config = New-AIFishBotDefaultConfig
+        $config.profileName = '重建方案'
+        $config.autoStopTime = 10
+        Save-AIFishBotProfile -ProfilesDirectory $directory -Config $config | Out-Null
+        $profilePath = Get-AIFishBotProfilePath -ProfilesDirectory $directory -ProfileName '重建方案'
+        [System.IO.File]::Copy($profilePath, ($profilePath + '.backup'), $true)
+        Remove-Item -LiteralPath $profilePath -Force
+
+        $config.autoStopTime = 20
+        Save-AIFishBotProfile -ProfilesDirectory $directory -Config $config | Out-Null
+
+        Assert-True -Condition (-not (Test-Path -LiteralPath ($profilePath + '.backup')))
+        Write-TestTextFile -Path $profilePath -Content '{ broken json'
+        Assert-Throws -ScriptBlock { Read-AIFishBotProfile -ProfilesDirectory $directory -ProfileName '重建方案' } -MessageLike '*损坏*'
+        Assert-Equal -Expected '{ broken json' -Actual ([System.IO.File]::ReadAllText($profilePath))
+    }
+    finally {
+        Remove-TestDirectory -Path $directory
+    }
+}
+
+Test-Case 'a temporary read failure never restores an older backup' {
+    $directory = New-TestDirectory
+    $lock = $null
+    try {
+        $config = New-AIFishBotDefaultConfig
+        $config.profileName = '读取占用'
+        $config.autoStopTime = 10
+        Save-AIFishBotProfile -ProfilesDirectory $directory -Config $config | Out-Null
+        $config.autoStopTime = 20
+        Save-AIFishBotProfile -ProfilesDirectory $directory -Config $config | Out-Null
+        $profilePath = Get-AIFishBotProfilePath -ProfilesDirectory $directory -ProfileName '读取占用'
+
+        $lock = [System.IO.File]::Open(
+            $profilePath,
+            [System.IO.FileMode]::Open,
+            [System.IO.FileAccess]::Write,
+            [System.IO.FileShare]::Delete)
+        Assert-Throws -ScriptBlock { Read-AIFishBotProfile -ProfilesDirectory $directory -ProfileName '读取占用' }
+        $lock.Dispose()
+        $lock = $null
+
+        Assert-Equal -Expected 20 -Actual (Read-AIFishBotProfile -ProfilesDirectory $directory -ProfileName '读取占用').autoStopTime
+    }
+    finally {
+        if ($null -ne $lock) {
+            $lock.Dispose()
+        }
+        Remove-TestDirectory -Path $directory
+    }
+}
+
+Test-Case 'failed atomic replacement preserves the previous profile and cleans temporary files' {
+    $directory = New-TestDirectory
+    $lock = $null
+    try {
+        $config = New-AIFishBotDefaultConfig
+        $config.profileName = '原子保存'
+        $config.autoStopTime = 10
+        Save-AIFishBotProfile -ProfilesDirectory $directory -Config $config | Out-Null
+        $profilePath = Get-AIFishBotProfilePath -ProfilesDirectory $directory -ProfileName '原子保存'
+
+        $lock = [System.IO.File]::Open($profilePath, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::None)
+        $config.autoStopTime = 99
+        Assert-Throws -ScriptBlock { Save-AIFishBotProfile -ProfilesDirectory $directory -Config $config }
+        $lock.Dispose()
+        $lock = $null
+
+        Assert-Equal -Expected 10 -Actual (Read-AIFishBotProfile -ProfilesDirectory $directory -ProfileName '原子保存').autoStopTime
+        Assert-Equal -Expected 0 -Actual @(Get-ChildItem -LiteralPath $directory -Filter '*.tmp' -File).Count
+    }
+    finally {
+        if ($null -ne $lock) {
+            $lock.Dispose()
+        }
+        Remove-TestDirectory -Path $directory
+    }
+}
+
+Test-Case 'initialization imports legacy settings only when no profile exists' {
+    $directory = New-TestDirectory
+    try {
+        $profilesDirectory = Join-Path -Path $directory -ChildPath 'profiles'
+        $legacyPath = Join-Path -Path $directory -ChildPath 'legacy.ps1'
+        Write-TestTextFile -Path $legacyPath -Content '$autoStopTime = 42'
+
+        $first = @(Initialize-AIFishBotProfiles -ProfilesDirectory $profilesDirectory -LegacyScriptPath $legacyPath -InitialProfileName '时光服')
+        Write-TestTextFile -Path $legacyPath -Content '$autoStopTime = 99'
+        $second = @(Initialize-AIFishBotProfiles -ProfilesDirectory $profilesDirectory -LegacyScriptPath $legacyPath -InitialProfileName '时光服')
+
+        Assert-Equal -Expected @('时光服') -Actual $first
+        Assert-Equal -Expected @('时光服') -Actual $second
+        Assert-Equal -Expected 42 -Actual (Read-AIFishBotProfile -ProfilesDirectory $profilesDirectory -ProfileName '时光服').autoStopTime
+    }
+    finally {
+        Remove-TestDirectory -Path $directory
+    }
+}
+
+Test-Case 'all profile management commands are exported' {
+    foreach ($commandName in @(
+            'Get-AIFishBotProfilePath',
+            'Get-AIFishBotProfiles',
+            'Read-AIFishBotProfile',
+            'Save-AIFishBotProfile',
+            'Copy-AIFishBotProfile',
+            'Rename-AIFishBotProfile',
+            'Remove-AIFishBotProfile',
+            'Initialize-AIFishBotProfiles',
+            'Import-AIFishBotLegacyConfig'
+        )) {
+        Assert-True -Condition ($null -ne (Get-Command -Name $commandName -ErrorAction SilentlyContinue))
+    }
+}
