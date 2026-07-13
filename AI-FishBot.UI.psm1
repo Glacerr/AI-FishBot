@@ -248,7 +248,7 @@ function New-AIFishBotMainView {
     $footerButtonHost = New-Object System.Windows.Forms.FlowLayoutPanel
     $footerButtonHost.Dock = [System.Windows.Forms.DockStyle]::Right
     $footerButtonHost.Width = 226
-    $footerButtonHost.Padding = New-Object System.Windows.Forms.Padding(8, 8, 0, 0)
+    $footerButtonHost.Padding = New-Object System.Windows.Forms.Padding(8, 2, 0, 0)
     $footerButtonHost.FlowDirection = [System.Windows.Forms.FlowDirection]::LeftToRight
     $footerButtonHost.WrapContents = $false
     $footerButtonHost.BackColor = $script:AIFishBotColors.Card

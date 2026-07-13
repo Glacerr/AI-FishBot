@@ -123,6 +123,41 @@ function Test-ControlDescendsFrom {
     return $false
 }
 
+function Assert-TestControlTreeInsideParent {
+    param(
+        [Parameter(Mandatory = $true)]
+        [System.Windows.Forms.Control]$Parent,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Path
+    )
+
+    foreach ($child in $Parent.Controls) {
+        if ($Parent -is [System.Windows.Forms.TabControl] -and
+            -not [object]::ReferenceEquals($child, $Parent.SelectedTab)) {
+            continue
+        }
+
+        $childName = if (-not [string]::IsNullOrWhiteSpace($child.Name)) {
+            $child.Name
+        }
+        elseif (-not [string]::IsNullOrWhiteSpace($child.Text)) {
+            '{0}[{1}]' -f $child.GetType().Name, $child.Text
+        }
+        else {
+            $child.GetType().Name
+        }
+        $bounds = $child.Bounds
+        $parentClient = $Parent.ClientRectangle
+        if ($bounds.Left -lt $parentClient.Left -or $bounds.Top -lt $parentClient.Top -or
+            $bounds.Right -gt $parentClient.Right -or $bounds.Bottom -gt $parentClient.Bottom) {
+            throw "Control '$Path/$childName' exceeds its parent: $bounds vs $parentClient."
+        }
+
+        Assert-TestControlTreeInsideParent -Parent $child -Path "$Path/$childName"
+    }
+}
+
 Test-Case 'UI module imports without creating a window or starting external work' {
     Assert-True -Condition (Test-Path -LiteralPath $script:UIModulePath -PathType Leaf)
     $openFormsBefore = @([System.Windows.Forms.Application]::OpenForms).Count
@@ -255,6 +290,43 @@ Test-Case 'every controller control remains inside the laid out client area' {
     Assert-True -Condition ($webhookBounds.Right -le $showBounds.Left)
 
     Assert-Equal -Expected $false -Actual $form.Visible
+}
+
+Test-Case 'every visible control fits its direct parent at initial and minimum size' {
+    foreach ($size in @(
+            (New-Object System.Drawing.Size(760, 620)),
+            (New-Object System.Drawing.Size(720, 580))
+        )) {
+        $view = New-AIFishBotMainView
+        try {
+            $form = $view.Form
+            $form.Size = $size
+            $null = $form.Handle
+            $tabs = $view.Controls.TabControl
+            $null = $tabs.Handle
+
+            foreach ($page in $tabs.TabPages) {
+                $tabs.SelectedTab = $page
+                $null = $page.Handle
+                Invoke-TestLayoutTree -Control $form
+                Assert-TestControlTreeInsideParent -Parent $form -Path ('Form[{0}x{1}]' -f $size.Width, $size.Height)
+            }
+
+            foreach ($name in @('SaveButton', 'StartStopButton')) {
+                $button = $view.Controls[$name]
+                $parentClient = $button.Parent.ClientRectangle
+                Assert-True -Condition (
+                    $button.Bounds.Left -ge $parentClient.Left -and
+                    $button.Bounds.Top -ge $parentClient.Top -and
+                    $button.Bounds.Right -le $parentClient.Right -and
+                    $button.Bounds.Bottom -le $parentClient.Bottom)
+            }
+            Assert-Equal -Expected $false -Actual $form.Visible
+        }
+        finally {
+            $view.Dispose()
+        }
+    }
 }
 
 Test-Case 'all four timing ranges use tenths of a second with bounded values' {
