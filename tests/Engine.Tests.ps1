@@ -1030,6 +1030,75 @@ Test-Case 'buff duration live update recomputes next due from last application' 
     }
 }
 
+Test-Case 'legacy buff name live update preserves its schedule without replay' {
+    $adapter = New-SimulatedAdapter
+    $buff = [pscustomobject]@{
+        name = 'old name'; enabled = $true; keybind = 'F9'
+        castTimeSeconds = 1; durationMinutes = 10
+    }
+    $config = New-EngineConfig -Values @{ buffs = @($buff) }
+    $state = $null
+    try {
+        $state = New-EngineTestState -Config $config -Adapter $adapter
+        Invoke-AIFishBotBuffCheck -State $state | Out-Null
+        $originalIdentity = $state.BuffSchedule[0].Identity
+        $originalLastApplied = $state.BuffSchedule[0].LastAppliedMonotonicMilliseconds
+        $originalNextDue = $state.BuffSchedule[0].NextDueMonotonicMilliseconds
+
+        $updated = Copy-EngineConfig -Config $config
+        $updated.buffs[0].name = 'new name'
+        Assert-Equal -Expected $true -Actual (Update-AIFishBotLiveConfig -State $state `
+                -CandidateConfig $updated -ConfigVersion 1)
+        Invoke-AIFishBotBuffCheck -State $state | Out-Null
+
+        Assert-Equal -Expected 1 -Actual (Get-EventCount -Adapter $adapter -Event 'key:F9')
+        Assert-Equal -Expected $originalIdentity -Actual $state.BuffSchedule[0].Identity
+        Assert-Equal -Expected $originalLastApplied `
+            -Actual $state.BuffSchedule[0].LastAppliedMonotonicMilliseconds
+        Assert-Equal -Expected $originalNextDue `
+            -Actual $state.BuffSchedule[0].NextDueMonotonicMilliseconds
+        Assert-Equal -Expected 'new name' -Actual $state.BuffSchedule[0].Name
+    }
+    finally {
+        Remove-EngineTestState -State $state
+    }
+}
+
+Test-Case 'legacy buff cast time live update preserves its schedule without replay' {
+    $adapter = New-SimulatedAdapter
+    $buff = [pscustomobject]@{
+        name = 'buff'; enabled = $true; keybind = 'F9'
+        castTimeSeconds = 1; durationMinutes = 10
+    }
+    $config = New-EngineConfig -Values @{ buffs = @($buff) }
+    $state = $null
+    try {
+        $state = New-EngineTestState -Config $config -Adapter $adapter
+        Invoke-AIFishBotBuffCheck -State $state | Out-Null
+        $originalIdentity = $state.BuffSchedule[0].Identity
+        $originalLastApplied = $state.BuffSchedule[0].LastAppliedMonotonicMilliseconds
+        $originalNextDue = $state.BuffSchedule[0].NextDueMonotonicMilliseconds
+
+        $updated = Copy-EngineConfig -Config $config
+        $updated.buffs[0].castTimeSeconds = 3
+        Assert-Equal -Expected $true -Actual (Update-AIFishBotLiveConfig -State $state `
+                -CandidateConfig $updated -ConfigVersion 1)
+        Invoke-AIFishBotBuffCheck -State $state | Out-Null
+
+        Assert-Equal -Expected 1 -Actual (Get-EventCount -Adapter $adapter -Event 'key:F9')
+        Assert-Equal -Expected 1 -Actual (Get-EventCount -Adapter $adapter -Event 'sleep:1000')
+        Assert-Equal -Expected $originalIdentity -Actual $state.BuffSchedule[0].Identity
+        Assert-Equal -Expected $originalLastApplied `
+            -Actual $state.BuffSchedule[0].LastAppliedMonotonicMilliseconds
+        Assert-Equal -Expected $originalNextDue `
+            -Actual $state.BuffSchedule[0].NextDueMonotonicMilliseconds
+        Assert-Equal -Expected 3 -Actual $state.BuffSchedule[0].CastTimeSeconds
+    }
+    finally {
+        Remove-EngineTestState -State $state
+    }
+}
+
 Test-Case 'deleted then re-added buff key is treated as a new row' {
     $adapter = New-SimulatedAdapter
     $buff = [pscustomobject]@{

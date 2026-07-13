@@ -852,15 +852,7 @@ function Get-AIFishBotBuffRowSignature {
         [object]$Buff
     )
 
-    $nameFound = $false
-    $name = Get-AIFishBotEngineProperty -InputObject $Buff -Name 'name' -Found ([ref]$nameFound)
-    if (-not $nameFound -or $null -eq $name) {
-        $name = ''
-    }
-    $castTimeText = [convert]::ToString(
-        [double]$Buff.castTimeSeconds,
-        [System.Globalization.CultureInfo]::InvariantCulture)
-    return '{0}|{1}|{2}' -f ([string]$name), ([string]$Buff.keybind), $castTimeText
+    return [string]$Buff.keybind
 }
 
 function Get-AIFishBotBuffStableId {
