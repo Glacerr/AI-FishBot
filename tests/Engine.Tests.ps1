@@ -70,6 +70,7 @@ function New-SimulatedAdapter {
     }
     $context = [pscustomobject]@{
         Now = $Now
+        MonotonicMilliseconds = [double]0
         Peaks = $queue
         Events = New-Object 'System.Collections.Generic.List[string]'
         DisposeCount = 0
@@ -81,10 +82,12 @@ function New-SimulatedAdapter {
     return [pscustomobject]@{
         Context = $context
         Now = ({ return $captured.Now }.GetNewClosure())
+        MonotonicMilliseconds = ({ return $captured.MonotonicMilliseconds }.GetNewClosure())
         SleepMilliseconds = ({
                 param($milliseconds)
                 [void]$captured.Events.Add(('sleep:{0}' -f [int]$milliseconds))
                 $captured.Now = $captured.Now.AddMilliseconds([double]$milliseconds)
+                $captured.MonotonicMilliseconds += [double]$milliseconds
                 if ($null -ne $captured.OnSleep) {
                     & $captured.OnSleep ([int]$milliseconds)
                 }
@@ -224,6 +227,82 @@ Test-Case 'adapter may expose its current time as a direct value' {
     try {
         $state = New-EngineTestState -Adapter $adapter
         Assert-Equal -Expected $expectedNow -Actual $state.StartedAt
+    }
+    finally {
+        Remove-EngineTestState -State $state
+    }
+}
+
+Test-Case 'engine uses an injected monotonic millisecond clock when available' {
+    $adapter = New-SimulatedAdapter
+    $state = $null
+    try {
+        $state = New-EngineTestState -Adapter $adapter
+        Assert-Equal -Expected 'Adapter.MonotonicMilliseconds' -Actual $state.MonotonicSource
+        Assert-Equal -Expected ([double]0) -Actual $state.StartedMonotonicMilliseconds
+    }
+    finally {
+        Remove-EngineTestState -State $state
+    }
+}
+
+Test-Case 'engine accepts an injected monotonic timespan clock' {
+    $adapter = New-SimulatedAdapter
+    $adapter.PSObject.Properties.Remove('MonotonicMilliseconds')
+    $capturedContext = $adapter.Context
+    $adapter | Add-Member -NotePropertyName MonotonicNow -NotePropertyValue ({
+            return [timespan]::FromMilliseconds($capturedContext.MonotonicMilliseconds)
+        }.GetNewClosure())
+    $state = $null
+    try {
+        $state = New-EngineTestState -Adapter $adapter
+        Assert-Equal -Expected 'Adapter.MonotonicNow' -Actual $state.MonotonicSource
+        Assert-Equal -Expected ([double]0) -Actual $state.StartedMonotonicMilliseconds
+    }
+    finally {
+        Remove-EngineTestState -State $state
+    }
+}
+
+Test-Case 'engine falls back to a running stopwatch when no monotonic adapter clock exists' {
+    $adapter = New-SimulatedAdapter
+    $adapter.PSObject.Properties.Remove('MonotonicMilliseconds')
+    $state = $null
+    try {
+        $state = New-EngineTestState -Adapter $adapter
+        Assert-Equal -Expected 'Stopwatch' -Actual $state.MonotonicSource
+        Assert-True -Condition ($state.MonotonicStopwatch -is [System.Diagnostics.Stopwatch])
+        Assert-True -Condition $state.MonotonicStopwatch.IsRunning
+    }
+    finally {
+        Remove-EngineTestState -State $state
+    }
+}
+
+Test-Case 'first ready status write is deferred until the owned engine loop starts' {
+    $adapter = New-SimulatedAdapter
+    $state = $null
+    try {
+        $state = New-EngineTestState -Adapter $adapter
+        Assert-Equal -Expected $false -Actual (Test-Path -LiteralPath `
+                (Join-Path -Path $state.RunDirectory -ChildPath 'status.json'))
+    }
+    finally {
+        Remove-EngineTestState -State $state
+    }
+}
+
+Test-Case 'initial status failure still disposes the adapter exactly once' {
+    $adapter = New-SimulatedAdapter
+    $adapter.Now = { throw 'simulated initial status failure' }
+    $state = $null
+    try {
+        $state = New-EngineTestState -Adapter $adapter `
+            -StartedAt ([datetimeoffset]'2026-07-13T08:00:00+08:00')
+        Start-AIFishBotEngineLoop -State $state | Out-Null
+        Assert-Equal -Expected 'error' -Actual $state.State
+        Assert-True -Condition ($state.LastError -like '*initial status failure*')
+        Assert-Equal -Expected 1 -Actual $adapter.Context.DisposeCount
     }
     finally {
         Remove-EngineTestState -State $state
@@ -385,6 +464,46 @@ Test-Case 'invalid live config is logged and leaves the last valid snapshot inta
     }
 }
 
+Test-Case 'live config versions require bounded integer value types and recover afterward' {
+    $adapter = New-SimulatedAdapter
+    $config = New-EngineConfig
+    $candidate = Copy-EngineConfig -Config $config
+    $candidate.audioSensitivity = 4
+    $invalidVersions = @(
+        '1',
+        $true,
+        [decimal]1,
+        [double]1,
+        [single]1,
+        [long]2147483648,
+        [int]-1
+    )
+    $state = $null
+    try {
+        $state = New-EngineTestState -Config $config -Adapter $adapter
+        foreach ($invalidVersion in $invalidVersions) {
+            Assert-Equal -Expected $false -Actual (Update-AIFishBotLiveConfig -State $state `
+                    -CandidateConfig $candidate -ConfigVersion $invalidVersion)
+            Assert-Equal -Expected 0 -Actual $state.ConfigVersion
+            Assert-Equal -Expected 3 -Actual $state.LiveConfig.audioSensitivity
+        }
+
+        $candidate.audioSensitivity = 5
+        Assert-Equal -Expected $true -Actual (Update-AIFishBotLiveConfig -State $state `
+                -CandidateConfig $candidate -ConfigVersion ([long]1))
+        Assert-Equal -Expected 1 -Actual $state.ConfigVersion
+        Assert-Equal -Expected 5 -Actual $state.LiveConfig.audioSensitivity
+
+        $logPath = Join-Path -Path $state.RunDirectory -ChildPath 'logs\2026-07-13.log'
+        $logText = [System.IO.File]::ReadAllText($logPath)
+        Assert-Equal -Expected $invalidVersions.Count -Actual `
+            ([regex]::Matches($logText, 'Live config rejected: config version is invalid\.')).Count
+    }
+    finally {
+        Remove-EngineTestState -State $state
+    }
+}
+
 Test-Case 'WeakAura cast accepts a peak exactly at the sensitivity threshold' {
     $adapter = New-SimulatedAdapter -Peaks @(3)
     $config = New-EngineConfig -Values @{ useWeakAura = $true; fishingRetries = 2 }
@@ -457,6 +576,40 @@ Test-Case 'non-WeakAura cast sends one simulated key and never samples audio' {
     }
 }
 
+foreach ($invalidPeakCase in @(
+        [pscustomobject]@{ Name = 'Boolean'; Value = $true },
+        [pscustomobject]@{ Name = 'numeric text'; Value = '3' },
+        [pscustomobject]@{ Name = 'NaN'; Value = [double]::NaN },
+        [pscustomobject]@{ Name = 'infinity'; Value = [double]::PositiveInfinity },
+        [pscustomobject]@{ Name = 'negative value'; Value = [double]-0.1 },
+        [pscustomobject]@{ Name = 'value above one hundred'; Value = [double]100.1 }
+    )) {
+    Test-Case ('invalid {0} audio peak causes adapter error and safe disposal' -f $invalidPeakCase.Name) {
+        $adapter = New-SimulatedAdapter -Peaks @($invalidPeakCase.Value)
+        $reader = {
+            param($state)
+            $reads = @($state.Adapter.Context.Events | Where-Object { $_ -eq 'peak' }).Count
+            if ($reads -ge 1) {
+                return [pscustomobject]@{ command = 'stop' }
+            }
+            return $null
+        }
+        $state = $null
+        try {
+            $state = New-EngineTestState -Adapter $adapter -ControlReader $reader
+            Start-AIFishBotEngineLoop -State $state | Out-Null
+
+            Assert-Equal -Expected 'error' -Actual $state.State
+            Assert-Equal -Expected $true -Actual $state.StopRequested
+            Assert-True -Condition ($state.LastError -like '*invalid audio peak*')
+            Assert-Equal -Expected 1 -Actual $adapter.Context.DisposeCount
+        }
+        finally {
+            Remove-EngineTestState -State $state
+        }
+    }
+}
+
 Test-Case 'no bite completes the classic window and starts the next round before stop' {
     $adapter = New-SimulatedAdapter
     $config = New-EngineConfig -Values @{ retail = $false; audioSensitivity = 3 }
@@ -524,8 +677,8 @@ Test-Case 'engine loop treats an equal peak as a bite and completes the hook seq
     $config = New-EngineConfig -Values @{ audioSensitivity = 3 }
     $reader = {
         param($state)
-        $casts = @($state.Adapter.Context.Events | Where-Object { $_ -eq 'key:F6' }).Count
-        if ($state.HookCount -ge 1 -and $casts -ge 2) {
+        if ($state.HookCount -ge 1 -and
+            $state.Adapter.Context.MonotonicMilliseconds -ge 12000) {
             return [pscustomobject]@{ command = 'stop' }
         }
         return $null
@@ -538,6 +691,7 @@ Test-Case 'engine loop treats an equal peak as a bite and completes the hook seq
         Assert-Equal -Expected 1 -Actual $state.HookCount
         Assert-Equal -Expected 1 -Actual (Get-EventCount -Adapter $adapter -Event 'key:F7')
         Assert-Equal -Expected 2 -Actual (Get-EventCount -Adapter $adapter -Event 'key:F6')
+        Assert-True -Condition ($adapter.Context.MonotonicMilliseconds -ge 12000)
         Assert-Equal -Expected 'stopped' -Actual $state.State
     }
     finally {
@@ -583,7 +737,124 @@ Test-Case 'waiting loop refreshes its runtime heartbeat while no bite is heard' 
     }
 }
 
-Test-Case 'enabled buff casts initially and again exactly at expiration' {
+Test-Case 'wall clock rollback does not delay the waiting window' {
+    $holder = @{ Adapter = $null; Rewound = $false }
+    $capturedHolder = $holder
+    $onSleep = {
+        param($milliseconds)
+        if (-not $capturedHolder.Rewound -and $null -ne $capturedHolder.Adapter -and
+            $capturedHolder.Adapter.Context.MonotonicMilliseconds -ge 5000) {
+            $capturedHolder.Adapter.Context.Now =
+                $capturedHolder.Adapter.Context.Now.AddHours(-1)
+            $capturedHolder.Rewound = $true
+        }
+    }.GetNewClosure()
+    $adapter = New-SimulatedAdapter -OnSleep $onSleep
+    $holder.Adapter = $adapter
+    $reader = {
+        param($state)
+        if ($state.Adapter.Context.MonotonicMilliseconds -ge 25000) {
+            return [pscustomobject]@{ command = 'stop' }
+        }
+        return $null
+    }
+    $config = New-EngineConfig -Values @{ retail = $true }
+    $state = $null
+    try {
+        $state = New-EngineTestState -Config $config -Adapter $adapter -ControlReader $reader
+        Start-AIFishBotEngineLoop -State $state | Out-Null
+
+        Assert-Equal -Expected 2 -Actual (Get-EventCount -Adapter $adapter -Event 'key:F6')
+        Assert-Equal -Expected $true -Actual $holder.Rewound
+        Assert-True -Condition ($adapter.Context.Now -lt $state.StartedAt)
+    }
+    finally {
+        Remove-EngineTestState -State $state
+    }
+}
+
+Test-Case 'wall clock rollback does not delay auto stop' {
+    $holder = @{ Adapter = $null; Rewound = $false }
+    $capturedHolder = $holder
+    $onSleep = {
+        param($milliseconds)
+        if (-not $capturedHolder.Rewound -and $null -ne $capturedHolder.Adapter -and
+            $capturedHolder.Adapter.Context.MonotonicMilliseconds -ge 1000) {
+            $capturedHolder.Adapter.Context.Now =
+                $capturedHolder.Adapter.Context.Now.AddHours(-1)
+            $capturedHolder.Rewound = $true
+        }
+    }.GetNewClosure()
+    $adapter = New-SimulatedAdapter -OnSleep $onSleep
+    $holder.Adapter = $adapter
+    $reader = {
+        param($state)
+        if ($state.Adapter.Context.MonotonicMilliseconds -ge 8000) {
+            return [pscustomobject]@{ command = 'stop' }
+        }
+        return $null
+    }
+    $config = New-EngineConfig -Values @{ autoStop = $true; autoStopTime = 0.1 }
+    $state = $null
+    try {
+        $state = New-EngineTestState -Config $config -Adapter $adapter -ControlReader $reader
+        Start-AIFishBotEngineLoop -State $state | Out-Null
+
+        Assert-Equal -Expected 'stopped' -Actual $state.State
+        Assert-Equal -Expected $true -Actual $holder.Rewound
+        Assert-True -Condition ($adapter.Context.MonotonicMilliseconds -ge 6000)
+        Assert-True -Condition ($adapter.Context.MonotonicMilliseconds -lt 7000)
+    }
+    finally {
+        Remove-EngineTestState -State $state
+    }
+}
+
+Test-Case 'wall clock rollback does not delay heartbeat refresh' {
+    $holder = @{ State = $null; Rewound = $false; ObservedHeartbeat = $null }
+    $capturedHolder = $holder
+    $onSleep = {
+        param($milliseconds)
+        if ($null -eq $capturedHolder.State) {
+            return
+        }
+        if (-not $capturedHolder.Rewound -and
+            $capturedHolder.State.Adapter.Context.MonotonicMilliseconds -ge 4500) {
+            $capturedHolder.State.Adapter.Context.Now =
+                $capturedHolder.State.Adapter.Context.Now.AddHours(-1)
+            $capturedHolder.Rewound = $true
+        }
+        if ($null -eq $capturedHolder.ObservedHeartbeat -and
+            $capturedHolder.State.Adapter.Context.MonotonicMilliseconds -ge 6500 -and
+            $null -ne $capturedHolder.State.PSObject.Properties['LastHeartbeatMonotonicMilliseconds']) {
+            $capturedHolder.ObservedHeartbeat =
+                $capturedHolder.State.LastHeartbeatMonotonicMilliseconds
+        }
+    }.GetNewClosure()
+    $adapter = New-SimulatedAdapter -OnSleep $onSleep
+    $reader = {
+        param($state)
+        if ($state.Adapter.Context.MonotonicMilliseconds -ge 7000) {
+            return [pscustomobject]@{ command = 'stop' }
+        }
+        return $null
+    }
+    $state = $null
+    try {
+        $state = New-EngineTestState -Adapter $adapter -ControlReader $reader
+        $holder.State = $state
+        Start-AIFishBotEngineLoop -State $state | Out-Null
+
+        Assert-Equal -Expected $true -Actual $holder.Rewound
+        Assert-True -Condition ($null -ne $holder.ObservedHeartbeat)
+        Assert-True -Condition ([double]$holder.ObservedHeartbeat -ge 6000)
+    }
+    finally {
+        Remove-EngineTestState -State $state
+    }
+}
+
+Test-Case 'wall clock rollback does not delay a scheduled buff' {
     $adapter = New-SimulatedAdapter
     $buff = [pscustomobject]@{
         enabled = $true; keybind = 'F9'; castTimeSeconds = 1; durationMinutes = 1
@@ -593,14 +864,186 @@ Test-Case 'enabled buff casts initially and again exactly at expiration' {
     try {
         $state = New-EngineTestState -Config $config -Adapter $adapter
         Invoke-AIFishBotBuffCheck -State $state | Out-Null
-        $expiration = $state.BuffExpirations['F9']
-        $adapter.Context.Now = $expiration.AddMilliseconds(-1)
+        $adapter.Context.MonotonicMilliseconds =
+            [double]$state.BuffSchedule[0].NextDueMonotonicMilliseconds
+        $adapter.Context.Now = $state.StartedAt.AddHours(-1)
         Invoke-AIFishBotBuffCheck -State $state | Out-Null
-        $adapter.Context.Now = $expiration
+
+        Assert-Equal -Expected 2 -Actual (Get-EventCount -Adapter $adapter -Event 'key:F9')
+        Assert-True -Condition ($adapter.Context.Now -lt $state.StartedAt)
+    }
+    finally {
+        Remove-EngineTestState -State $state
+    }
+}
+
+Test-Case 'multiple buff rows keep separate keys and cast durations' {
+    $adapter = New-SimulatedAdapter
+    $buffs = @(
+        [pscustomobject]@{
+            enabled = $true; keybind = 'F9'; castTimeSeconds = 1; durationMinutes = 1
+        },
+        [pscustomobject]@{
+            enabled = $true; keybind = 'F10'; castTimeSeconds = 2; durationMinutes = 2
+        }
+    )
+    $config = New-EngineConfig -Values @{ buffs = $buffs }
+    $state = $null
+    try {
+        $state = New-EngineTestState -Config $config -Adapter $adapter
+        Invoke-AIFishBotBuffCheck -State $state | Out-Null
+
+        Assert-Equal -Expected @('key:F9', 'sleep:1000', 'key:F10', 'sleep:2000') `
+            -Actual @($adapter.Context.Events)
+        Assert-Equal -Expected 2 -Actual @($state.BuffSchedule).Count
+        Assert-True -Condition ($state.BuffSchedule[0].Identity -ne $state.BuffSchedule[1].Identity)
+        foreach ($scheduledBuff in $state.BuffSchedule) {
+            Assert-True -Condition ($null -ne $scheduledBuff.LastAppliedAt)
+            Assert-True -Condition ($null -ne $scheduledBuff.NextDue)
+        }
+    }
+    finally {
+        Remove-EngineTestState -State $state
+    }
+}
+
+Test-Case 'duplicate buff keys remain two independent scheduled rows' {
+    $adapter = New-SimulatedAdapter
+    $buffs = @(
+        [pscustomobject]@{
+            enabled = $true; keybind = 'F9'; castTimeSeconds = 1; durationMinutes = 1
+        },
+        [pscustomobject]@{
+            enabled = $true; keybind = 'F9'; castTimeSeconds = 2; durationMinutes = 2
+        }
+    )
+    $config = New-EngineConfig -Values @{ buffs = $buffs }
+    $state = $null
+    try {
+        $state = New-EngineTestState -Config $config -Adapter $adapter
+        Invoke-AIFishBotBuffCheck -State $state | Out-Null
+
+        Assert-Equal -Expected @('key:F9', 'sleep:1000', 'key:F9', 'sleep:2000') `
+            -Actual @($adapter.Context.Events)
+        Assert-Equal -Expected 2 -Actual @($state.BuffSchedule).Count
+        Assert-True -Condition ($state.BuffSchedule[0].Identity -ne $state.BuffSchedule[1].Identity)
+    }
+    finally {
+        Remove-EngineTestState -State $state
+    }
+}
+
+Test-Case 'enabled buff casts initially and again exactly at monotonic expiration' {
+    $adapter = New-SimulatedAdapter
+    $buff = [pscustomobject]@{
+        enabled = $true; keybind = 'F9'; castTimeSeconds = 1; durationMinutes = 1
+    }
+    $config = New-EngineConfig -Values @{ buffs = @($buff) }
+    $state = $null
+    try {
+        $state = New-EngineTestState -Config $config -Adapter $adapter
+        Invoke-AIFishBotBuffCheck -State $state | Out-Null
+        $expiration = [double]$state.BuffSchedule[0].NextDueMonotonicMilliseconds
+        $adapter.Context.MonotonicMilliseconds = $expiration - 1
+        $adapter.Context.Now = $state.BuffSchedule[0].NextDue.AddMilliseconds(-1)
+        Invoke-AIFishBotBuffCheck -State $state | Out-Null
+        $adapter.Context.MonotonicMilliseconds = $expiration
+        $adapter.Context.Now = $state.BuffSchedule[0].NextDue
         Invoke-AIFishBotBuffCheck -State $state | Out-Null
 
         Assert-Equal -Expected 2 -Actual (Get-EventCount -Adapter $adapter -Event 'key:F9')
         Assert-Equal -Expected 2 -Actual (Get-EventCount -Adapter $adapter -Event 'sleep:1000')
+    }
+    finally {
+        Remove-EngineTestState -State $state
+    }
+}
+
+Test-Case 'buff duration live update recomputes next due from last application' {
+    $adapter = New-SimulatedAdapter
+    $buff = [pscustomobject]@{
+        enabled = $true; keybind = 'F9'; castTimeSeconds = 1; durationMinutes = 10
+    }
+    $config = New-EngineConfig -Values @{ buffs = @($buff) }
+    $state = $null
+    try {
+        $state = New-EngineTestState -Config $config -Adapter $adapter
+        Invoke-AIFishBotBuffCheck -State $state | Out-Null
+        $lastApplied = [double]$state.BuffSchedule[0].LastAppliedMonotonicMilliseconds
+        $adapter.Context.MonotonicMilliseconds = $lastApplied + 120000
+        $adapter.Context.Now = $adapter.Context.Now.AddMinutes(2)
+
+        $updated = Copy-EngineConfig -Config $config
+        $updated.buffs[0].durationMinutes = 1
+        Assert-Equal -Expected $true -Actual (Update-AIFishBotLiveConfig -State $state `
+                -CandidateConfig $updated -ConfigVersion 1)
+        Invoke-AIFishBotBuffCheck -State $state | Out-Null
+
+        Assert-Equal -Expected 2 -Actual (Get-EventCount -Adapter $adapter -Event 'key:F9')
+        Assert-True -Condition ($state.BuffSchedule[0].LastAppliedMonotonicMilliseconds `
+                -ge ($lastApplied + 120000))
+    }
+    finally {
+        Remove-EngineTestState -State $state
+    }
+}
+
+Test-Case 'deleted then re-added buff key is treated as a new row' {
+    $adapter = New-SimulatedAdapter
+    $buff = [pscustomobject]@{
+        enabled = $true; keybind = 'F9'; castTimeSeconds = 1; durationMinutes = 10
+    }
+    $config = New-EngineConfig -Values @{ buffs = @($buff) }
+    $state = $null
+    try {
+        $state = New-EngineTestState -Config $config -Adapter $adapter
+        Invoke-AIFishBotBuffCheck -State $state | Out-Null
+        $firstIdentity = $state.BuffSchedule[0].Identity
+
+        $removed = Copy-EngineConfig -Config $config
+        $removed.buffs = @()
+        Assert-Equal -Expected $true -Actual (Update-AIFishBotLiveConfig -State $state `
+                -CandidateConfig $removed -ConfigVersion 1)
+        Invoke-AIFishBotBuffCheck -State $state | Out-Null
+        Assert-Equal -Expected 0 -Actual @($state.BuffSchedule).Count
+
+        Assert-Equal -Expected $true -Actual (Update-AIFishBotLiveConfig -State $state `
+                -CandidateConfig $config -ConfigVersion 2)
+        Invoke-AIFishBotBuffCheck -State $state | Out-Null
+
+        Assert-Equal -Expected 2 -Actual (Get-EventCount -Adapter $adapter -Event 'key:F9')
+        Assert-True -Condition ($state.BuffSchedule[0].Identity -ne $firstIdentity)
+    }
+    finally {
+        Remove-EngineTestState -State $state
+    }
+}
+
+Test-Case 'reordered buff rows reset only through their new row positions' {
+    $adapter = New-SimulatedAdapter
+    $first = [pscustomobject]@{
+        enabled = $true; keybind = 'F9'; castTimeSeconds = 1; durationMinutes = 10
+    }
+    $second = [pscustomobject]@{
+        enabled = $true; keybind = 'F10'; castTimeSeconds = 1; durationMinutes = 10
+    }
+    $config = New-EngineConfig -Values @{ buffs = @($first, $second) }
+    $state = $null
+    try {
+        $state = New-EngineTestState -Config $config -Adapter $adapter
+        Invoke-AIFishBotBuffCheck -State $state | Out-Null
+        $oldIdentities = @($state.BuffSchedule | ForEach-Object { $_.Identity })
+
+        $updated = Copy-EngineConfig -Config $config
+        $updated.buffs = @($updated.buffs[1], $updated.buffs[0])
+        Assert-Equal -Expected $true -Actual (Update-AIFishBotLiveConfig -State $state `
+                -CandidateConfig $updated -ConfigVersion 1)
+        Invoke-AIFishBotBuffCheck -State $state | Out-Null
+
+        Assert-Equal -Expected 2 -Actual (Get-EventCount -Adapter $adapter -Event 'key:F9')
+        Assert-Equal -Expected 2 -Actual (Get-EventCount -Adapter $adapter -Event 'key:F10')
+        Assert-True -Condition ($state.BuffSchedule[0].Identity -notin $oldIdentities)
+        Assert-True -Condition ($state.BuffSchedule[1].Identity -notin $oldIdentities)
     }
     finally {
         Remove-EngineTestState -State $state
@@ -650,11 +1093,11 @@ Test-Case 'latest auto-stop settings stop immediately and send the locked logout
     $loader = New-VersionedLoader -Items @(
         [pscustomobject]@{ ConfigVersion = 1; Config = $updated }
     )
-    $startedAt = $adapter.Context.Now.AddMinutes(-1)
     $state = $null
     try {
         $state = New-EngineTestState -Config $config -Adapter $adapter `
-            -LiveConfigLoader $loader -StartedAt $startedAt
+            -LiveConfigLoader $loader
+        $adapter.Context.MonotonicMilliseconds = 60000
         Start-AIFishBotEngineLoop -State $state | Out-Null
 
         Assert-Equal -Expected @('notify:start', 'key:F8', 'notify:stop') `
@@ -695,10 +1138,10 @@ Test-Case 'notification failures are logged and never prevent a clean stop or di
         notifyOnStop = $true
         discordWebhook = 'https://discord.com/api/webhooks/123/secret-token'
     }
-    $startedAt = $adapter.Context.Now.AddMinutes(-1)
     $state = $null
     try {
-        $state = New-EngineTestState -Config $config -Adapter $adapter -StartedAt $startedAt
+        $state = New-EngineTestState -Config $config -Adapter $adapter
+        $adapter.Context.MonotonicMilliseconds = 60000
         Start-AIFishBotEngineLoop -State $state | Out-Null
 
         Assert-Equal -Expected @('notify:start', 'key:F8', 'notify:stop') -Actual @($adapter.Context.Events)

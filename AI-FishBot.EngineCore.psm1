@@ -86,7 +86,8 @@ function Invoke-AIFishBotAdapterMember {
         if ($property.Value -is [System.Delegate]) {
             return $property.Value.DynamicInvoke($ArgumentList)
         }
-        if ($Name -eq 'Now' -and $ArgumentList.Count -eq 0) {
+        if ($Name -in @('Now', 'MonotonicNow', 'MonotonicMilliseconds') -and
+            $ArgumentList.Count -eq 0) {
             return $property.Value
         }
     }
@@ -95,6 +96,19 @@ function Invoke-AIFishBotAdapterMember {
         return $method.Invoke($ArgumentList)
     }
     throw ('The engine adapter does not provide {0}.' -f $Name)
+}
+
+function Test-AIFishBotAdapterMemberAvailable {
+    param(
+        [Parameter(Mandatory = $true)]
+        [object]$Adapter,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Name
+    )
+
+    return $null -ne $Adapter.PSObject.Properties[$Name] -or
+        $null -ne $Adapter.PSObject.Methods[$Name]
 }
 
 function Get-AIFishBotEngineNow {
@@ -113,6 +127,79 @@ function Get-AIFishBotEngineNow {
     catch {
         throw ('The engine adapter returned an invalid timestamp: {0}' -f $_.Exception.Message)
     }
+}
+
+function ConvertTo-AIFishBotMonotonicMilliseconds {
+    param(
+        [Parameter(Mandatory = $true)]
+        [AllowNull()]
+        [object]$Value,
+
+        [Parameter(Mandatory = $true)]
+        [string]$SourceName
+    )
+
+    $milliseconds = $null
+    if ($Value -is [timespan]) {
+        $milliseconds = [double]$Value.TotalMilliseconds
+    }
+    elseif ($Value -is [datetimeoffset]) {
+        $milliseconds = [double]$Value.Ticks / [timespan]::TicksPerMillisecond
+    }
+    elseif ($Value -is [datetime]) {
+        $milliseconds = [double]$Value.Ticks / [timespan]::TicksPerMillisecond
+    }
+    else {
+        $isNumericType = $Value -is [sbyte] -or $Value -is [byte] -or
+            $Value -is [int16] -or $Value -is [uint16] -or
+            $Value -is [int32] -or $Value -is [uint32] -or
+            $Value -is [int64] -or $Value -is [uint64] -or
+            $Value -is [single] -or $Value -is [double] -or $Value -is [decimal]
+        if ($isNumericType) {
+            try {
+                $milliseconds = [convert]::ToDouble(
+                    $Value,
+                    [System.Globalization.CultureInfo]::InvariantCulture)
+            }
+            catch {
+            }
+        }
+    }
+    if ($null -eq $milliseconds -or [double]::IsNaN($milliseconds) -or
+        [double]::IsInfinity($milliseconds) -or $milliseconds -lt 0) {
+        throw ('The engine adapter {0} member returned an invalid monotonic time.' -f $SourceName)
+    }
+    return [double]$milliseconds
+}
+
+function Get-AIFishBotEngineMonotonicMilliseconds {
+    param(
+        [Parameter(Mandatory = $true)]
+        [object]$State
+    )
+
+    if ($State.MonotonicSource -eq 'Adapter.MonotonicMilliseconds') {
+        $values = @(Invoke-AIFishBotAdapterMember -Adapter $State.Adapter `
+                -Name 'MonotonicMilliseconds')
+        if ($values.Count -ne 1) {
+            throw 'The engine adapter MonotonicMilliseconds member must return exactly one value.'
+        }
+        return ConvertTo-AIFishBotMonotonicMilliseconds -Value $values[0] `
+            -SourceName 'MonotonicMilliseconds'
+    }
+    if ($State.MonotonicSource -eq 'Adapter.MonotonicNow') {
+        $values = @(Invoke-AIFishBotAdapterMember -Adapter $State.Adapter -Name 'MonotonicNow')
+        if ($values.Count -ne 1) {
+            throw 'The engine adapter MonotonicNow member must return exactly one value.'
+        }
+        return ConvertTo-AIFishBotMonotonicMilliseconds -Value $values[0] `
+            -SourceName 'MonotonicNow'
+    }
+    if ($State.MonotonicSource -eq 'Stopwatch' -and
+        $State.MonotonicStopwatch -is [System.Diagnostics.Stopwatch]) {
+        return [double]$State.MonotonicStopwatch.Elapsed.TotalMilliseconds
+    }
+    throw 'The engine state does not have a valid monotonic time source.'
 }
 
 function Invoke-AIFishBotEngineSleep {
@@ -159,13 +246,23 @@ function Get-AIFishBotEnginePeak {
     if ($values.Count -ne 1 -or $null -eq $values[0]) {
         throw 'The engine adapter ReadPeak member must return exactly one number.'
     }
+    $value = $values[0]
+    $isNumericType = $value -is [sbyte] -or $value -is [byte] -or
+        $value -is [int16] -or $value -is [uint16] -or
+        $value -is [int32] -or $value -is [uint32] -or
+        $value -is [int64] -or $value -is [uint64] -or
+        $value -is [single] -or $value -is [double] -or $value -is [decimal]
+    if (-not $isNumericType) {
+        throw 'The engine adapter returned an invalid audio peak.'
+    }
     try {
-        $peak = [convert]::ToDouble($values[0], [System.Globalization.CultureInfo]::InvariantCulture)
+        $peak = [convert]::ToDouble($value, [System.Globalization.CultureInfo]::InvariantCulture)
     }
     catch {
         throw ('The engine adapter returned an invalid audio peak: {0}' -f $_.Exception.Message)
     }
-    if ([double]::IsNaN($peak) -or [double]::IsInfinity($peak)) {
+    if ([double]::IsNaN($peak) -or [double]::IsInfinity($peak) -or
+        $peak -lt 0 -or $peak -gt 100) {
         throw 'The engine adapter returned an invalid audio peak.'
     }
     return $peak
@@ -217,14 +314,17 @@ function Get-AIFishBotEngineRemainingSeconds {
         [object]$State,
 
         [Parameter(Mandatory = $true)]
-        [datetimeoffset]$Now
+        [double]$MonotonicNow
     )
 
     if (-not [bool]$State.LiveConfig.autoStop) {
         return $null
     }
-    $deadline = $State.StartedAt.AddMinutes([double]$State.LiveConfig.autoStopTime)
-    return [double][math]::Max(0, ($deadline - $Now).TotalSeconds)
+    $totalSeconds = [double]$State.LiveConfig.autoStopTime * 60
+    $elapsedSeconds = [math]::Max(
+        0,
+        ($MonotonicNow - [double]$State.StartedMonotonicMilliseconds) / 1000)
+    return [double][math]::Max(0, $totalSeconds - $elapsedSeconds)
 }
 
 function Write-AIFishBotEngineStatus {
@@ -234,6 +334,7 @@ function Write-AIFishBotEngineStatus {
     )
 
     $now = Get-AIFishBotEngineNow -State $State
+    $monotonicNow = Get-AIFishBotEngineMonotonicMilliseconds -State $State
     $status = [pscustomobject][ordered]@{
         processId = [int]$PID
         state = [string]$State.State
@@ -241,7 +342,8 @@ function Write-AIFishBotEngineStatus {
         retryCount = [int]$State.RetryCount
         profileName = [string]$State.LockedConfig.profileName
         startedAt = $State.StartedAt
-        remainingSeconds = Get-AIFishBotEngineRemainingSeconds -State $State -Now $now
+        remainingSeconds = Get-AIFishBotEngineRemainingSeconds -State $State `
+            -MonotonicNow $monotonicNow
         lastError = $State.LastError
         heartbeatAt = $now
         configVersion = [int]$State.ConfigVersion
@@ -249,6 +351,9 @@ function Write-AIFishBotEngineStatus {
     Write-AIFishBotStatus -RunDirectory $State.RunDirectory -Status $status | Out-Null
     if ($null -ne $State.PSObject.Properties['LastHeartbeatAt']) {
         $State.LastHeartbeatAt = $now
+    }
+    if ($null -ne $State.PSObject.Properties['LastHeartbeatMonotonicMilliseconds']) {
+        $State.LastHeartbeatMonotonicMilliseconds = $monotonicNow
     }
 }
 
@@ -338,6 +443,18 @@ function New-AIFishBotEngineState {
             return Read-AIFishBotControlCommand -RunDirectory $state.RunDirectory -Consume
         }
     }
+    $monotonicSource = $null
+    $monotonicStopwatch = $null
+    if (Test-AIFishBotAdapterMemberAvailable -Adapter $Adapter -Name 'MonotonicMilliseconds') {
+        $monotonicSource = 'Adapter.MonotonicMilliseconds'
+    }
+    elseif (Test-AIFishBotAdapterMemberAvailable -Adapter $Adapter -Name 'MonotonicNow') {
+        $monotonicSource = 'Adapter.MonotonicNow'
+    }
+    else {
+        $monotonicSource = 'Stopwatch'
+        $monotonicStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+    }
     $history = New-Object 'System.Collections.Generic.List[string]'
     [void]$history.Add('ready')
     $state = [pscustomobject][ordered]@{
@@ -351,9 +468,15 @@ function New-AIFishBotEngineState {
         RunDirectory = $fullRunDirectory
         Adapter = $Adapter
         BuffExpirations = @{}
+        BuffSchedule = @()
+        BuffIdentityCounter = 0
         StopRequested = $false
         LastError = $null
         LastHeartbeatAt = $null
+        LastHeartbeatMonotonicMilliseconds = $null
+        MonotonicSource = $monotonicSource
+        MonotonicStopwatch = $monotonicStopwatch
+        StartedMonotonicMilliseconds = [double]0
         RandomIntProvider = $RandomIntProvider
         LiveConfigLoader = $LiveConfigLoader
         ControlReader = $ControlReader
@@ -362,7 +485,7 @@ function New-AIFishBotEngineState {
         StartNotificationSent = $false
         StopNotificationSent = $false
     }
-    Write-AIFishBotEngineStatus -State $state
+    $state.StartedMonotonicMilliseconds = Get-AIFishBotEngineMonotonicMilliseconds -State $state
     return $state
 }
 
@@ -428,6 +551,15 @@ function Update-AIFishBotLiveConfig {
             return $false
         }
     }
+    $isIntegerType = $ConfigVersion -is [sbyte] -or $ConfigVersion -is [byte] -or
+        $ConfigVersion -is [int16] -or $ConfigVersion -is [uint16] -or
+        $ConfigVersion -is [int32] -or $ConfigVersion -is [uint32] -or
+        $ConfigVersion -is [int64] -or $ConfigVersion -is [uint64]
+    if (-not $isIntegerType) {
+        Write-AIFishBotEngineLog -State $State -Level Warning `
+            -Message 'Live config rejected: config version is invalid.'
+        return $false
+    }
     try {
         $versionDecimal = [convert]::ToDecimal(
             $ConfigVersion,
@@ -438,8 +570,7 @@ function Update-AIFishBotLiveConfig {
             -Message 'Live config rejected: config version is invalid.'
         return $false
     }
-    if ([decimal]::Truncate($versionDecimal) -ne $versionDecimal -or
-        $versionDecimal -lt 0 -or $versionDecimal -gt [int]::MaxValue) {
+    if ($versionDecimal -lt 0 -or $versionDecimal -gt [int]::MaxValue) {
         Write-AIFishBotEngineLog -State $State -Level Warning `
             -Message 'Live config rejected: config version is invalid.'
         return $false
@@ -547,9 +678,9 @@ function Test-AIFishBotEngineCheckpoint {
     if ($State.StopRequested) {
         return $false
     }
-    $checkpointNow = Get-AIFishBotEngineNow -State $State
-    if ($null -eq $State.LastHeartbeatAt -or
-        ($checkpointNow - [datetimeoffset]$State.LastHeartbeatAt).TotalSeconds -ge 1) {
+    $checkpointMonotonic = Get-AIFishBotEngineMonotonicMilliseconds -State $State
+    if ($null -eq $State.LastHeartbeatMonotonicMilliseconds -or
+        ($checkpointMonotonic - [double]$State.LastHeartbeatMonotonicMilliseconds) -ge 1000) {
         Write-AIFishBotEngineStatus -State $State
     }
     [void](Update-AIFishBotLiveConfig -State $State)
@@ -573,8 +704,11 @@ function Test-AIFishBotEngineCheckpoint {
             -Message ('Control read failed: {0}' -f $_.Exception.Message)
     }
     if ([bool]$State.LiveConfig.autoStop) {
-        $deadline = $State.StartedAt.AddMinutes([double]$State.LiveConfig.autoStopTime)
-        if ((Get-AIFishBotEngineNow -State $State) -ge $deadline) {
+        $elapsedMilliseconds =
+            (Get-AIFishBotEngineMonotonicMilliseconds -State $State) -
+            [double]$State.StartedMonotonicMilliseconds
+        $autoStopMilliseconds = [double]$State.LiveConfig.autoStopTime * 60000
+        if ($elapsedMilliseconds -ge $autoStopMilliseconds) {
             Invoke-AIFishBotStop -State $State -Logout:([bool]$State.LiveConfig.autoLogout) `
                 -Reason 'auto stop' | Out-Null
             return $false
@@ -712,6 +846,88 @@ function Invoke-AIFishBotBiteSequence {
     return Invoke-AIFishBotCast -State $State
 }
 
+function Get-AIFishBotBuffRowSignature {
+    param(
+        [Parameter(Mandatory = $true)]
+        [object]$Buff
+    )
+
+    $castTimeText = [convert]::ToString(
+        [double]$Buff.castTimeSeconds,
+        [System.Globalization.CultureInfo]::InvariantCulture)
+    return '{0}|{1}|{2}' -f ([bool]$Buff.enabled), ([string]$Buff.keybind), $castTimeText
+}
+
+function Update-AIFishBotBuffSchedule {
+    param(
+        [Parameter(Mandatory = $true)]
+        [object]$State,
+
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyCollection()]
+        [AllowNull()]
+        [object[]]$Buffs
+    )
+
+    $previousSchedule = @($State.BuffSchedule)
+    $updatedSchedule = New-Object 'System.Collections.Generic.List[object]'
+    $monotonicNow = Get-AIFishBotEngineMonotonicMilliseconds -State $State
+    $wallNow = Get-AIFishBotEngineNow -State $State
+    for ($index = 0; $index -lt $Buffs.Count; $index += 1) {
+        $buff = $Buffs[$index]
+        $signature = Get-AIFishBotBuffRowSignature -Buff $buff
+        $scheduled = $null
+        if ($index -lt $previousSchedule.Count -and
+            $previousSchedule[$index].Signature -eq $signature) {
+            $scheduled = $previousSchedule[$index]
+        }
+        if ($null -eq $scheduled) {
+            $State.BuffIdentityCounter += 1
+            $scheduled = [pscustomobject][ordered]@{
+                Identity = 'buff-{0}' -f $State.BuffIdentityCounter
+                Index = $index
+                Signature = $signature
+                Enabled = [bool]$buff.enabled
+                Keybind = [string]$buff.keybind
+                CastTimeSeconds = [double]$buff.castTimeSeconds
+                DurationMinutes = [double]$buff.durationMinutes
+                LastAppliedAt = $null
+                NextDue = $wallNow
+                LastAppliedMonotonicMilliseconds = $null
+                NextDueMonotonicMilliseconds = [double]$monotonicNow
+            }
+        }
+        else {
+            $scheduled.Index = $index
+            $scheduled.DurationMinutes = [double]$buff.durationMinutes
+            if ($null -ne $scheduled.LastAppliedMonotonicMilliseconds) {
+                $scheduled.NextDueMonotonicMilliseconds =
+                    [double]$scheduled.LastAppliedMonotonicMilliseconds +
+                    ([double]$scheduled.DurationMinutes * 60000)
+                $scheduled.NextDue = ([datetimeoffset]$scheduled.LastAppliedAt).AddMinutes(
+                    [double]$scheduled.DurationMinutes)
+            }
+        }
+        [void]$updatedSchedule.Add($scheduled)
+    }
+    $State.BuffSchedule = $updatedSchedule.ToArray()
+}
+
+function Update-AIFishBotBuffExpirationView {
+    param(
+        [Parameter(Mandatory = $true)]
+        [object]$State
+    )
+
+    $expirations = @{}
+    foreach ($scheduled in @($State.BuffSchedule)) {
+        if ($null -ne $scheduled.NextDue) {
+            $expirations[$scheduled.Identity] = $scheduled.NextDue
+        }
+    }
+    $State.BuffExpirations = $expirations
+}
+
 function Invoke-AIFishBotBuffCheck {
     [CmdletBinding()]
     param(
@@ -722,31 +938,44 @@ function Invoke-AIFishBotBuffCheck {
     if (-not (Test-AIFishBotEngineCheckpoint -State $State)) {
         return $false
     }
-    $buffSnapshot = @(Copy-AIFishBotEngineValue -Value @($State.LiveConfig.buffs))
+    $buffSnapshot = @(
+        foreach ($buffRow in @($State.LiveConfig.buffs)) {
+            if ($null -ne $buffRow) {
+                Copy-AIFishBotEngineValue -Value $buffRow
+            }
+        }
+    )
+    Update-AIFishBotBuffSchedule -State $State -Buffs $buffSnapshot
     $castAny = $false
-    foreach ($buff in $buffSnapshot) {
-        if ($null -eq $buff -or -not [bool]$buff.enabled -or
-            [string]::IsNullOrWhiteSpace([string]$buff.keybind)) {
+    foreach ($scheduled in @($State.BuffSchedule)) {
+        if (-not $scheduled.Enabled -or
+            [string]::IsNullOrWhiteSpace([string]$scheduled.Keybind)) {
             continue
         }
-        $key = [string]$buff.keybind
-        $now = Get-AIFishBotEngineNow -State $State
-        if ($State.BuffExpirations.ContainsKey($key) -and
-            $now -lt [datetimeoffset]$State.BuffExpirations[$key]) {
+        $monotonicNow = Get-AIFishBotEngineMonotonicMilliseconds -State $State
+        if ($monotonicNow -lt [double]$scheduled.NextDueMonotonicMilliseconds) {
             continue
         }
         Set-AIFishBotEngineStateValue -State $State -Value 'casting'
         if ([bool]$State.LockedConfig.useWindowFocus) {
             Invoke-AIFishBotEngineFocus -State $State
         }
-        Invoke-AIFishBotEngineKey -State $State -Key $key
+        Invoke-AIFishBotEngineKey -State $State -Key ([string]$scheduled.Keybind)
         $castMilliseconds = Get-AIFishBotEngineDelay -State $State `
-            -MinimumSeconds $buff.castTimeSeconds -MaximumSeconds $buff.castTimeSeconds
+            -MinimumSeconds $scheduled.CastTimeSeconds `
+            -MaximumSeconds $scheduled.CastTimeSeconds
         Invoke-AIFishBotEngineSleep -State $State -Milliseconds $castMilliseconds
-        $State.BuffExpirations[$key] = (Get-AIFishBotEngineNow -State $State).AddMinutes(
-            [double]$buff.durationMinutes)
+        $scheduled.LastAppliedMonotonicMilliseconds =
+            Get-AIFishBotEngineMonotonicMilliseconds -State $State
+        $scheduled.LastAppliedAt = Get-AIFishBotEngineNow -State $State
+        $scheduled.NextDueMonotonicMilliseconds =
+            [double]$scheduled.LastAppliedMonotonicMilliseconds +
+            ([double]$scheduled.DurationMinutes * 60000)
+        $scheduled.NextDue = ([datetimeoffset]$scheduled.LastAppliedAt).AddMinutes(
+            [double]$scheduled.DurationMinutes)
         $castAny = $true
     }
+    Update-AIFishBotBuffExpirationView -State $State
     if ($castAny -and -not $State.StopRequested) {
         Set-AIFishBotEngineStateValue -State $State -Value 'ready'
     }
@@ -763,6 +992,9 @@ function Close-AIFishBotEngineAdapter {
         return
     }
     $State.Disposed = $true
+    if ($State.MonotonicStopwatch -is [System.Diagnostics.Stopwatch]) {
+        $State.MonotonicStopwatch.Stop()
+    }
     try {
         Invoke-AIFishBotAdapterMember -Adapter $State.Adapter -Name 'Dispose' | Out-Null
     }
@@ -780,33 +1012,38 @@ function Start-AIFishBotEngineLoop {
     )
 
     try {
+        Write-AIFishBotEngineStatus -State $State
         [void](Update-AIFishBotLiveConfig -State $State)
         Send-AIFishBotEngineNotification -State $State -EventName start
+        $castReadyForWindow = $false
         :engineLoop while (-not $State.StopRequested) {
-            if (-not (Test-AIFishBotEngineCheckpoint -State $State)) {
-                break
+            if (-not $castReadyForWindow) {
+                if (-not (Test-AIFishBotEngineCheckpoint -State $State)) {
+                    break
+                }
+                if (-not (Invoke-AIFishBotBuffCheck -State $State)) {
+                    break
+                }
+                if (-not (Test-AIFishBotEngineCheckpoint -State $State)) {
+                    break
+                }
+                if (-not (Invoke-AIFishBotCast -State $State)) {
+                    break
+                }
             }
-            if (-not (Invoke-AIFishBotBuffCheck -State $State)) {
-                break
-            }
-            if (-not (Test-AIFishBotEngineCheckpoint -State $State)) {
-                break
-            }
-            if (-not (Invoke-AIFishBotCast -State $State)) {
-                break
-            }
+            $castReadyForWindow = $false
 
-            $windowStart = Get-AIFishBotEngineNow -State $State
+            $windowStart = Get-AIFishBotEngineMonotonicMilliseconds -State $State
             if (-not (Test-AIFishBotEngineCheckpoint -State $State)) {
                 break
             }
             Invoke-AIFishBotEngineSleep -State $State -Milliseconds 4000
             Set-AIFishBotEngineStateValue -State $State -Value 'waiting-for-bite'
             $windowSeconds = if ([bool]$State.LockedConfig.retail) { 22 } else { 30 }
-            $deadline = $windowStart.AddSeconds($windowSeconds)
+            $deadline = $windowStart + ($windowSeconds * 1000)
             $biteDetected = $false
 
-            while ((Get-AIFishBotEngineNow -State $State) -lt $deadline) {
+            while ((Get-AIFishBotEngineMonotonicMilliseconds -State $State) -lt $deadline) {
                 if (-not (Test-AIFishBotEngineCheckpoint -State $State)) {
                     break engineLoop
                 }
@@ -816,10 +1053,11 @@ function Start-AIFishBotEngineLoop {
                     if (-not (Invoke-AIFishBotBiteSequence -State $State)) {
                         break engineLoop
                     }
+                    $castReadyForWindow = $true
                     break
                 }
                 $remainingMilliseconds = [int][math]::Ceiling(
-                    ($deadline - (Get-AIFishBotEngineNow -State $State)).TotalMilliseconds)
+                    $deadline - (Get-AIFishBotEngineMonotonicMilliseconds -State $State))
                 if ($remainingMilliseconds -gt 0) {
                     Invoke-AIFishBotEngineSleep -State $State `
                         -Milliseconds ([math]::Min(100, $remainingMilliseconds))
@@ -836,9 +1074,16 @@ function Start-AIFishBotEngineLoop {
     catch {
         if ($State.State -ne 'error') {
             $State.StopRequested = $true
-            Set-AIFishBotEngineStateValue -State $State -Value 'error' -LastError $_.Exception.Message
+            $State.State = 'error'
+            $State.LastError = $_.Exception.Message
+            [void]$State.StateHistory.Add('error')
+            try {
+                Write-AIFishBotEngineStatus -State $State
+            }
+            catch {
+            }
             Write-AIFishBotEngineLog -State $State -Level Error `
-                -Message ('Engine failed: {0}' -f $_.Exception.Message)
+                -Message ('Engine failed: {0}' -f $State.LastError)
         }
     }
     finally {
