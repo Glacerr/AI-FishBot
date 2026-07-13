@@ -17,6 +17,7 @@ function Assert-ConfigError {
     Assert-Equal -Expected $false -Actual $Result.IsValid
     Assert-True -Condition $Result.Errors.ContainsKey($Field)
     Assert-True -Condition (-not [string]::IsNullOrWhiteSpace([string]$Result.Errors[$Field]))
+    Assert-True -Condition ([regex]::IsMatch([string]$Result.Errors[$Field], '[\u4e00-\u9fff]'))
 }
 
 function New-TestBuff {
@@ -79,6 +80,50 @@ Test-Case 'default configuration is valid' {
     Assert-Equal -Expected 0 -Actual $result.Errors.Count
 }
 
+$booleanFields = @(
+    'retail',
+    'autoStop',
+    'autoLogout',
+    'useWindowFocus',
+    'useWeakAura',
+    'usePi',
+    'enableNotifications',
+    'notifyOnStart',
+    'notifyOnStop'
+)
+
+$invalidBooleanCases = @(
+    @{ Name = 'text'; Value = 'true'; Missing = $false },
+    @{ Name = 'an empty value'; Value = $null; Missing = $false },
+    @{ Name = 'a missing property'; Missing = $true }
+)
+
+foreach ($booleanField in $booleanFields) {
+    foreach ($invalidCase in $invalidBooleanCases) {
+        Test-Case ("{0} rejects {1}" -f $booleanField, $invalidCase.Name) {
+            $config = New-AIFishBotDefaultConfig
+            if ($invalidCase.Missing) {
+                $config.PSObject.Properties.Remove($booleanField)
+            }
+            else {
+                $config.$booleanField = $invalidCase.Value
+            }
+
+            Assert-ConfigError -Result (Test-AIFishBotConfig -Config $config) -Field $booleanField
+        }
+    }
+}
+
+Test-Case 'a text usePi value does not trigger port validation' {
+    $config = New-AIFishBotDefaultConfig
+    $config.usePi = 'true'
+    $config.picoComPort = 'COM_MISSING'
+
+    $result = Test-AIFishBotConfig -Config $config -AvailablePorts @()
+    Assert-ConfigError -Result $result -Field 'usePi'
+    Assert-True -Condition (-not $result.Errors.ContainsKey('picoComPort'))
+}
+
 foreach ($case in @(
         @{ Name = 'below the minimum'; Value = 0 },
         @{ Name = 'above the maximum'; Value = 10 },
@@ -109,6 +154,13 @@ foreach ($case in @(
 Test-Case 'fishing retries rejects a negative value' {
     $config = New-AIFishBotDefaultConfig
     $config.fishingRetries = -1
+
+    Assert-ConfigError -Result (Test-AIFishBotConfig -Config $config) -Field 'fishingRetries'
+}
+
+Test-Case 'fishing retries rejects a fractional value' {
+    $config = New-AIFishBotDefaultConfig
+    $config.fishingRetries = 0.5
 
     Assert-ConfigError -Result (Test-AIFishBotConfig -Config $config) -Field 'fishingRetries'
 }
@@ -233,6 +285,27 @@ Test-Case 'a valid buff with an empty name is accepted' {
     $result = Test-AIFishBotConfig -Config $config
     Assert-Equal -Expected $true -Actual $result.IsValid
     Assert-Equal -Expected 0 -Actual $result.Errors.Count
+}
+
+Test-Case 'a null buff returns an error at its original index' {
+    $config = New-AIFishBotDefaultConfig
+    $config.buffs = [object[]]@($null)
+
+    Assert-ConfigError -Result (Test-AIFishBotConfig -Config $config) -Field 'buffs[0]'
+}
+
+Test-Case 'mixed buff lists preserve indexes after a null item' {
+    $config = New-AIFishBotDefaultConfig
+    $config.buffs = [object[]]@(
+        (New-TestBuff -Keybind 'F9'),
+        $null,
+        (New-TestBuff -Keybind 'F4')
+    )
+
+    $result = Test-AIFishBotConfig -Config $config
+    Assert-ConfigError -Result $result -Field 'buffs[1]'
+    Assert-True -Condition $result.Errors.ContainsKey('buffs[2].keybind')
+    Assert-True -Condition (-not $result.Errors.ContainsKey('buffs[1].keybind'))
 }
 
 Test-Case 'buff cast time rejects zero' {

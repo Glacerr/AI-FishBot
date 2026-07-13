@@ -142,6 +142,25 @@ function Test-AIFishBotConfig {
         }
     }
 
+    $booleanFields = @(
+        'retail',
+        'autoStop',
+        'autoLogout',
+        'useWindowFocus',
+        'useWeakAura',
+        'usePi',
+        'enableNotifications',
+        'notifyOnStart',
+        'notifyOnStop'
+    )
+
+    foreach ($booleanField in $booleanFields) {
+        $booleanValue = Get-AIFishBotConfigValue -InputObject $Config -Name $booleanField
+        if ($booleanValue -isnot [bool]) {
+            Add-AIFishBotConfigError -Errors $errors -Field $booleanField -Message '开关值必须是布尔值。'
+        }
+    }
+
     $audioSensitivity = Get-AIFishBotConfigValue -InputObject $Config -Name 'audioSensitivity'
     if (-not (Test-AIFishBotNumber -Value $audioSensitivity)) {
         Add-AIFishBotConfigError -Errors $errors -Field 'audioSensitivity' -Message '灵敏度必须是1到9之间的有效数字。'
@@ -164,6 +183,9 @@ function Test-AIFishBotConfig {
     }
     elseif ([double]$fishingRetries -lt 0) {
         Add-AIFishBotConfigError -Errors $errors -Field 'fishingRetries' -Message '抛竿重试次数不得小于0。'
+    }
+    elseif ([double]$fishingRetries % 1 -ne 0) {
+        Add-AIFishBotConfigError -Errors $errors -Field 'fishingRetries' -Message '抛竿重试次数必须是整数。'
     }
 
     $waitRanges = @(
@@ -218,11 +240,23 @@ function Test-AIFishBotConfig {
         }
     }
 
-    $buffValues = Get-AIFishBotConfigValue -InputObject $Config -Name 'buffs'
-    if ($null -ne $buffValues) {
-        $buffs = @($buffValues)
+    $buffProperty = $Config.PSObject.Properties['buffs']
+    $buffs = @()
+    if ($null -ne $buffProperty) {
+        if ($buffProperty.Value -is [System.Array]) {
+            $buffs = [object[]]$buffProperty.Value
+        }
+        elseif ($null -ne $buffProperty.Value) {
+            $buffs = @($buffProperty.Value)
+        }
+
         for ($index = 0; $index -lt $buffs.Count; $index += 1) {
             $buff = $buffs[$index]
+            if ($null -eq $buff) {
+                Add-AIFishBotConfigError -Errors $errors -Field ('buffs[{0}]' -f $index) -Message '增益项不能为空。'
+                continue
+            }
+
             $enabledField = 'buffs[{0}].enabled' -f $index
             $keybindField = 'buffs[{0}].keybind' -f $index
             $castTimeField = 'buffs[{0}].castTimeSeconds' -f $index
