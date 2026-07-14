@@ -1023,6 +1023,47 @@ Test-Case 'stop arriving during one buff is honored before the next row sends a 
     }
 }
 
+Test-Case 'stop arriving in the final wait slice prevents buff completion bookkeeping' {
+    $signal = @{ Stop = $false }
+    $capturedSignal = $signal
+    $onSleep = {
+        param($milliseconds)
+        $capturedSignal.Stop = $true
+    }.GetNewClosure()
+    $adapter = New-SimulatedAdapter -OnSleep $onSleep
+    $reader = {
+        param($state)
+        if ($capturedSignal.Stop) {
+            return [pscustomobject]@{ command = 'stop' }
+        }
+        return $null
+    }.GetNewClosure()
+    $buffs = @(
+        [pscustomobject]@{
+            name = 'first'; enabled = $true; keybind = 'F9'
+            castTimeSeconds = 1; durationMinutes = 10
+        },
+        [pscustomobject]@{
+            name = 'second'; enabled = $true; keybind = 'F10'
+            castTimeSeconds = 1; durationMinutes = 10
+        }
+    )
+    $config = New-EngineConfig -Values @{ buffs = $buffs }
+    $state = $null
+    try {
+        $state = New-EngineTestState -Config $config -Adapter $adapter -ControlReader $reader
+
+        Assert-Equal -Expected $false -Actual (Invoke-AIFishBotBuffCheck -State $state)
+
+        Assert-Equal -Expected @('key:F9', 'sleep:1000') -Actual @($adapter.Context.Events)
+        Assert-Equal -Expected $null -Actual $state.BuffSchedule[0].LastAppliedMonotonicMilliseconds
+        Assert-Equal -Expected 'stopped' -Actual $state.State
+    }
+    finally {
+        Remove-EngineTestState -State $state
+    }
+}
+
 Test-Case 'duplicate buff keys remain two independent scheduled rows' {
     $adapter = New-SimulatedAdapter
     $buffs = @(

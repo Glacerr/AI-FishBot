@@ -235,6 +235,16 @@ function Test-AIFishBotControllerProcessIdentity {
     if ($null -eq $expectedStart) {
         return [pscustomobject]@{ Success = $false; Error = '后台记录缺少可核对的启动时间。' }
     }
+    if ($source -eq 'Status') {
+        $lastHeartbeat = ConvertTo-AIFishBotControllerDateTimeOffset `
+            (Get-AIFishBotObjectPropertyValue $Status 'heartbeatAt' $null)
+        if ($null -eq $lastHeartbeat) {
+            return [pscustomobject]@{ Success = $false; Error = '后台记录缺少可核对的最后心跳时间。' }
+        }
+        if ($actualStart -gt $lastHeartbeat) {
+            return [pscustomobject]@{ Success = $false; Error = '进程编号已在最后心跳后被其他进程重复使用。' }
+        }
+    }
     if ([math]::Abs(($actualStart - $expectedStart).TotalSeconds) -gt $toleranceSeconds) {
         return [pscustomobject]@{ Success = $false; Error = '进程编号已被其他进程重复使用。' }
     }

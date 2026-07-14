@@ -1048,6 +1048,90 @@ Test-Case 'Force stop accepts an expired heartbeat only after the process start 
     }
 }
 
+Test-Case 'Expired legacy status rejects a PID reused after its last heartbeat' {
+    $root = New-TestDirectory
+    try {
+        $view = New-ControllerFakeView
+        $now = [datetimeoffset]'2026-07-13T10:00:00+08:00'
+        $oldStart = $now.AddMinutes(-1)
+        $lastHeartbeat = $oldStart.AddSeconds(5)
+        $reusedStart = $oldStart.AddSeconds(10)
+        $run = New-AIFishBotRunDirectory -RuntimeRoot (Join-Path $root 'runtime') `
+            -StartConfig (New-ControllerTestConfig) -LiveConfig ([pscustomobject]@{ configVersion = 1 })
+        $status = [pscustomobject]@{
+            processId = 558; state = 'ready'; heartbeatAt = $lastHeartbeat.ToString('o')
+            startedAt = $oldStart.ToString('o'); configVersion = 1
+        }
+        $script:legacyReuseForceCalls = 0
+        $controller = New-ControllerForTest -View $view -Root $root `
+            -StatusReader { param($path) $status } `
+            -ProcessLookup { param($id) [pscustomobject]@{ Id = $id; StartTime = $reusedStart.UtcDateTime } } `
+            -ForceStopper { param($id) $script:legacyReuseForceCalls += 1 }
+
+        $resume = Resume-AIFishBotRun -Controller $controller -RunDirectory $run
+        $markerWasUpgraded = Test-Path -LiteralPath $controller.ActiveMarkerPath -PathType Leaf
+        Remove-Item -LiteralPath $controller.ActiveMarkerPath -Force -ErrorAction SilentlyContinue
+        $controller.CurrentRunDirectory = $run
+        $controller.CurrentProcessId = 558
+        $controller.CurrentProcessStartedAt = $reusedStart.ToString('o')
+        Set-AIFishBotRunningState -Controller $controller -Running $true
+
+        $force = $controller.ForceStop()
+
+        Assert-Equal -Expected $false -Actual $resume.Success
+        Assert-Equal -Expected $false -Actual $markerWasUpgraded
+        Assert-Equal -Expected $false -Actual $force.Success
+        Assert-Equal -Expected 0 -Actual $script:legacyReuseForceCalls
+    }
+    finally {
+        Remove-ControllerTestDirectory $root
+        Remove-Variable legacyReuseForceCalls -Scope Script -ErrorAction SilentlyContinue
+    }
+}
+
+Test-Case 'Expired legacy status keeps the original process recoverable and blocks duplicate start' {
+    $root = New-TestDirectory
+    try {
+        $view = New-ControllerFakeView
+        $now = [datetimeoffset]'2026-07-13T10:00:00+08:00'
+        $processStart = $now.AddMinutes(-1)
+        $statusStart = $processStart.AddSeconds(2)
+        $lastHeartbeat = $processStart.AddSeconds(5)
+        $run = New-AIFishBotRunDirectory -RuntimeRoot (Join-Path $root 'runtime') `
+            -StartConfig (New-ControllerTestConfig) -LiveConfig ([pscustomobject]@{ configVersion = 1 })
+        $status = [pscustomobject]@{
+            processId = 559; state = 'ready'; heartbeatAt = $lastHeartbeat.ToString('o')
+            startedAt = $statusStart.ToString('o'); configVersion = 1
+        }
+        $controller = New-ControllerForTest -View $view -Root $root `
+            -StatusReader { param($path) $status } `
+            -ProcessLookup { param($id) [pscustomobject]@{ Id = $id; StartTime = $processStart.UtcDateTime } }
+
+        $resume = Resume-AIFishBotRun -Controller $controller -RunDirectory $run
+
+        Assert-Equal -Expected $true -Actual $resume.Success
+        Assert-True -Condition (Test-Path -LiteralPath $controller.ActiveMarkerPath -PathType Leaf)
+
+        $script:legacyStarterCalls = 0
+        $secondView = New-ControllerFakeView
+        $secondController = New-ControllerForTest -View $secondView -Root $root `
+            -StatusReader { param($path) $status } `
+            -ProcessLookup { param($id) [pscustomobject]@{ Id = $id; StartTime = $processStart.UtcDateTime } } `
+            -ProcessStarter { param($request) $script:legacyStarterCalls += 1 }
+        Set-AIFishBotViewFromConfig -Controller $secondController -Config (New-ControllerTestConfig)
+
+        $start = Start-AIFishBotRun -Controller $secondController
+
+        Assert-Equal -Expected $false -Actual $start.Success
+        Assert-Equal -Expected $true -Actual $start.AlreadyRunning
+        Assert-Equal -Expected 0 -Actual $script:legacyStarterCalls
+    }
+    finally {
+        Remove-ControllerTestDirectory $root
+        Remove-Variable legacyStarterCalls -Scope Script -ErrorAction SilentlyContinue
+    }
+}
+
 Test-Case 'Resume clears stale controller state without terminating a process' {
     $root = New-TestDirectory
     try {

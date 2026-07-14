@@ -229,8 +229,7 @@ function Wait-AIFishBotEngineInterruptibly {
         $sliceMilliseconds = [math]::Min(1000, $remainingMilliseconds)
         Invoke-AIFishBotEngineSleep -State $State -Milliseconds $sliceMilliseconds
         $remainingMilliseconds -= $sliceMilliseconds
-        if ($remainingMilliseconds -gt 0 -and
-            -not (Test-AIFishBotEngineCheckpoint -State $State)) {
+        if (-not (Test-AIFishBotEngineCheckpoint -State $State)) {
             return $false
         }
     }
