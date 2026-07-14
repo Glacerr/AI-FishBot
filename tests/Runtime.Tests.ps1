@@ -29,6 +29,7 @@ function New-RuntimeStatus {
         retryCount = 3
         profileName = 'Test Profile'
         startedAt = '2026-07-13T03:30:00.0000000+00:00'
+        processStartedAt = '2026-07-13T03:29:58.1234567+00:00'
         remainingSeconds = 90
         lastError = $null
         heartbeatAt = $HeartbeatAt
@@ -430,7 +431,7 @@ Test-Case 'status round trip contains exactly the fixed protocol fields' {
         $actual = Read-AIFishBotStatus -RunDirectory $runDirectory
         $expectedNames = @(
             'processId', 'state', 'hookCount', 'retryCount', 'profileName', 'startedAt',
-            'remainingSeconds', 'lastError', 'heartbeatAt', 'configVersion'
+            'processStartedAt', 'remainingSeconds', 'lastError', 'heartbeatAt', 'configVersion'
         )
 
         Assert-Equal -Expected $expectedNames -Actual @($actual.PSObject.Properties.Name)
@@ -636,7 +637,7 @@ foreach ($case in @(
     }
 }
 
-foreach ($timestampField in @('startedAt', 'heartbeatAt')) {
+foreach ($timestampField in @('startedAt', 'processStartedAt', 'heartbeatAt')) {
     foreach ($case in @(
             [pscustomobject]@{ Name = 'invalid text'; Value = 'not-a-time' },
             [pscustomobject]@{ Name = 'null'; Value = $null },
@@ -655,6 +656,20 @@ foreach ($timestampField in @('startedAt', 'heartbeatAt')) {
                 Remove-RuntimeTestDirectory -Path $runDirectory
             }
         }
+    }
+}
+
+Test-Case 'status rejects a missing exact process start identity' {
+    $runDirectory = New-TestDirectory
+    try {
+        $status = New-RuntimeStatus
+        $status.PSObject.Properties.Remove('processStartedAt')
+        Assert-Throws -ScriptBlock {
+            Write-AIFishBotStatus -RunDirectory $runDirectory -Status $status
+        } -MessageLike '*processStartedAt*required*'
+    }
+    finally {
+        Remove-RuntimeTestDirectory -Path $runDirectory
     }
 }
 
@@ -713,6 +728,7 @@ Test-Case 'status fields retain the protocol value types after a round trip' {
         Assert-Equal -Expected ([int]) -Actual $actual.retryCount.GetType()
         Assert-Equal -Expected ([string]) -Actual $actual.profileName.GetType()
         Assert-Equal -Expected ([string]) -Actual $actual.startedAt.GetType()
+        Assert-Equal -Expected ([string]) -Actual $actual.processStartedAt.GetType()
         Assert-Equal -Expected ([double]) -Actual $actual.remainingSeconds.GetType()
         Assert-Equal -Expected ([string]) -Actual $actual.lastError.GetType()
         Assert-Equal -Expected ([string]) -Actual $actual.heartbeatAt.GetType()

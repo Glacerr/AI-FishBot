@@ -460,6 +460,8 @@ Test-Case 'simulation GUI controller completes start live update reopen resume a
             return $null
         }
         Assert-Equal -Expected $enginePid -Actual $readyStatus.processId
+        Assert-Equal -Expected ([datetimeoffset]$engineProcess.StartTime).ToUniversalTime().ToString('o') `
+            -Actual ([datetimeoffset]$readyStatus.processStartedAt).ToUniversalTime().ToString('o')
 
         $firstView.Controls.AudioSensitivity.Value = 8
         $saved = Save-AIFishBotCurrentProfile -Controller $firstController

@@ -147,7 +147,8 @@ function New-EngineTestState {
         [scriptblock]$RandomIntProvider = { param($minimum, $maximum) return $minimum },
         [scriptblock]$LiveConfigLoader,
         [scriptblock]$ControlReader,
-        [datetimeoffset]$StartedAt
+        [datetimeoffset]$StartedAt,
+        [datetimeoffset]$ProcessStartedAt = [datetimeoffset]'2026-07-13T07:59:58+08:00'
     )
 
     $runDirectory = New-TestDirectory
@@ -156,6 +157,7 @@ function New-EngineTestState {
         RunDirectory = $runDirectory
         Adapter = $Adapter
         RandomIntProvider = $RandomIntProvider
+        ProcessStartedAt = $ProcessStartedAt
     }
     if ($PSBoundParameters.ContainsKey('LiveConfigLoader')) {
         $parameters.LiveConfigLoader = $LiveConfigLoader
@@ -289,6 +291,30 @@ Test-Case 'first ready status write is deferred until the owned engine loop star
     }
     finally {
         Remove-EngineTestState -State $state
+    }
+}
+
+Test-Case 'engine status carries the injected operating-system process start identity' {
+    $adapter = New-SimulatedAdapter
+    $runDirectory = New-TestDirectory
+    $state = $null
+    $processStartedAt = [datetimeoffset]'2026-07-13T07:59:58.1234567+08:00'
+    try {
+        $state = New-AIFishBotEngineState -Config (New-EngineConfig) `
+            -RunDirectory $runDirectory -Adapter $adapter `
+            -StartedAt ([datetimeoffset]'2026-07-13T08:00:00+08:00') `
+            -ProcessStartedAt $processStartedAt `
+            -ControlReader { param($engineState) [pscustomobject]@{ command = 'stop' } }
+
+        Start-AIFishBotEngineLoop -State $state | Out-Null
+        $status = Read-AIFishBotStatus -RunDirectory $runDirectory
+
+        Assert-Equal -Expected $processStartedAt.ToString('o') -Actual $status.processStartedAt
+    }
+    finally {
+        if (Test-Path -LiteralPath $runDirectory) {
+            Remove-Item -LiteralPath $runDirectory -Recurse -Force -ErrorAction SilentlyContinue
+        }
     }
 }
 

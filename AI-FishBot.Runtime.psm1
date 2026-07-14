@@ -586,6 +586,9 @@ function ConvertTo-AIFishBotStatusObject {
             startedAt = ConvertTo-AIFishBotDateTimeOffsetText `
                 -Value (Get-AIFishBotRequiredProtocolValue -InputObject $Status -Name 'startedAt') `
                 -FieldName 'startedAt'
+            processStartedAt = ConvertTo-AIFishBotDateTimeOffsetText `
+                -Value (Get-AIFishBotRequiredProtocolValue -InputObject $Status -Name 'processStartedAt') `
+                -FieldName 'processStartedAt'
             remainingSeconds = ConvertTo-AIFishBotRemainingSeconds `
                 -Value (Get-AIFishBotRequiredProtocolValue -InputObject $Status -Name 'remainingSeconds')
             lastError = $lastError

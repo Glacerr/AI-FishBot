@@ -8,6 +8,8 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $engineRoot = $PSScriptRoot
+$currentProcess = Get-Process -Id $PID -ErrorAction Stop
+$processStartedAt = [datetimeoffset]$currentProcess.StartTime
 $startedAt = [datetimeoffset]::Now
 $state = $null
 $adapter = $null
@@ -82,6 +84,7 @@ function Write-AIFishBotEngineEntryError {
                 retryCount = 0
                 profileName = $profileName
                 startedAt = $startedAt
+                processStartedAt = $processStartedAt
                 remainingSeconds = $null
                 lastError = $safeMessage
                 heartbeatAt = $now
@@ -142,7 +145,8 @@ try {
         }.GetNewClosure())
     $state = New-AIFishBotEngineState -Config $startupConfig `
         -RunDirectory $fullRunDirectory -Adapter $adapter -ConfigVersion $startupVersion `
-        -LiveConfigLoader $liveConfigLoader -StartedAt $startedAt
+        -LiveConfigLoader $liveConfigLoader -StartedAt $startedAt `
+        -ProcessStartedAt $processStartedAt
 
     $coreOwnsAdapter = $true
     $state = Start-AIFishBotEngineLoop -State $state

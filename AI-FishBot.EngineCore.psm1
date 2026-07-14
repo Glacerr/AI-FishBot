@@ -363,6 +363,7 @@ function Write-AIFishBotEngineStatus {
         retryCount = [int]$State.RetryCount
         profileName = [string]$State.LockedConfig.profileName
         startedAt = $State.StartedAt
+        processStartedAt = $State.ProcessStartedAt
         remainingSeconds = Get-AIFishBotEngineRemainingSeconds -State $State `
             -MonotonicNow $monotonicNow
         lastError = $State.LastError
@@ -437,7 +438,10 @@ function New-AIFishBotEngineState {
 
         [scriptblock]$ControlReader,
 
-        [datetimeoffset]$StartedAt
+        [datetimeoffset]$StartedAt,
+
+        [Parameter(Mandatory = $true)]
+        [datetimeoffset]$ProcessStartedAt
     )
 
     $fullRunDirectory = [System.IO.Path]::GetFullPath($RunDirectory)
@@ -485,6 +489,7 @@ function New-AIFishBotEngineState {
         HookCount = 0
         RetryCount = 0
         StartedAt = [datetimeoffset]$effectiveStartedAt
+        ProcessStartedAt = [datetimeoffset]$ProcessStartedAt
         State = 'ready'
         RunDirectory = $fullRunDirectory
         Adapter = $Adapter
