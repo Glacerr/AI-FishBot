@@ -723,7 +723,15 @@ function Read-AIFishBotControlCommand {
             return
         }
 
-        Write-AIFishBotAtomicJson -Path $markerPath -InputObject $control -CreateNew | Out-Null
+        $markerStream = New-Object System.IO.FileStream(
+            $markerPath,
+            [System.IO.FileMode]::CreateNew,
+            [System.IO.FileAccess]::Write,
+            [System.IO.FileShare]::None)
+        try {
+            $markerStream.Flush($true)
+        }
+        finally { $markerStream.Dispose() }
         Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue
         return $control
     }

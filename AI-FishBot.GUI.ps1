@@ -47,6 +47,25 @@ function Write-AIFishBotGuiFailureLog {
     }
 }
 
+function Show-AIFishBotGuiErrorSummary {
+    param([Parameter(Mandatory = $true)][string]$Summary)
+
+    $injected = Get-Variable -Name AIFishBotGuiErrorPresenter -Scope Global `
+        -ErrorAction SilentlyContinue
+    if ($null -ne $injected -and $injected.Value -is [scriptblock]) {
+        & $injected.Value $Summary | Out-Null
+        return $true
+    }
+
+    Add-Type -AssemblyName System.Windows.Forms
+    [void][Windows.Forms.MessageBox]::Show(
+        $Summary,
+        'AI FishBot',
+        [Windows.Forms.MessageBoxButtons]::OK,
+        [Windows.Forms.MessageBoxIcon]::Error)
+    return $false
+}
+
 try {
     if ([Threading.Thread]::CurrentThread.ApartmentState -ne [Threading.ApartmentState]::STA) {
         throw '界面必须在 STA 模式下运行。请使用启动脚本重新打开。'
@@ -253,7 +272,18 @@ elseif ($SelfTest) {
     }
 }
 elseif ($exitCode -ne 0) {
-    Write-Error $failureSummary
+    if ($NoShow) {
+        [Console]::Error.WriteLine($failureSummary)
+    }
+    else {
+        try {
+            $usedInjectedPresenter = Show-AIFishBotGuiErrorSummary -Summary $failureSummary
+            if ($usedInjectedPresenter) { [Console]::Error.WriteLine($failureSummary) }
+        }
+        catch {
+            [Console]::Error.WriteLine($failureSummary)
+        }
+    }
 }
 
 exit $exitCode
