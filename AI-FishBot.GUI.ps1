@@ -16,6 +16,7 @@ $fullDataRoot = $null
 $runtimeImported = $false
 $alreadyRunning = $false
 $failureSummary = $null
+$failureContext = 'AI FishBot 界面启动失败'
 $selfTestReport = $null
 $cleanupErrors = New-Object 'System.Collections.Generic.List[string]'
 
@@ -45,6 +46,95 @@ function Write-AIFishBotGuiFailureLog {
     }
     catch {
     }
+}
+
+function Get-SafeErrorSummary {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [System.Exception]$Exception,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Context,
+
+        [ValidateRange(1, 2000)]
+        [int]$MaximumLength = 500
+    )
+
+    $safeMessage = [string]$Exception.Message
+    if ([string]::IsNullOrWhiteSpace($safeMessage)) {
+        $safeMessage = '未知错误。'
+    }
+
+    try {
+        if ($null -ne (Get-Command -Name Protect-AIFishBotSecret -ErrorAction SilentlyContinue)) {
+            $safeMessage = Protect-AIFishBotSecret -Text $safeMessage
+        }
+    }
+    catch {
+    }
+
+    $webhookPattern = '(?<prefix>https:(?:\\/|/){2}(?:(?:canary|ptb)\.)?discord(?:app)?\.com(?::[0-9]{1,5})?' +
+        '(?:\\/|/)api(?:(?:\\/|/)v[0-9]+)?(?:\\/|/)webhooks(?:\\/|/))' +
+        '[A-Za-z0-9_-]+(?:\\/|/)[A-Za-z0-9._-]+(?:\?[^\s<>"'']*)?'
+    $safeMessage = [regex]::Replace(
+        $safeMessage,
+        $webhookPattern,
+        '[Webhook已隐藏]',
+        [Text.RegularExpressions.RegexOptions]::IgnoreCase)
+    $protectedWebhookPattern = 'https:(?:\\/|/){2}(?:(?:canary|ptb)\.)?discord(?:app)?\.com(?::[0-9]{1,5})?' +
+        '(?:\\/|/)api(?:(?:\\/|/)v[0-9]+)?(?:\\/|/)webhooks(?:\\/|/)\*{3}'
+    $safeMessage = [regex]::Replace(
+        $safeMessage,
+        $protectedWebhookPattern,
+        '[Webhook已隐藏]',
+        [Text.RegularExpressions.RegexOptions]::IgnoreCase)
+
+    $profilePaths = @(
+        [string]$HOME,
+        [string]$env:USERPROFILE,
+        [Environment]::GetFolderPath([Environment+SpecialFolder]::UserProfile)
+    ) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+        Sort-Object Length -Descending -Unique
+    foreach ($profilePath in $profilePaths) {
+        $trimmedPath = $profilePath.TrimEnd([char[]]@('\', '/'))
+        if ([string]::IsNullOrWhiteSpace($trimmedPath)) { continue }
+        $safeMessage = [regex]::Replace(
+            $safeMessage,
+            ([regex]::Escape($trimmedPath) + '(?=$|[\\/])'),
+            '%USERPROFILE%',
+            [Text.RegularExpressions.RegexOptions]::IgnoreCase)
+    }
+
+    $userName = [Environment]::UserName
+    if (-not [string]::IsNullOrWhiteSpace($userName)) {
+        $commonUserPath = '[A-Za-z]:[\\/]+Users[\\/]+' + [regex]::Escape($userName) + '(?=$|[\\/])'
+        $safeMessage = [regex]::Replace(
+            $safeMessage,
+            $commonUserPath,
+            '%USERPROFILE%',
+            [Text.RegularExpressions.RegexOptions]::IgnoreCase)
+    }
+
+    $safeMessage = [regex]::Replace($safeMessage, '[\r\n\u2028\u2029]+', ' ')
+    $safeMessage = [regex]::Replace($safeMessage, '[ \t]{2,}', ' ').Trim()
+    $safeContext = ([string]$Context).Trim().TrimEnd([char[]]@('：', ':'))
+    if ([string]::IsNullOrWhiteSpace($safeContext)) { $safeContext = 'AI FishBot 界面启动失败' }
+    $prefix = $safeContext + '：'
+    if ($prefix.Length -ge $MaximumLength) {
+        return $prefix.Substring(0, $MaximumLength)
+    }
+
+    $availableLength = $MaximumLength - $prefix.Length
+    if ($safeMessage.Length -gt $availableLength) {
+        if ($availableLength -eq 1) {
+            $safeMessage = '…'
+        }
+        else {
+            $safeMessage = $safeMessage.Substring(0, $availableLength - 1) + '…'
+        }
+    }
+    return $prefix + $safeMessage
 }
 
 function Show-AIFishBotGuiErrorSummary {
@@ -112,8 +202,12 @@ try {
         }
 
         $legacyScriptPath = Join-Path $PSScriptRoot 'AI-FishBot.ps1'
+        if (@(Get-AIFishBotProfiles -ProfilesDirectory $profilesDirectory).Count -eq 0) {
+            $failureContext = '首次配置导入失败'
+        }
         $profiles = @(Initialize-AIFishBotProfiles -ProfilesDirectory $profilesDirectory `
                 -LegacyScriptPath $legacyScriptPath -InitialProfileName '时光服')
+        $failureContext = 'AI FishBot 界面启动失败'
         if ($profiles.Count -eq 0) {
             throw '没有可用的钓鱼方案。'
         }
@@ -203,7 +297,7 @@ try {
 }
 catch {
     $exitCode = 1
-    $failureSummary = 'AI FishBot 界面启动失败。请查看日志了解详情。'
+    $failureSummary = Get-SafeErrorSummary -Exception $_.Exception -Context $failureContext
     Write-AIFishBotGuiFailureLog -Details $_.Exception.ToString()
 }
 finally {

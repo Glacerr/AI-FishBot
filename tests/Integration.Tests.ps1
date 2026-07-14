@@ -143,7 +143,9 @@ function Invoke-GuiEntryWithInjectedErrorPresenter {
     param(
         [Parameter(Mandatory = $true)][string]$DataRoot,
         [Parameter(Mandatory = $true)][string]$MarkerPath,
+        [string]$GuiPath = $script:GuiEntryPath,
         [switch]$NoShow,
+        [switch]$SelfTest,
         [int]$TimeoutMilliseconds = 30000
     )
 
@@ -156,7 +158,8 @@ param(
     [string]$GuiPath,
     [string]$GuiDataRoot,
     [string]$PresenterMarker,
-    [switch]$NoShow
+    [switch]$NoShow,
+    [switch]$SelfTest
 )
 $capturedMarker = $PresenterMarker
 $global:AIFishBotGuiErrorPresenter = ({
@@ -166,7 +169,10 @@ $global:AIFishBotGuiErrorPresenter = ({
             [string]$Summary,
             (New-Object Text.UTF8Encoding($false)))
     }.GetNewClosure())
-if ($NoShow) {
+if ($SelfTest) {
+    & $GuiPath -DataRoot $GuiDataRoot -SelfTest -Simulation
+}
+elseif ($NoShow) {
     & $GuiPath -DataRoot $GuiDataRoot -NoShow -Simulation
 }
 else {
@@ -178,11 +184,12 @@ exit $LASTEXITCODE
     $arguments = @(
         '-NoProfile', '-Sta', '-ExecutionPolicy', 'Bypass',
         '-File', (Quote-IntegrationArgument $harnessPath),
-        '-GuiPath', (Quote-IntegrationArgument $script:GuiEntryPath),
+        '-GuiPath', (Quote-IntegrationArgument $GuiPath),
         '-GuiDataRoot', (Quote-IntegrationArgument $DataRoot),
         '-PresenterMarker', (Quote-IntegrationArgument $MarkerPath)
     )
     if ($NoShow) { $arguments += '-NoShow' }
+    if ($SelfTest) { $arguments += '-SelfTest' }
 
     $process = $null
     try {
@@ -327,6 +334,61 @@ Test-Case 'interactive startup failures use a safe Chinese presenter while hidde
         Assert-True -Condition ($hidden.ExitCode -ne 0)
         Assert-Equal -Expected $false -Actual (Test-Path -LiteralPath $hiddenMarker)
         Assert-True -Condition (($hidden.StandardOutput + $hidden.StandardError) -like '*启动失败*')
+    }
+    finally { Remove-IntegrationDirectory $root }
+}
+
+Test-Case 'first legacy import failure presents its safe field and reason without secrets paths or stack details' {
+    $root = New-TestDirectory
+    try {
+        $projectRoot = Join-Path $root 'isolated GUI project'
+        [void][IO.Directory]::CreateDirectory($projectRoot)
+        foreach ($fileName in @(
+                'AI-FishBot.GUI.ps1',
+                'AI-FishBot.Config.psm1',
+                'AI-FishBot.Runtime.psm1',
+                'AI-FishBot.Dependencies.psm1',
+                'AI-FishBot.UI.psm1',
+                'AI-FishBot.Controller.psm1'
+            )) {
+            Copy-Item -LiteralPath (Join-Path $script:IntegrationRoot $fileName) `
+                -Destination (Join-Path $projectRoot $fileName)
+        }
+
+        $secret = 'first-import-secret-token'
+        $userProfilePath = [Environment]::GetFolderPath([Environment+SpecialFolder]::UserProfile)
+        $legacyText = '$autoStopTime = "x" autoStopTime=https://discord.com/api/webhooks/123456/{0}+{1}\private+{2}' -f `
+            $secret, $userProfilePath, ('A' * 700)
+        [IO.File]::WriteAllText(
+            (Join-Path $projectRoot 'AI-FishBot.ps1'),
+            $legacyText,
+            (New-Object Text.UTF8Encoding($false)))
+
+        $dataRoot = Join-Path $root 'data'
+        $interactiveMarker = Join-Path $root 'first-import-presenter.txt'
+        $interactive = Invoke-GuiEntryWithInjectedErrorPresenter `
+            -GuiPath (Join-Path $projectRoot 'AI-FishBot.GUI.ps1') `
+            -DataRoot $dataRoot -MarkerPath $interactiveMarker
+
+        Assert-True -Condition ($interactive.ExitCode -ne 0)
+        Assert-True -Condition (Test-Path -LiteralPath $interactiveMarker -PathType Leaf)
+        $summary = [IO.File]::ReadAllText($interactiveMarker)
+        Assert-True -Condition ($summary -like '首次配置导入失败：*')
+        Assert-True -Condition ($summary -like '*autoStopTime*')
+        Assert-True -Condition ($summary -match '无法解析|Unexpected token')
+        Assert-Equal -Expected $false -Actual $summary.Contains($secret)
+        Assert-Equal -Expected $false -Actual $summary.Contains($userProfilePath)
+        Assert-Equal -Expected $false -Actual ($summary -match '[\r\n\u2028\u2029]')
+        Assert-Equal -Expected 500 -Actual $summary.Length
+        Assert-True -Condition $summary.EndsWith('…')
+        Assert-Equal -Expected $false -Actual ($summary -match 'ScriptStackTrace|AI-FishBot\.GUI\.ps1:\s*line')
+
+        $selfTestMarker = Join-Path $root 'self-test-presenter.txt'
+        $selfTest = Invoke-GuiEntryWithInjectedErrorPresenter `
+            -GuiPath (Join-Path $projectRoot 'AI-FishBot.GUI.ps1') `
+            -DataRoot $dataRoot -MarkerPath $selfTestMarker -SelfTest
+        Assert-True -Condition ($selfTest.ExitCode -ne 0)
+        Assert-Equal -Expected $false -Actual (Test-Path -LiteralPath $selfTestMarker)
     }
     finally { Remove-IntegrationDirectory $root }
 }
