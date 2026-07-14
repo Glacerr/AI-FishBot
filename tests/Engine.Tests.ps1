@@ -2005,6 +2005,155 @@ Test-Case 'notification failures are logged and never prevent a clean stop or di
     }
 }
 
+Test-Case 'an explicit false focus result stops the loop before a cast key and still cleans up' {
+    $adapter = New-SimulatedAdapter
+    $capturedContext = $adapter.Context
+    $signal = @{ Stop = $false }
+    $capturedSignal = $signal
+    $adapter.FocusWindow = ({
+            [void]$capturedContext.Events.Add('focus')
+            $true
+            $false
+            $true
+        }.GetNewClosure())
+    $adapter.SendKey = ({
+            param($key)
+            [void]$capturedContext.Events.Add(('key:{0}' -f $key))
+            $capturedSignal.Stop = $true
+        }.GetNewClosure())
+    $reader = ({
+            param($engineState)
+            if ($capturedSignal.Stop) { return [pscustomobject]@{ command = 'stop' } }
+            return $null
+        }.GetNewClosure())
+    $config = New-EngineConfig -Values @{
+        useWindowFocus = $true
+        enableNotifications = $true
+        notifyOnStart = $true
+        notifyOnStop = $true
+        discordWebhook = 'https://discord.com/api/webhooks/123/focus-false-cleanup-token'
+    }
+    $state = $null
+    try {
+        $state = New-EngineTestState -Config $config -Adapter $adapter -ControlReader $reader
+
+        Start-AIFishBotEngineLoop -State $state | Out-Null
+
+        Assert-Equal -Expected 'error' -Actual $state.State
+        Assert-Equal -Expected $true -Actual $state.StopRequested
+        Assert-Equal -Expected 0 -Actual (Get-EventCount -Adapter $adapter -Event 'key:F6')
+        Assert-Equal -Expected @('notify:start', 'sleep:200', 'focus', 'notify:stop') `
+            -Actual @($adapter.Context.Events)
+        Assert-Equal -Expected 1 -Actual $adapter.Context.DisposeCount
+        Assert-True -Condition ($state.LastError -like '*game window*key*skipped*')
+    }
+    finally {
+        Remove-EngineTestState -State $state
+    }
+}
+
+Test-Case 'an explicit false focus result blocks both bite and buff keys' {
+    $adapter = New-SimulatedAdapter
+    $capturedContext = $adapter.Context
+    $adapter.FocusWindow = ({
+            [void]$capturedContext.Events.Add('focus')
+            return $false
+        }.GetNewClosure())
+    $biteConfig = New-EngineConfig -Values @{ useWindowFocus = $true }
+    $biteState = $null
+    $buffState = $null
+    try {
+        $biteState = New-EngineTestState -Config $biteConfig -Adapter $adapter
+        Assert-Throws -ScriptBlock { Invoke-AIFishBotBiteSequence -State $biteState } `
+            -MessageLike '*game window*key*skipped*'
+        Assert-Equal -Expected 0 -Actual (Get-EventCount -Adapter $adapter -Event 'key:F7')
+        Assert-Equal -Expected 0 -Actual (Get-EventCount -Adapter $adapter -Event 'key:F6')
+        Assert-Equal -Expected 0 -Actual $biteState.HookCount
+
+        $adapter.Context.Events.Clear()
+        $buffConfig = New-EngineConfig -Values @{
+            useWindowFocus = $true
+            buffs = @([pscustomobject]@{
+                    enabled = $true; name = 'focus guard'; keybind = 'F9'
+                    castTimeSeconds = 1; durationMinutes = 10
+                })
+        }
+        $buffState = New-EngineTestState -Config $buffConfig -Adapter $adapter
+        Assert-Throws -ScriptBlock { Invoke-AIFishBotBuffCheck -State $buffState } `
+            -MessageLike '*game window*key*skipped*'
+        Assert-Equal -Expected 0 -Actual (Get-EventCount -Adapter $adapter -Event 'key:F9')
+    }
+    finally {
+        Remove-EngineTestState -State $biteState
+        Remove-EngineTestState -State $buffState
+    }
+}
+
+Test-Case 'a thrown focus failure is masked before the loop records its error' {
+    $adapter = New-SimulatedAdapter
+    $capturedContext = $adapter.Context
+    $secret = 'private-focus-throw-token'
+    $adapter.FocusWindow = ({
+            [void]$capturedContext.Events.Add('focus')
+            throw 'focus failed at https://discord.com/api/webhooks/999/private-focus-throw-token'
+        }.GetNewClosure())
+    $config = New-EngineConfig -Values @{ useWindowFocus = $true }
+    $state = $null
+    try {
+        $state = New-EngineTestState -Config $config -Adapter $adapter
+
+        Start-AIFishBotEngineLoop -State $state | Out-Null
+
+        Assert-Equal -Expected 'error' -Actual $state.State
+        Assert-Equal -Expected 0 -Actual (Get-EventCount -Adapter $adapter -Event 'key:F6')
+        Assert-Equal -Expected 1 -Actual $adapter.Context.DisposeCount
+        Assert-True -Condition ($state.LastError -like '*game window*key*skipped*')
+        Assert-True -Condition (-not $state.LastError.Contains($secret))
+        Assert-True -Condition ($state.LastError -like '*https://discord.com/api/webhooks/***')
+        $logPath = Join-Path -Path $state.RunDirectory -ChildPath 'logs\2026-07-13.log'
+        $logText = [System.IO.File]::ReadAllText($logPath)
+        Assert-True -Condition (-not $logText.Contains($secret))
+    }
+    finally {
+        Remove-EngineTestState -State $state
+    }
+}
+
+Test-Case 'legacy void focus explicit success and disabled focus preserve fishing key behavior' {
+    $states = New-Object 'System.Collections.Generic.List[object]'
+    try {
+        $legacyAdapter = New-SimulatedAdapter
+        $legacyState = New-EngineTestState -Config (New-EngineConfig -Values @{ useWindowFocus = $true }) `
+            -Adapter $legacyAdapter
+        [void]$states.Add($legacyState)
+        Assert-Equal -Expected $true -Actual (Invoke-AIFishBotCast -State $legacyState)
+        Assert-Equal -Expected @('sleep:200', 'focus', 'key:F6') -Actual @($legacyAdapter.Context.Events)
+
+        $successAdapter = New-SimulatedAdapter
+        $successContext = $successAdapter.Context
+        $successAdapter.FocusWindow = ({
+                [void]$successContext.Events.Add('focus')
+                return $true
+            }.GetNewClosure())
+        $successState = New-EngineTestState -Config (New-EngineConfig -Values @{ useWindowFocus = $true }) `
+            -Adapter $successAdapter
+        [void]$states.Add($successState)
+        Assert-Equal -Expected $true -Actual (Invoke-AIFishBotCast -State $successState)
+        Assert-Equal -Expected @('sleep:200', 'focus', 'key:F6') -Actual @($successAdapter.Context.Events)
+
+        $disabledAdapter = New-SimulatedAdapter
+        $disabledAdapter.FocusWindow = { throw 'focus must stay disabled' }
+        $disabledState = New-EngineTestState -Config (New-EngineConfig -Values @{ useWindowFocus = $false }) `
+            -Adapter $disabledAdapter
+        [void]$states.Add($disabledState)
+        Assert-Equal -Expected $true -Actual (Invoke-AIFishBotCast -State $disabledState)
+        Assert-Equal -Expected @('sleep:200', 'key:F6') -Actual @($disabledAdapter.Context.Events)
+    }
+    finally {
+        foreach ($state in $states) { Remove-EngineTestState -State $state }
+    }
+}
+
 Test-Case 'unexpected audio failure ends in error and disposes the adapter exactly once' {
     $adapter = New-SimulatedAdapter -ThrowOnReadPeak
     $state = $null

@@ -177,6 +177,7 @@ function New-ControllerForTest {
         [scriptblock]$ConfirmExitProvider = { param($running) 'Continue' },
         [scriptblock]$ProfileNameProvider = { param($action, $currentName, $suggestedName) $suggestedName },
         [scriptblock]$ForceStopper = { param($id) },
+        [scriptblock]$MessageProvider = { param($message, $title) },
         [scriptblock]$DependencyInstaller,
         [scriptblock]$LogOpener,
         [switch]$Simulation
@@ -198,6 +199,7 @@ function New-ControllerForTest {
         ConfirmExitProvider = $ConfirmExitProvider
         ProfileNameProvider = $ProfileNameProvider
         ForceStopper = $ForceStopper
+        MessageProvider = $MessageProvider
         AvailablePortsProvider = { @('COM7') }
     }
     if ($PSBoundParameters.ContainsKey('DependencyInstaller')) {
@@ -928,6 +930,154 @@ Test-Case 'Start saves then reports a missing dependency without starting or ins
         Assert-True -Condition (Test-Path -LiteralPath (Join-Path $root 'profiles\依赖方案.json'))
     }
     finally { Remove-ControllerTestDirectory $root; Remove-Variable starterCalls -Scope Script -ErrorAction SilentlyContinue }
+}
+
+Test-Case 'Start button presents a missing audio dependency with an install direction' {
+    $root = New-TestDirectory
+    try {
+        $view = New-ControllerFakeView
+        $messages = New-Object 'System.Collections.Generic.List[string]'
+        $capturedMessages = $messages
+        $controller = New-ControllerForTest -View $view -Root $root `
+            -DependencyChecker { [pscustomobject]@{ Status = 'Missing'; IsAvailable = $false } } `
+            -MessageProvider {
+                param($message, $title)
+                [void]$capturedMessages.Add([string]$message)
+            }
+        Set-AIFishBotViewFromConfig -Controller $controller `
+            -Config (New-ControllerTestConfig -Name '按钮缺少依赖方案') | Out-Null
+
+        $view.Controls.StartStopButton.InvokeEvent('Click')
+
+        Assert-Equal -Expected 1 -Actual $messages.Count
+        Assert-True -Condition ($messages[0] -like '*缺少声音组件*基础*安装声音组件*')
+        Assert-Equal -Expected $messages[0] -Actual $view.Controls.SaveStateLabel.Text
+        Assert-Equal -Expected $false -Actual $controller.IsRunning
+    }
+    finally { Remove-ControllerTestDirectory $root }
+}
+
+Test-Case 'Tray Start presents a masked process failure' {
+    $root = New-TestDirectory
+    try {
+        $view = New-ControllerFakeView
+        $messages = New-Object 'System.Collections.Generic.List[string]'
+        $capturedMessages = $messages
+        $secret = 'private-tray-start-token'
+        $controller = New-ControllerForTest -View $view -Root $root `
+            -ProcessStarter {
+                param($request)
+                throw '模拟进程启动失败 https://discord.com/api/webhooks/999/private-tray-start-token'
+            } `
+            -MessageProvider {
+                param($message, $title)
+                [void]$capturedMessages.Add([string]$message)
+            }
+        Set-AIFishBotViewFromConfig -Controller $controller `
+            -Config (New-ControllerTestConfig -Name '托盘失败方案') | Out-Null
+
+        $view.TrayMenu.ByName.StartItem.InvokeEvent('Click')
+
+        Assert-Equal -Expected 1 -Actual $messages.Count
+        Assert-True -Condition ($messages[0] -like '*模拟进程启动失败*')
+        Assert-True -Condition (-not $messages[0].Contains($secret))
+        Assert-True -Condition ($messages[0] -like '*https://discord.com/api/webhooks/***')
+        Assert-Equal -Expected $messages[0] -Actual $view.Controls.SaveStateLabel.Text
+        Assert-Equal -Expected $false -Actual $controller.IsRunning
+    }
+    finally { Remove-ControllerTestDirectory $root }
+}
+
+Test-Case 'A successful Start click stays silent' {
+    $root = New-TestDirectory
+    try {
+        $view = New-ControllerFakeView
+        $script:successfulStartMessages = 0
+        $controller = New-ControllerForTest -View $view -Root $root `
+            -ProcessStarter { param($request) [pscustomobject]@{ Id = 5432 } } `
+            -MessageProvider { param($message, $title) $script:successfulStartMessages += 1 }
+        Set-AIFishBotViewFromConfig -Controller $controller `
+            -Config (New-ControllerTestConfig -Name '安静成功方案') | Out-Null
+
+        $view.Controls.StartStopButton.InvokeEvent('Click')
+
+        Assert-Equal -Expected $true -Actual $controller.IsRunning
+        Assert-Equal -Expected 0 -Actual $script:successfulStartMessages
+    }
+    finally {
+        Remove-ControllerTestDirectory $root
+        Remove-Variable successfulStartMessages -Scope Script -ErrorAction SilentlyContinue
+    }
+}
+
+Test-Case 'A failing MessageProvider cannot break a Start click' {
+    $root = New-TestDirectory
+    try {
+        $view = New-ControllerFakeView
+        $script:failingMessageProviderCalls = 0
+        $controller = New-ControllerForTest -View $view -Root $root `
+            -DependencyChecker { [pscustomobject]@{ Status = 'Missing'; IsAvailable = $false } } `
+            -MessageProvider {
+                param($message, $title)
+                $script:failingMessageProviderCalls += 1
+                throw '模拟消息窗口失败'
+            }
+        Set-AIFishBotViewFromConfig -Controller $controller `
+            -Config (New-ControllerTestConfig -Name '消息失败方案') | Out-Null
+
+        $view.Controls.StartStopButton.InvokeEvent('Click')
+
+        Assert-Equal -Expected 1 -Actual $script:failingMessageProviderCalls
+        Assert-True -Condition ($view.Controls.SaveStateLabel.Text -like '*缺少声音组件*')
+        Assert-Equal -Expected $false -Actual $controller.IsRunning
+    }
+    finally {
+        Remove-ControllerTestDirectory $root
+        Remove-Variable failingMessageProviderCalls -Scope Script -ErrorAction SilentlyContinue
+    }
+}
+
+Test-Case 'An unverified background disables both Start entries until it clears' {
+    $root = New-TestDirectory
+    try {
+        $view = New-ControllerFakeView
+        $script:unverifiedProcessExists = $true
+        $controller = New-ControllerForTest -View $view -Root $root -ProcessLookup {
+            param($id)
+            if ($script:unverifiedProcessExists) {
+                [pscustomobject]@{ Id = $id; StartTime = [datetime]'2026-07-13T01:59:00Z' }
+            }
+        }
+        Set-AIFishBotViewFromConfig -Controller $controller `
+            -Config (New-ControllerTestConfig -Name '入口锁定方案') | Out-Null
+        Assert-Equal -Expected $true -Actual $view.Controls.StartStopButton.Enabled
+        Assert-Equal -Expected $true -Actual $view.TrayMenu.ByName.StartItem.Enabled
+
+        & (Get-Module 'AI-FishBot.Controller') {
+            param($innerController)
+            [void](Set-AIFishBotUnverifiedBackground -Controller $innerController -Reservation ([pscustomobject]@{
+                        Pid = 3456
+                        RunDirectory = (Join-Path $innerController.RuntimeRoot 'unverified-run')
+                        Error = '身份无法核对'
+                    }))
+        } $controller
+
+        Assert-Equal -Expected $false -Actual $view.Controls.StartStopButton.Enabled
+        Assert-Equal -Expected $false -Actual $view.TrayMenu.ByName.StartItem.Enabled
+        $script:unverifiedProcessExists = $false
+        & (Get-Module 'AI-FishBot.Controller') {
+            param($innerController)
+            Update-AIFishBotUnverifiedBackground -Controller $innerController | Out-Null
+        } $controller
+
+        Assert-Equal -Expected $null -Actual $controller.UnverifiedBackground
+        Assert-Equal -Expected $true -Actual $view.Controls.StartStopButton.Enabled
+        Assert-Equal -Expected $true -Actual $view.TrayMenu.ByName.StartItem.Enabled
+    }
+    finally {
+        Remove-ControllerTestDirectory $root
+        Remove-Variable unverifiedProcessExists -Scope Script -ErrorAction SilentlyContinue
+    }
 }
 
 Test-Case 'Start writes snapshots and passes safely quoted Chinese paths to hidden Windows PowerShell' {

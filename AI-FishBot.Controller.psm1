@@ -92,6 +92,54 @@ function Format-AIFishBotControllerError {
     return '{0}：{1}' -f $Prefix, $safeMessage
 }
 
+function Present-AIFishBotStartResult {
+    param(
+        [Parameter(Mandatory = $true)]$Controller,
+        [AllowNull()]$Result
+    )
+
+    if ($null -eq $Result -or
+        [bool](Get-AIFishBotObjectPropertyValue $Result 'Success' $false)) {
+        return $Result
+    }
+
+    $requiresDependency = [bool](Get-AIFishBotObjectPropertyValue `
+            $Result 'RequiresDependencyInstall' $false)
+    $messagePrefix = ''
+    if ($requiresDependency) {
+        $message = '缺少声音组件。请到“基础”页点击“安装声音组件”。'
+        $tabs = Get-AIFishBotControllerControl -Controller $Controller -Name 'MainTabs'
+        if ($null -eq $tabs) {
+            $tabs = Get-AIFishBotControllerControl -Controller $Controller -Name 'TabControl'
+        }
+        if ($null -ne $tabs -and $null -ne $tabs.PSObject.Properties['TabPages']) {
+            $basicPage = @($tabs.TabPages | Where-Object { [string]$_.Text -eq '基础' } |
+                    Select-Object -First 1)
+            if ($basicPage.Count -gt 0 -and $null -ne $tabs.PSObject.Properties['SelectedTab']) {
+                $tabs.SelectedTab = $basicPage[0]
+            }
+        }
+    }
+    else {
+        $message = [string](Get-AIFishBotObjectPropertyValue $Result 'Error' '')
+        if ($null -ne (Get-AIFishBotObjectPropertyValue $Result 'Validation' $null)) {
+            $messagePrefix = '配置错误'
+        }
+        if ([string]::IsNullOrWhiteSpace($message)) {
+            $message = if ([bool](Get-AIFishBotObjectPropertyValue $Result 'AlreadyRunning' $false)) {
+                '已有钓鱼任务正在运行。'
+            }
+            else { '启动失败。' }
+        }
+    }
+    $message = Format-AIFishBotControllerError -Message $message -Prefix $messagePrefix
+    $saveState = Get-AIFishBotControllerControl -Controller $Controller -Name 'SaveStateLabel'
+    if ($null -ne $saveState) { $saveState.Text = $message }
+    try { & $Controller.MessageProvider $message 'AI-FishBot 警告' | Out-Null }
+    catch { }
+    return $Result
+}
+
 function Get-AIFishBotObjectPropertyValue {
     param([AllowNull()]$InputObject, [string]$Name, $Default = $null)
     if ($null -eq $InputObject) { return $Default }
@@ -355,6 +403,10 @@ function Show-AIFishBotUnverifiedBackground {
     if ($null -ne $saveState) { $saveState.Text = $script:AIFishBotUnverifiedWarning }
     $statusItem = Get-AIFishBotTrayItem $Controller 'StatusItem'
     if ($null -ne $statusItem) { $statusItem.Text = '状态：后台身份待处理' }
+    $startButton = Get-AIFishBotControllerControl $Controller 'StartStopButton'
+    if ($null -ne $startButton) { $startButton.Enabled = $false }
+    $startItem = Get-AIFishBotTrayItem $Controller 'StartItem'
+    if ($null -ne $startItem) { $startItem.Enabled = $false }
     if ($null -ne $Controller.View.Timers.Status) { $Controller.View.Timers.Status.Enabled = $true }
 }
 
@@ -666,8 +718,11 @@ function Test-AIFishBotView {
         elseif ($Controller.IsDirty) { '未保存' }
         else { '已保存' }
     }
+    $canStart = $result.IsValid -and $null -eq $Controller.UnverifiedBackground
     $startButton = Get-AIFishBotControllerControl $Controller 'StartStopButton'
-    if ($null -ne $startButton) { $startButton.Enabled = $Controller.IsRunning -or $result.IsValid }
+    if ($null -ne $startButton) { $startButton.Enabled = $Controller.IsRunning -or $canStart }
+    $startItem = Get-AIFishBotTrayItem $Controller 'StartItem'
+    if ($null -ne $startItem) { $startItem.Enabled = -not $Controller.IsRunning -and $canStart }
     return $result
 }
 
@@ -720,7 +775,9 @@ function Set-AIFishBotRunningState {
     }
     $startItem = Get-AIFishBotTrayItem $Controller 'StartItem'
     $stopItem = Get-AIFishBotTrayItem $Controller 'StopItem'
-    if ($null -ne $startItem) { $startItem.Enabled = -not $Running }
+    if ($null -ne $startItem) {
+        $startItem.Enabled = -not $Running -and $null -eq $Controller.UnverifiedBackground
+    }
     if ($null -ne $stopItem) { $stopItem.Enabled = $Running }
     foreach ($timerName in @('Status', 'Log')) {
         $timerProperty = $Controller.View.Timers.PSObject.Properties[$timerName]
@@ -1747,7 +1804,10 @@ function Bind-AIFishBotControllerEvents {
     Add-AIFishBotEventHandler (Get-AIFishBotControllerControl $Controller 'SaveButton') 'Click' ({ Save-AIFishBotCurrentProfile $Controller | Out-Null }.GetNewClosure()) -Binding $binding
     Add-AIFishBotEventHandler (Get-AIFishBotControllerControl $Controller 'StartStopButton') 'Click' ({
             if ($Controller.IsRunning) { $Controller.BeginStop() | Out-Null }
-            else { Start-AIFishBotRun $Controller | Out-Null }
+            else {
+                $result = Start-AIFishBotRun $Controller
+                $Controller.PresentStartResult($result) | Out-Null
+            }
         }.GetNewClosure()) -Binding $binding
     Add-AIFishBotEventHandler (Get-AIFishBotControllerControl $Controller 'NewProfileButton') 'Click' ({ $Controller.NewProfile() | Out-Null }.GetNewClosure()) -Binding $binding
     Add-AIFishBotEventHandler (Get-AIFishBotControllerControl $Controller 'CopyProfileButton') 'Click' ({ $Controller.CopyProfile() | Out-Null }.GetNewClosure()) -Binding $binding
@@ -1766,7 +1826,10 @@ function Bind-AIFishBotControllerEvents {
         }.GetNewClosure()) -Binding $binding
     Add-AIFishBotEventHandler (Get-AIFishBotTrayItem $Controller 'OpenItem') 'Click' ({ $Controller.OpenView() }.GetNewClosure()) -Binding $binding
     Add-AIFishBotEventHandler $Controller.View.TrayIcon 'DoubleClick' ({ $Controller.OpenView() }.GetNewClosure()) -Binding $binding
-    Add-AIFishBotEventHandler (Get-AIFishBotTrayItem $Controller 'StartItem') 'Click' ({ Start-AIFishBotRun $Controller | Out-Null }.GetNewClosure()) -Binding $binding
+    Add-AIFishBotEventHandler (Get-AIFishBotTrayItem $Controller 'StartItem') 'Click' ({
+            $result = Start-AIFishBotRun $Controller
+            $Controller.PresentStartResult($result) | Out-Null
+        }.GetNewClosure()) -Binding $binding
     Add-AIFishBotEventHandler (Get-AIFishBotTrayItem $Controller 'StopItem') 'Click' ({ $Controller.BeginStop() | Out-Null }.GetNewClosure()) -Binding $binding
     Add-AIFishBotEventHandler (Get-AIFishBotTrayItem $Controller 'ExitItem') 'Click' ({ $Controller.ExitApplication() | Out-Null }.GetNewClosure()) -Binding $binding
     Add-AIFishBotEventHandler $Controller.View.Form 'Resize' ({
@@ -1822,6 +1885,15 @@ function New-AIFishBotController {
         [scriptblock]$ConfirmExitProvider = { param($Running, $Unverified) 'Continue' },
         [scriptblock]$ProfileNameProvider = { param($Action, $CurrentName, $SuggestedName) $SuggestedName },
         [scriptblock]$ForceStopper = { param($ProcessId) Stop-Process -Id $ProcessId -Force -ErrorAction Stop },
+        [scriptblock]$MessageProvider = {
+            param($Message, $Title)
+            Add-Type -AssemblyName System.Windows.Forms
+            [System.Windows.Forms.MessageBox]::Show(
+                [string]$Message,
+                [string]$Title,
+                [System.Windows.Forms.MessageBoxButtons]::OK,
+                [System.Windows.Forms.MessageBoxIcon]::Warning) | Out-Null
+        },
         [scriptblock]$AvailablePortsProvider = { Get-AIFishBotControllerAvailablePorts },
         [ValidateRange(0.1, 3600)][double]$HeartbeatMaxAgeSeconds = 5,
         [ValidateRange(1, 60000)][int]$PollIntervalMilliseconds = 100,
@@ -1851,6 +1923,7 @@ function New-AIFishBotController {
         ConfirmExitProvider = $ConfirmExitProvider
         ProfileNameProvider = $ProfileNameProvider
         ForceStopper = $ForceStopper
+        MessageProvider = $MessageProvider
         AvailablePortsProvider = $AvailablePortsProvider
         HeartbeatMaxAgeSeconds = $HeartbeatMaxAgeSeconds
         PollIntervalMilliseconds = $PollIntervalMilliseconds
@@ -1894,6 +1967,10 @@ function New-AIFishBotController {
     }
     $controller | Add-Member -MemberType ScriptMethod -Name InstallAudio -Value {
         Invoke-AIFishBotDependencyInstall -Controller $this
+    }
+    $controller | Add-Member -MemberType ScriptMethod -Name PresentStartResult -Value {
+        param($Result)
+        Present-AIFishBotStartResult -Controller $this -Result $Result
     }
     $controller | Add-Member -MemberType ScriptMethod -Name ClearLog -Value {
         Clear-AIFishBotViewLog -Controller $this

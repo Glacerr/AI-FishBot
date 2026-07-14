@@ -242,7 +242,33 @@ function Invoke-AIFishBotEngineFocus {
         [object]$State
     )
 
-    Invoke-AIFishBotAdapterMember -Adapter $State.Adapter -Name 'FocusWindow' | Out-Null
+    try {
+        $focusValues = @(
+            Invoke-AIFishBotAdapterMember -Adapter $State.Adapter -Name 'FocusWindow'
+        )
+    }
+    catch {
+        $safeDetail = Protect-AIFishBotSecret -Text $_.Exception.Message
+        throw ('Unable to confirm the game window; the key was skipped. Focus failed: {0}' -f
+            $safeDetail)
+    }
+    foreach ($focusValue in $focusValues) {
+        if ($focusValue -is [bool] -and -not [bool]$focusValue) {
+            return $false
+        }
+    }
+    return $true
+}
+
+function Assert-AIFishBotEngineFocusForKey {
+    param(
+        [Parameter(Mandatory = $true)]
+        [object]$State
+    )
+
+    if (-not (Invoke-AIFishBotEngineFocus -State $State)) {
+        throw 'Unable to confirm the game window; the key was skipped because focus returned false.'
+    }
 }
 
 function Invoke-AIFishBotEngineKey {
@@ -686,15 +712,7 @@ function Invoke-AIFishBotStop {
         $sendLogoutKey = $true
         if ([bool]$State.LockedConfig.useWindowFocus) {
             try {
-                $focusValues = @(
-                    Invoke-AIFishBotAdapterMember -Adapter $State.Adapter -Name 'FocusWindow'
-                )
-                foreach ($focusValue in $focusValues) {
-                    if ($focusValue -is [bool] -and -not [bool]$focusValue) {
-                        $sendLogoutKey = $false
-                        break
-                    }
-                }
+                $sendLogoutKey = Invoke-AIFishBotEngineFocus -State $State
                 if (-not $sendLogoutKey) {
                     Write-AIFishBotEngineLog -State $State -Level Warning `
                         -Message 'Logout key skipped because window focus returned false.'
@@ -805,7 +823,7 @@ function Invoke-AIFishBotCastAttempt {
         if (-not (Test-AIFishBotEngineCheckpoint -State $State)) {
             return $false
         }
-        Invoke-AIFishBotEngineFocus -State $State
+        Assert-AIFishBotEngineFocusForKey -State $State
     }
     if (-not (Test-AIFishBotEngineCheckpoint -State $State)) {
         return $false
@@ -902,7 +920,7 @@ function Invoke-AIFishBotBiteSequence {
         if (-not (Test-AIFishBotEngineCheckpoint -State $State)) {
             return $false
         }
-        Invoke-AIFishBotEngineFocus -State $State
+        Assert-AIFishBotEngineFocusForKey -State $State
     }
     if (-not (Test-AIFishBotEngineCheckpoint -State $State)) {
         return $false
@@ -1071,7 +1089,7 @@ function Invoke-AIFishBotBuffCheck {
         }
         Set-AIFishBotEngineStateValue -State $State -Value 'casting'
         if ([bool]$State.LockedConfig.useWindowFocus) {
-            Invoke-AIFishBotEngineFocus -State $State
+            Assert-AIFishBotEngineFocusForKey -State $State
         }
         Invoke-AIFishBotEngineKey -State $State -Key ([string]$scheduled.Keybind)
         $castMilliseconds = Get-AIFishBotEngineDelay -State $State `
