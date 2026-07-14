@@ -666,7 +666,14 @@ function Read-AIFishBotStatus {
     )
 
     $path = Join-Path -Path ([System.IO.Path]::GetFullPath($RunDirectory)) -ChildPath 'status.json'
-    return ConvertTo-AIFishBotStatusObject -Status (Read-AIFishBotJson -Path $path)
+    $status = Read-AIFishBotJson -Path $path
+    $audioPeakFound = $false
+    [void](Get-AIFishBotProtocolValue -InputObject $status -Name 'audioPeak' `
+            -Found ([ref]$audioPeakFound))
+    if (-not $audioPeakFound) {
+        $status | Add-Member -MemberType NoteProperty -Name 'audioPeak' -Value ([double]0)
+    }
+    return ConvertTo-AIFishBotStatusObject -Status $status
 }
 
 function ConvertTo-AIFishBotControlObject {

@@ -1078,6 +1078,75 @@ Test-Case 'Resume keeps an identity-matched run with an expired heartbeat and bl
     }
 }
 
+Test-Case 'Real hidden view resumes an exact legacy status without audioPeak and blocks a duplicate start' {
+    $root = New-TestDirectory
+    $view = $null
+    try {
+        Import-Module (Join-Path -Path (Split-Path -Path $PSScriptRoot -Parent) `
+                -ChildPath 'AI-FishBot.UI.psm1') -Force
+        $view = New-AIFishBotMainView
+        $now = [datetimeoffset]'2026-07-13T10:01:00+08:00'
+        $processStart = [datetimeoffset]'2026-07-13T10:00:00.1234567+08:00'
+        $run = New-AIFishBotRunDirectory -RuntimeRoot (Join-Path $root 'runtime') `
+            -StartConfig (New-ControllerTestConfig) -LiveConfig ([pscustomobject]@{ configVersion = 1 })
+        $legacyStatus = [pscustomobject][ordered]@{
+            processId = 1566; state = 'ready'; hookCount = 2; retryCount = 1
+            profileName = '中文 方案'; startedAt = $processStart.ToString('o')
+            processStartedAt = $processStart.ToString('o'); remainingSeconds = 60
+            lastError = $null; heartbeatAt = $now.ToString('o'); configVersion = 1
+        }
+        Write-AIFishBotAtomicJson -Path (Join-Path $run 'status.json') `
+            -InputObject $legacyStatus | Out-Null
+        $state = [pscustomobject]@{ StarterCalls = 0 }
+        $controller = New-ControllerForTest -View $view -Root $root `
+            -StatusReader { param($path) Read-AIFishBotStatus -RunDirectory $path } `
+            -Clock { $now } `
+            -ProcessLookup {
+                param($id)
+                if ($id -eq 1566) {
+                    [pscustomobject]@{ Id = $id; StartTime = $processStart.UtcDateTime }
+                }
+            } `
+            -ProcessStarter { param($request) $state.StarterCalls += 1 }
+        Set-AIFishBotViewFromConfig -Controller $controller -Config (New-ControllerTestConfig) | Out-Null
+        Write-AIFishBotAtomicJson -Path $controller.ActiveMarkerPath -InputObject ([pscustomobject]@{
+                runDirectory = $run; processId = 1566
+                processStartedAt = $processStart.ToString('o')
+            }) | Out-Null
+
+        $resume = Resume-AIFishBotRun -Controller $controller
+
+        Assert-Equal -Expected $true -Actual $resume.Success
+        Assert-Equal -Expected $true -Actual $controller.IsRunning
+        Assert-Equal -Expected $null -Actual $controller.UnverifiedBackground
+        Assert-Equal -Expected ([double]0) -Actual $view.Controls.AudioPeakBar.Value
+        Assert-True -Condition (Test-Path -LiteralPath $controller.ActiveMarkerPath -PathType Leaf)
+
+        $secondController = New-ControllerForTest -View (New-ControllerFakeView) -Root $root `
+            -StatusReader { param($path) Read-AIFishBotStatus -RunDirectory $path } `
+            -Clock { $now } `
+            -ProcessLookup {
+                param($id)
+                if ($id -eq 1566) {
+                    [pscustomobject]@{ Id = $id; StartTime = $processStart.UtcDateTime }
+                }
+            } `
+            -ProcessStarter { param($request) $state.StarterCalls += 1 }
+        Set-AIFishBotViewFromConfig -Controller $secondController -Config (New-ControllerTestConfig) | Out-Null
+
+        $start = Start-AIFishBotRun -Controller $secondController
+
+        Assert-Equal -Expected $false -Actual $start.Success
+        Assert-Equal -Expected $true -Actual $start.AlreadyRunning
+        Assert-Equal -Expected 0 -Actual $state.StarterCalls
+        Assert-True -Condition (Test-Path -LiteralPath $controller.ActiveMarkerPath -PathType Leaf)
+    }
+    finally {
+        if ($null -ne $view) { $view.Dispose() }
+        Remove-ControllerTestDirectory $root
+    }
+}
+
 Test-Case 'Force stop accepts an expired heartbeat only after the process start time matches' {
     $root = New-TestDirectory
     try {

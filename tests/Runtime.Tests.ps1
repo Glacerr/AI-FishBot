@@ -447,6 +447,27 @@ Test-Case 'status round trip contains exactly the fixed protocol fields' {
     }
 }
 
+Test-Case 'legacy status without audioPeak reads as zero and keeps exact process identity' {
+    $runDirectory = New-TestDirectory
+    try {
+        $legacyStatus = New-RuntimeStatus
+        $expectedProcessStartedAt = '2026-07-13T03:29:58.1234567+00:00'
+        $legacyStatus.processStartedAt = $expectedProcessStartedAt
+        $legacyStatus.PSObject.Properties.Remove('audioPeak')
+        Write-AIFishBotAtomicJson -Path (Join-Path $runDirectory 'status.json') `
+            -InputObject $legacyStatus | Out-Null
+
+        $actual = Read-AIFishBotStatus -RunDirectory $runDirectory
+
+        Assert-Equal -Expected ([double]0) -Actual $actual.audioPeak
+        Assert-Equal -Expected ([double]) -Actual $actual.audioPeak.GetType()
+        Assert-Equal -Expected $expectedProcessStartedAt -Actual $actual.processStartedAt
+    }
+    finally {
+        Remove-RuntimeTestDirectory -Path $runDirectory
+    }
+}
+
 Test-Case 'status replacement is atomic and keeps a backup' {
     $runDirectory = New-TestDirectory
     try {

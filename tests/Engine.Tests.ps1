@@ -222,23 +222,22 @@ Test-Case 'engine state keeps locked and live snapshots with runtime counters' {
     }
 }
 
-Test-Case 'a valid injected peak is kept and written by the next engine heartbeat' {
-    $adapter = New-SimulatedAdapter -Peaks @([double]47.25)
+Test-Case 'a below-threshold peak is written by the natural retry heartbeat without stopping' {
+    $adapter = New-SimulatedAdapter -Peaks @([double]4.75, [double]5)
     $config = New-EngineConfig -Values @{
         useWeakAura = $true
         fishingRetries = 2
-        audioSensitivity = 3
+        audioSensitivity = 5
     }
     $state = $null
     try {
         $state = New-EngineTestState -Config $config -Adapter $adapter
 
         Assert-Equal -Expected $true -Actual (Invoke-AIFishBotCast -State $state)
-        Assert-Equal -Expected ([double]47.25) -Actual $state.AudioPeak
-
-        Invoke-AIFishBotStop -State $state | Out-Null
         $status = Read-AIFishBotStatus -RunDirectory $state.RunDirectory
-        Assert-Equal -Expected ([double]47.25) -Actual $status.audioPeak
+        Assert-Equal -Expected ([double]4.75) -Actual $status.audioPeak
+        Assert-Equal -Expected $false -Actual $state.StopRequested
+        Assert-Equal -Expected 'casting' -Actual $status.state
     }
     finally {
         Remove-EngineTestState -State $state
