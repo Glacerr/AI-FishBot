@@ -68,7 +68,8 @@ function New-ControllerFakeView {
             'BobberKey', 'LogoutKey', 'UseWindowFocus', 'UseWeakAura', 'FishingRetries', 'UsePi',
             'PicoComPort', 'BuffGrid', 'AddBuffButton', 'RemoveBuffButton', 'MoveBuffUpButton',
             'MoveBuffDownButton', 'EnableNotifications', 'NotifyOnStart', 'NotifyOnStop',
-            'WebhookText', 'LogBox')) {
+            'WebhookText', 'InstallAudioButton', 'LogLevel', 'ClearLogButton', 'OpenLogButton',
+            'LogBox')) {
         $controls[$name] = New-ControllerFakeControl -Value 0
         $controls[$name].Name = $name
     }
@@ -175,16 +176,38 @@ function New-ControllerForTest {
         [scriptblock]$ConfirmProvider = { param($purpose) $true },
         [scriptblock]$ConfirmExitProvider = { param($running) 'Continue' },
         [scriptblock]$ProfileNameProvider = { param($action, $currentName, $suggestedName) $suggestedName },
-        [scriptblock]$ForceStopper = { param($id) }
+        [scriptblock]$ForceStopper = { param($id) },
+        [scriptblock]$DependencyInstaller,
+        [scriptblock]$LogOpener,
+        [switch]$Simulation
     )
     $profiles = Join-Path $Root 'profiles'
     $runtime = Join-Path $Root 'runtime'
-    New-AIFishBotController -View $View -ProfilesDirectory $profiles -RuntimeRoot $runtime `
-        -EngineScriptPath 'C:\测试 目录\AI-FishBot.Engine.ps1' -DependencyChecker $DependencyChecker `
-        -ProcessStarter $ProcessStarter -ProcessLookup $ProcessLookup -StatusReader $StatusReader `
-        -Clock $Clock -Sleeper $Sleeper -ConfirmProvider $ConfirmProvider `
-        -ConfirmExitProvider $ConfirmExitProvider -ProfileNameProvider $ProfileNameProvider `
-        -ForceStopper $ForceStopper -AvailablePortsProvider { @('COM7') }
+    $controllerParameters = @{
+        View = $View
+        ProfilesDirectory = $profiles
+        RuntimeRoot = $runtime
+        EngineScriptPath = 'C:\测试 目录\AI-FishBot.Engine.ps1'
+        DependencyChecker = $DependencyChecker
+        ProcessStarter = $ProcessStarter
+        ProcessLookup = $ProcessLookup
+        StatusReader = $StatusReader
+        Clock = $Clock
+        Sleeper = $Sleeper
+        ConfirmProvider = $ConfirmProvider
+        ConfirmExitProvider = $ConfirmExitProvider
+        ProfileNameProvider = $ProfileNameProvider
+        ForceStopper = $ForceStopper
+        AvailablePortsProvider = { @('COM7') }
+    }
+    if ($PSBoundParameters.ContainsKey('DependencyInstaller')) {
+        $controllerParameters.DependencyInstaller = $DependencyInstaller
+    }
+    if ($PSBoundParameters.ContainsKey('LogOpener')) {
+        $controllerParameters.LogOpener = $LogOpener
+    }
+    if ($Simulation) { $controllerParameters.Simulation = $true }
+    New-AIFishBotController @controllerParameters
 }
 
 function Remove-ControllerTestDirectory {
@@ -564,6 +587,149 @@ Test-Case 'Start writes snapshots and passes safely quoted Chinese paths to hidd
         Assert-True -Condition ($null -eq $live.PSObject.Properties['retail'])
     }
     finally { Remove-ControllerTestDirectory $root; Remove-Variable startRequest -Scope Script -ErrorAction SilentlyContinue }
+}
+
+Test-Case 'Simulation mode is passed only to the engine child process request' {
+    $root = New-TestDirectory
+    try {
+        $view = New-ControllerFakeView
+        $script:simulationRequest = $null
+        $controller = New-ControllerForTest -View $view -Root $root -Simulation -ProcessStarter {
+            param($request)
+            $script:simulationRequest = $request
+            [pscustomobject]@{ Id = 4322; StartTime = [datetime]'2026-07-13T01:59:00Z' }
+        }
+        Set-AIFishBotViewFromConfig -Controller $controller -Config (New-ControllerTestConfig -Name '模拟启动方案')
+
+        $result = Start-AIFishBotRun -Controller $controller
+
+        Assert-Equal -Expected $true -Actual $result.Success
+        Assert-True -Condition ($script:simulationRequest.ArgumentList -match '(?:^|\s)-Simulation(?:\s|$)')
+
+        $normalView = New-ControllerFakeView
+        $script:normalRequest = $null
+        $normalRoot = Join-Path $root 'normal'
+        $normal = New-ControllerForTest -View $normalView -Root $normalRoot -ProcessStarter {
+            param($request)
+            $script:normalRequest = $request
+            [pscustomobject]@{ Id = 4323; StartTime = [datetime]'2026-07-13T01:59:01Z' }
+        }
+        Set-AIFishBotViewFromConfig -Controller $normal -Config (New-ControllerTestConfig -Name '普通启动方案')
+        Assert-Equal -Expected $true -Actual (Start-AIFishBotRun -Controller $normal).Success
+        Assert-Equal -Expected $false -Actual ($script:normalRequest.ArgumentList -match '(?:^|\s)-Simulation(?:\s|$)')
+    }
+    finally {
+        Remove-ControllerTestDirectory $root
+        Remove-Variable simulationRequest -Scope Script -ErrorAction SilentlyContinue
+        Remove-Variable normalRequest -Scope Script -ErrorAction SilentlyContinue
+    }
+}
+
+Test-Case 'audio dependency installation runs only after the user clicks its button' {
+    $root = New-TestDirectory
+    try {
+        $view = New-ControllerFakeView
+        $script:installCalls = 0
+        $controller = New-ControllerForTest -View $view -Root $root -DependencyInstaller {
+            $script:installCalls += 1
+            [pscustomobject]@{ Success = $true; Summary = '模拟安装完成。'; Details = '' }
+        }
+
+        Assert-Equal -Expected 0 -Actual $script:installCalls
+        Assert-True -Condition ($null -eq $controller.LastDependencyInstallResult)
+
+        $view.Controls.InstallAudioButton.InvokeEvent('Click')
+
+        Assert-Equal -Expected 1 -Actual $script:installCalls
+        Assert-Equal -Expected $true -Actual $controller.LastDependencyInstallResult.Success
+        Assert-Equal -Expected '模拟安装完成。' -Actual $view.Controls.InstallAudioButton.Text
+    }
+    finally {
+        Remove-ControllerTestDirectory $root
+        Remove-Variable installCalls -Scope Script -ErrorAction SilentlyContinue
+    }
+}
+
+Test-Case 'log toolbar buttons clear the view and open only the isolated run log folder' {
+    $root = New-TestDirectory
+    try {
+        $view = New-ControllerFakeView
+        $script:openedLogPath = $null
+        $controller = New-ControllerForTest -View $view -Root $root -LogOpener {
+            param($path)
+            $script:openedLogPath = $path
+        }
+        $run = Join-Path $root 'runtime\run-test'
+        $logs = Join-Path $run 'logs'
+        New-Item -ItemType Directory -Path $logs -Force | Out-Null
+        $controller.CurrentRunDirectory = $run
+        $controller.RawLogHistory = 'old line'
+        $view.Controls.LogBox.Text = 'old line'
+
+        $view.Controls.ClearLogButton.InvokeEvent('Click')
+        Assert-Equal -Expected '' -Actual $controller.RawLogHistory
+        Assert-Equal -Expected '' -Actual $view.Controls.LogBox.Text
+
+        $view.Controls.OpenLogButton.InvokeEvent('Click')
+        Assert-Equal -Expected ([IO.Path]::GetFullPath($logs)) -Actual $script:openedLogPath
+
+        $controller.CurrentRunDirectory = $null
+        $script:openedLogPath = $null
+        $view.Controls.OpenLogButton.InvokeEvent('Click')
+        Assert-Equal -Expected ([IO.Path]::GetFullPath((Join-Path $root 'logs'))) -Actual $script:openedLogPath
+    }
+    finally {
+        Remove-ControllerTestDirectory $root
+        Remove-Variable openedLogPath -Scope Script -ErrorAction SilentlyContinue
+    }
+}
+
+Test-Case 'clearing a polled log keeps old lines hidden while allowing later lines to appear' {
+    $root = New-TestDirectory
+    try {
+        $view = New-ControllerFakeView
+        $controller = New-ControllerForTest -View $view -Root $root
+        $run = New-AIFishBotRunDirectory -RuntimeRoot (Join-Path $root 'runtime') `
+            -StartConfig (New-ControllerTestConfig) -LiveConfig ([pscustomobject]@{ configVersion = 1 })
+        $controller.CurrentRunDirectory = $run
+        Write-AIFishBotLog -RunDirectory $run -Level INFO -Message 'old line' | Out-Null
+        Update-AIFishBotViewLog -Controller $controller | Out-Null
+
+        $view.Controls.ClearLogButton.InvokeEvent('Click')
+        Update-AIFishBotViewLog -Controller $controller | Out-Null
+        Assert-Equal -Expected '' -Actual $view.Controls.LogBox.Text
+
+        Write-AIFishBotLog -RunDirectory $run -Level ERROR -Message 'new line' | Out-Null
+        Update-AIFishBotViewLog -Controller $controller | Out-Null
+        Assert-True -Condition ($view.Controls.LogBox.Text -like '*new line*')
+        Assert-Equal -Expected $false -Actual ($view.Controls.LogBox.Text -like '*old line*')
+    }
+    finally { Remove-ControllerTestDirectory $root }
+}
+
+Test-Case 'log level selection filters existing lines and can restore the complete view' {
+    $root = New-TestDirectory
+    try {
+        $view = New-ControllerFakeView
+        $controller = New-ControllerForTest -View $view -Root $root
+        $content = "2026-07-14T10:00:00+08:00 [INFO] info line`n" +
+            "2026-07-14T10:00:01+08:00 [WARNING] warn line`n" +
+            '2026-07-14T10:00:02+08:00 [ERROR] error line'
+        Update-AIFishBotViewLog -Controller $controller -Content $content | Out-Null
+
+        $view.Controls.LogLevel.SelectedItem = '错误'
+        $view.Controls.LogLevel.InvokeEvent('SelectedIndexChanged')
+        Assert-True -Condition ($view.Controls.LogBox.Text -like '*error line*')
+        Assert-Equal -Expected $false -Actual ($view.Controls.LogBox.Text -like '*info line*')
+        Assert-Equal -Expected $false -Actual ($view.Controls.LogBox.Text -like '*warn line*')
+
+        $view.Controls.LogLevel.SelectedItem = '全部'
+        $view.Controls.LogLevel.InvokeEvent('SelectedIndexChanged')
+        Assert-True -Condition ($view.Controls.LogBox.Text -like '*info line*')
+        Assert-True -Condition ($view.Controls.LogBox.Text -like '*warn line*')
+        Assert-True -Condition ($view.Controls.LogBox.Text -like '*error line*')
+    }
+    finally { Remove-ControllerTestDirectory $root }
 }
 
 Test-Case 'A starter failure rolls back the new run directory and running state' {

@@ -706,6 +706,64 @@ function Clear-AIFishBotActiveMarker {
     }
 }
 
+function Invoke-AIFishBotDependencyInstall {
+    param([Parameter(Mandatory = $true)]$Controller)
+
+    $button = Get-AIFishBotControllerControl $Controller 'InstallAudioButton'
+    if ($null -ne $button) { $button.Enabled = $false }
+    try {
+        $outputs = @(& $Controller.DependencyInstaller)
+        if ($outputs.Count -ne 1 -or $null -eq $outputs[0]) {
+            throw '声音组件安装没有返回有效结果。'
+        }
+        $result = $outputs[0]
+    }
+    catch {
+        $result = [pscustomobject]@{
+            Success = $false
+            Summary = '声音组件安装失败。'
+            Details = $_.Exception.Message
+        }
+    }
+    finally {
+        if ($null -ne $button) { $button.Enabled = $true }
+    }
+
+    $Controller.LastDependencyInstallResult = $result
+    if ($null -ne $button -and $null -ne $result.PSObject.Properties['Summary'] -and
+        -not [string]::IsNullOrWhiteSpace([string]$result.Summary)) {
+        $button.Text = [string]$result.Summary
+    }
+    return $result
+}
+
+function Clear-AIFishBotViewLog {
+    param([Parameter(Mandatory = $true)]$Controller)
+
+    try { [void](Read-AIFishBotControllerLogDelta -Controller $Controller) }
+    catch { }
+    $Controller.RawLogHistory = ''
+    $Controller.LastLogSourceLength = 0
+    $Controller.LastLogSourceTail = ''
+    $logBox = Get-AIFishBotControllerControl $Controller 'LogBox'
+    if ($null -ne $logBox) { $logBox.Text = '' }
+}
+
+function Open-AIFishBotLogDirectory {
+    param([Parameter(Mandatory = $true)]$Controller)
+
+    $basePath = if ([string]::IsNullOrWhiteSpace($Controller.CurrentRunDirectory)) {
+        $Controller.DataRoot
+    }
+    else { $Controller.CurrentRunDirectory }
+    $logsPath = [IO.Path]::GetFullPath((Join-Path $basePath 'logs'))
+    if (-not [IO.Directory]::Exists($logsPath)) {
+        [void][IO.Directory]::CreateDirectory($logsPath)
+    }
+    & $Controller.LogOpener $logsPath | Out-Null
+    return $logsPath
+}
+
 function Start-AIFishBotRun {
     [CmdletBinding()]
     param([Parameter(Mandatory = $true)]$Controller)
@@ -757,6 +815,7 @@ function Start-AIFishBotRun {
             $arguments = '-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File {0} -RunDirectory {1}' -f `
                 (ConvertTo-AIFishBotQuotedArgument $Controller.EngineScriptPath),
                 (ConvertTo-AIFishBotQuotedArgument $runDirectory)
+            if ($Controller.Simulation) { $arguments += ' -Simulation' }
             $request = [pscustomobject][ordered]@{
                 FilePath = $powershellPath
                 Arguments = $arguments
@@ -1178,6 +1237,17 @@ function Update-AIFishBotViewLog {
     if ($null -eq $logBox) { return $safeText }
     $displayText = $safeText -replace "`r`n", "`n" -replace "`r", "`n"
     if ($displayText.EndsWith("`n")) { $displayText = $displayText.Substring(0, $displayText.Length - 1) }
+    $logLevelControl = Get-AIFishBotControllerControl $Controller 'LogLevel'
+    $selectedLogLevel = if ($null -eq $logLevelControl) { '全部' } else { [string]$logLevelControl.SelectedItem }
+    $levelPattern = switch ($selectedLogLevel) {
+        '信息' { '\[INFO\]' }
+        '警告' { '\[(?:WARN|WARNING)\]' }
+        '错误' { '\[ERROR\]' }
+        default { $null }
+    }
+    if ($null -ne $levelPattern -and -not [string]::IsNullOrEmpty($displayText)) {
+        $displayText = @($displayText -split "`n" | Where-Object { $_ -match $levelPattern }) -join "`n"
+    }
     $logBox.Text = $displayText -replace "`n", [Environment]::NewLine
     if ($null -ne $logBox.PSObject.Properties['SelectionStart'] -and
         $null -ne $logBox.PSObject.Properties['TextLength']) {
@@ -1304,6 +1374,10 @@ function Bind-AIFishBotControllerEvents {
     Add-AIFishBotEventHandler (Get-AIFishBotControllerControl $Controller 'CopyProfileButton') 'Click' ({ $Controller.CopyProfile() | Out-Null }.GetNewClosure()) -Binding $binding
     Add-AIFishBotEventHandler (Get-AIFishBotControllerControl $Controller 'RenameProfileButton') 'Click' ({ $Controller.RenameProfile() | Out-Null }.GetNewClosure()) -Binding $binding
     Add-AIFishBotEventHandler (Get-AIFishBotControllerControl $Controller 'DeleteProfileButton') 'Click' ({ $Controller.DeleteProfile() | Out-Null }.GetNewClosure()) -Binding $binding
+    Add-AIFishBotEventHandler (Get-AIFishBotControllerControl $Controller 'InstallAudioButton') 'Click' ({ $Controller.InstallAudio() | Out-Null }.GetNewClosure()) -Binding $binding
+    Add-AIFishBotEventHandler (Get-AIFishBotControllerControl $Controller 'ClearLogButton') 'Click' ({ $Controller.ClearLog() }.GetNewClosure()) -Binding $binding
+    Add-AIFishBotEventHandler (Get-AIFishBotControllerControl $Controller 'OpenLogButton') 'Click' ({ $Controller.OpenLog() | Out-Null }.GetNewClosure()) -Binding $binding
+    Add-AIFishBotEventHandler (Get-AIFishBotControllerControl $Controller 'LogLevel') 'SelectedIndexChanged' ({ Update-AIFishBotViewLog $Controller -Content '' | Out-Null }.GetNewClosure()) -Binding $binding
     Add-AIFishBotEventHandler (Get-AIFishBotControllerControl $Controller 'ProfileSelector') 'SelectedIndexChanged' ({
             if (-not $Controller.SuppressDirty) {
                 $selected = [string](Get-AIFishBotControllerControl $Controller 'ProfileSelector').SelectedItem
@@ -1348,6 +1422,11 @@ function New-AIFishBotController {
         [Parameter(Mandatory = $true)][string]$RuntimeRoot,
         [string]$EngineScriptPath = (Join-Path $PSScriptRoot 'AI-FishBot.Engine.ps1'),
         [scriptblock]$DependencyChecker = { Test-AIFishBotAudioDependency },
+        [scriptblock]$DependencyInstaller = { Install-AIFishBotAudioDependency },
+        [scriptblock]$LogOpener = {
+            param($Path)
+            Start-Process -FilePath 'explorer.exe' -ArgumentList ('"{0}"' -f ($Path -replace '"', '\"'))
+        },
         [scriptblock]$ProcessStarter = {
             param($Request)
             Start-Process -FilePath $Request.FilePath -ArgumentList $Request.ArgumentList -WindowStyle Hidden -PassThru
@@ -1363,7 +1442,8 @@ function New-AIFishBotController {
         [scriptblock]$AvailablePortsProvider = { Get-AIFishBotControllerAvailablePorts },
         [ValidateRange(0.1, 3600)][double]$HeartbeatMaxAgeSeconds = 5,
         [ValidateRange(1, 60000)][int]$PollIntervalMilliseconds = 100,
-        [ValidateRange(0, 3600)][double]$StopTimeoutSeconds = 10
+        [ValidateRange(0, 3600)][double]$StopTimeoutSeconds = 10,
+        [switch]$Simulation
     )
     $profilesPath = [System.IO.Path]::GetFullPath($ProfilesDirectory)
     $runtimePath = [System.IO.Path]::GetFullPath($RuntimeRoot)
@@ -1377,6 +1457,8 @@ function New-AIFishBotController {
         ActiveMarkerPath = (Join-Path $runtimePath 'active-run.json')
         EngineScriptPath = [System.IO.Path]::GetFullPath($EngineScriptPath)
         DependencyChecker = $DependencyChecker
+        DependencyInstaller = $DependencyInstaller
+        LogOpener = $LogOpener
         ProcessStarter = $ProcessStarter
         ProcessLookup = $ProcessLookup
         StatusReader = $StatusReader
@@ -1390,6 +1472,7 @@ function New-AIFishBotController {
         HeartbeatMaxAgeSeconds = $HeartbeatMaxAgeSeconds
         PollIntervalMilliseconds = $PollIntervalMilliseconds
         StopTimeoutSeconds = $StopTimeoutSeconds
+        Simulation = [bool]$Simulation
         MarkerProcessStartToleranceSeconds = 2.0
         LegacyProcessStartToleranceSeconds = 30.0
         CurrentProfileName = ''
@@ -1415,6 +1498,7 @@ function New-AIFishBotController {
         LastLogByteSignature = ''
         RawLogHistory = ''
         Binding = $null
+        LastDependencyInstallResult = $null
     }
     $controller | Add-Member -MemberType ScriptMethod -Name MarkDirty -Value {
         if (-not $this.SuppressDirty) { Set-AIFishBotSaveState -Controller $this -Dirty $true }
@@ -1425,6 +1509,15 @@ function New-AIFishBotController {
     }
     $controller | Add-Member -MemberType ScriptMethod -Name OpenView -Value {
         Open-AIFishBotView -Controller $this
+    }
+    $controller | Add-Member -MemberType ScriptMethod -Name InstallAudio -Value {
+        Invoke-AIFishBotDependencyInstall -Controller $this
+    }
+    $controller | Add-Member -MemberType ScriptMethod -Name ClearLog -Value {
+        Clear-AIFishBotViewLog -Controller $this
+    }
+    $controller | Add-Member -MemberType ScriptMethod -Name OpenLog -Value {
+        Open-AIFishBotLogDirectory -Controller $this
     }
     $controller | Add-Member -MemberType ScriptMethod -Name ExitApplication -Value {
         Invoke-AIFishBotExit -Controller $this
