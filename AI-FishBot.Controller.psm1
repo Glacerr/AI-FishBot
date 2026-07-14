@@ -743,12 +743,7 @@ function Save-AIFishBotCurrentProfile {
     $Controller.CurrentProfileName = [string]$saved.profileName
     if ($Controller.IsRunning) {
         try {
-            if ($null -ne $Controller.LiveConfigWriter) {
-                [void](& $Controller.LiveConfigWriter $Controller $config)
-            }
-            else {
-                [void](Write-AIFishBotControllerLiveConfig $Controller $config)
-            }
+            [void](Write-AIFishBotControllerLiveConfig $Controller $config)
         }
         catch {
             $safeDetail = Protect-AIFishBotSecret -Text ([string]$_.Exception.Message)
@@ -1794,8 +1789,7 @@ function New-AIFishBotController {
         [ValidateRange(0.1, 3600)][double]$HeartbeatMaxAgeSeconds = 5,
         [ValidateRange(1, 60000)][int]$PollIntervalMilliseconds = 100,
         [ValidateRange(0, 3600)][double]$StopTimeoutSeconds = 10,
-        [switch]$Simulation,
-        [scriptblock]$LiveConfigWriter
+        [switch]$Simulation
     )
     $profilesPath = [System.IO.Path]::GetFullPath($ProfilesDirectory)
     $runtimePath = [System.IO.Path]::GetFullPath($RuntimeRoot)
@@ -1810,7 +1804,6 @@ function New-AIFishBotController {
         EngineScriptPath = [System.IO.Path]::GetFullPath($EngineScriptPath)
         DependencyChecker = $DependencyChecker
         DependencyInstaller = $DependencyInstaller
-        LiveConfigWriter = $LiveConfigWriter
         LogOpener = $LogOpener
         ProcessStarter = $ProcessStarter
         ProcessLookup = $ProcessLookup
@@ -1964,7 +1957,10 @@ function New-AIFishBotController {
         }
 
         $originalView = Get-AIFishBotConfigFromView -Controller $this
+        $originalDirty = [bool]$this.IsDirty
         $originalSaved = $null
+        $profiles = @()
+        $viewChanged = $false
         try {
             $originalSaved = Read-AIFishBotProfile -ProfilesDirectory $this.ProfilesDirectory `
                 -ProfileName $this.CurrentProfileName
@@ -1974,26 +1970,47 @@ function New-AIFishBotController {
                 -AvailablePorts @(& $this.AvailablePortsProvider)
             if (-not $validation.IsValid) { throw '默认配置未通过验证。' }
 
+            $profiles = @(Get-AIFishBotProfiles $this.ProfilesDirectory)
+            $viewChanged = $true
+            Set-AIFishBotViewFromConfig -Controller $this -Config $defaults | Out-Null
+            Set-AIFishBotProfileItems -Controller $this -Profiles $profiles
+            $viewValidation = Test-AIFishBotView -Controller $this
+            if (-not $viewValidation.IsValid) { throw '默认配置界面未通过验证。' }
+
             $saved = Save-AIFishBotProfile -ProfilesDirectory $this.ProfilesDirectory `
                 -Config $defaults
-            try {
-                Set-AIFishBotViewFromConfig -Controller $this -Config $saved | Out-Null
-                Set-AIFishBotProfileItems -Controller $this `
-                    -Profiles @(Get-AIFishBotProfiles $this.ProfilesDirectory)
-            }
-            catch {
-                Save-AIFishBotProfile -ProfilesDirectory $this.ProfilesDirectory `
-                    -Config $originalSaved | Out-Null
-                Set-AIFishBotViewFromConfig -Controller $this -Config $originalView | Out-Null
-                throw
-            }
             return [pscustomobject]@{ Success = $true; Config = $saved }
         }
         catch {
-            $message = '恢复默认失败，原方案未更改。'
+            $viewRestored = $true
+            if ($viewChanged) {
+                try {
+                    Set-AIFishBotViewFromConfig -Controller $this -Config $originalView | Out-Null
+                    Set-AIFishBotProfileItems -Controller $this -Profiles $profiles
+                    $this.CurrentConfig = Copy-AIFishBotControllerObject $originalSaved
+                    $this.CurrentProfileName = [string]$originalSaved.profileName
+                    Set-AIFishBotSaveState -Controller $this -Dirty $originalDirty
+                }
+                catch {
+                    $viewRestored = $false
+                    try { Set-AIFishBotProfileItems -Controller $this -Profiles $profiles } catch { }
+                    try { Set-AIFishBotSaveState -Controller $this -Dirty $true } catch { }
+                }
+            }
+            $message = if ($viewRestored) {
+                '恢复默认失败，方案文件未更改，界面已恢复。'
+            }
+            else {
+                '恢复默认失败，方案文件未更改；界面未能完全恢复，请重新载入方案。'
+            }
             $saveState = Get-AIFishBotControllerControl -Controller $this -Name 'SaveStateLabel'
             if ($null -ne $saveState) { $saveState.Text = $message }
-            return [pscustomobject]@{ Success = $false; Error = $message }
+            return [pscustomobject]@{
+                Success = $false
+                ProfileFileChanged = $false
+                ViewRestored = $viewRestored
+                Error = $message
+            }
         }
     }
     $controller | Add-Member -MemberType ScriptMethod -Name DeleteProfile -Value {

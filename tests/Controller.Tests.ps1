@@ -179,7 +179,6 @@ function New-ControllerForTest {
         [scriptblock]$ForceStopper = { param($id) },
         [scriptblock]$DependencyInstaller,
         [scriptblock]$LogOpener,
-        [scriptblock]$LiveConfigWriter,
         [switch]$Simulation
     )
     $profiles = Join-Path $Root 'profiles'
@@ -206,9 +205,6 @@ function New-ControllerForTest {
     }
     if ($PSBoundParameters.ContainsKey('LogOpener')) {
         $controllerParameters.LogOpener = $LogOpener
-    }
-    if ($PSBoundParameters.ContainsKey('LiveConfigWriter')) {
-        $controllerParameters.LiveConfigWriter = $LiveConfigWriter
     }
     if ($Simulation) { $controllerParameters.Simulation = $true }
     New-AIFishBotController @controllerParameters
@@ -296,6 +292,7 @@ Test-Case 'Controller exports its public commands' {
     foreach ($name in $expected) {
         Assert-True -Condition ($actual -contains $name)
     }
+    Assert-True -Condition (-not (Get-Command New-AIFishBotController).Parameters.ContainsKey('LiveConfigWriter'))
 }
 
 Test-Case 'Controller owns a resolvable default serial-port provider' {
@@ -552,6 +549,103 @@ Test-Case 'Failed reset preserves the original profile and current view without 
     }
 }
 
+Test-Case 'Reset prepares the complete view before touching the profile file' {
+    $root = New-TestDirectory
+    try {
+        $view = New-ControllerFakeView
+        $controller = New-ControllerForTest -View $view -Root $root `
+            -ConfirmProvider { param($purpose) $purpose -eq 'ResetProfile' }
+        $config = New-ControllerTestConfig -Name '界面失败方案'
+        Set-AIFishBotViewFromConfig -Controller $controller -Config $config
+        Save-AIFishBotCurrentProfile -Controller $controller | Out-Null
+        $view.Controls.AutoStopTime.Value = 44
+        $controller.MarkDirty()
+        $profilePath = Get-AIFishBotProfilePath -ProfilesDirectory (Join-Path $root 'profiles') `
+            -ProfileName '界面失败方案'
+        $backupPath = $profilePath + '.backup'
+        $fileBefore = Get-Content -LiteralPath $profilePath -Raw
+        $viewBefore = Get-AIFishBotConfigFromView $controller | ConvertTo-Json -Depth 20 -Compress
+
+        $control = $view.Controls.AutoStopTime
+        $failingValue = @{ Value = $control.Value; RemainingFailures = 1 }
+        $getter = { return $failingValue.Value }.GetNewClosure()
+        $setter = {
+            param($value)
+            if ($failingValue.RemainingFailures -gt 0) {
+                $failingValue.RemainingFailures -= 1
+                throw 'simulated view application failure'
+            }
+            $failingValue.Value = $value
+        }.GetNewClosure()
+        $control.PSObject.Properties.Remove('Value')
+        $control | Add-Member -MemberType ScriptProperty -Name Value -Value $getter -SecondValue $setter
+
+        $result = $controller.ResetProfile()
+
+        Assert-Equal -Expected $false -Actual $result.Success
+        Assert-Equal -Expected $fileBefore -Actual (Get-Content -LiteralPath $profilePath -Raw)
+        Assert-Equal -Expected $false -Actual (Test-Path -LiteralPath $backupPath)
+        Assert-Equal -Expected $viewBefore `
+            -Actual (Get-AIFishBotConfigFromView $controller | ConvertTo-Json -Depth 20 -Compress)
+        Assert-Equal -Expected $true -Actual $controller.IsDirty
+    }
+    finally { Remove-ControllerTestDirectory $root }
+}
+
+Test-Case 'Reset reports file preservation separately when view recovery also fails' {
+    $root = New-TestDirectory
+    $lock = $null
+    try {
+        $view = New-ControllerFakeView
+        $controller = New-ControllerForTest -View $view -Root $root `
+            -ConfirmProvider { param($purpose) $purpose -eq 'ResetProfile' }
+        $config = New-ControllerTestConfig -Name '双重失败方案'
+        Set-AIFishBotViewFromConfig -Controller $controller -Config $config
+        Save-AIFishBotCurrentProfile -Controller $controller | Out-Null
+        $controller.MarkDirty()
+        $profilePath = Get-AIFishBotProfilePath -ProfilesDirectory (Join-Path $root 'profiles') `
+            -ProfileName '双重失败方案'
+        $fileBefore = Get-Content -LiteralPath $profilePath -Raw
+        $viewBefore = Get-AIFishBotConfigFromView $controller | ConvertTo-Json -Depth 20 -Compress
+
+        $control = $view.Controls.AutoStopTime
+        $failingValue = @{ Value = $control.Value; OriginalValue = $control.Value }
+        $getter = { return $failingValue.Value }.GetNewClosure()
+        $setter = {
+            param($value)
+            if ($value -eq $failingValue.OriginalValue -and
+                $failingValue.Value -ne $failingValue.OriginalValue) {
+                throw 'simulated view recovery failure'
+            }
+            $failingValue.Value = $value
+        }.GetNewClosure()
+        $control.PSObject.Properties.Remove('Value')
+        $control | Add-Member -MemberType ScriptProperty -Name Value -Value $getter -SecondValue $setter
+        $lock = [System.IO.File]::Open(
+            $profilePath,
+            [System.IO.FileMode]::Open,
+            [System.IO.FileAccess]::Read,
+            [System.IO.FileShare]::Read)
+
+        $result = $controller.ResetProfile()
+        $lock.Dispose()
+        $lock = $null
+
+        Assert-Equal -Expected $false -Actual $result.Success
+        Assert-Equal -Expected $false -Actual $result.ProfileFileChanged
+        Assert-Equal -Expected $false -Actual $result.ViewRestored
+        Assert-True -Condition ($result.Error -like '*方案文件未更改*')
+        Assert-True -Condition ($result.Error -like '*界面未能完全恢复*')
+        Assert-Equal -Expected $fileBefore -Actual (Get-Content -LiteralPath $profilePath -Raw)
+        Assert-True -Condition ($viewBefore -ne `
+                (Get-AIFishBotConfigFromView $controller | ConvertTo-Json -Depth 20 -Compress))
+    }
+    finally {
+        if ($null -ne $lock) { $lock.Dispose() }
+        Remove-ControllerTestDirectory $root
+    }
+}
+
 Test-Case 'Running edits remain unsaved until Save writes one new live version' {
     $root = New-TestDirectory
     try {
@@ -606,13 +700,11 @@ Test-Case 'Running Save reports when profile persistence succeeds but live persi
 
 Test-Case 'Running live-config failure masks the webhook in the returned error and status bar' {
     $root = New-TestDirectory
+    $lock = $null
     try {
         $view = New-ControllerFakeView
         $script:sensitiveWebhook = 'https://discord.com/api/webhooks/654321/private-live-token'
-        $controller = New-ControllerForTest -View $view -Root $root -LiveConfigWriter {
-            param($controllerState, $configState)
-            throw ('模拟写入失败：{0}' -f $script:sensitiveWebhook)
-        }
+        $controller = New-ControllerForTest -View $view -Root $root
         $config = New-ControllerTestConfig -Name '安全失败方案'
         Set-AIFishBotViewFromConfig -Controller $controller -Config $config
         Save-AIFishBotCurrentProfile -Controller $controller | Out-Null
@@ -622,8 +714,16 @@ Test-Case 'Running live-config failure masks the webhook in the returned error a
         $controller.ConfigVersion = 1
         Set-AIFishBotRunningState -Controller $controller -Running $true
         $view.Controls.WebhookText.Text = $script:sensitiveWebhook
+        $livePath = Join-Path $run 'live-config.json'
+        $lock = [System.IO.File]::Open(
+            $livePath,
+            [System.IO.FileMode]::Open,
+            [System.IO.FileAccess]::Read,
+            [System.IO.FileShare]::Read)
 
         $result = Save-AIFishBotCurrentProfile -Controller $controller
+        $lock.Dispose()
+        $lock = $null
 
         Assert-Equal -Expected $false -Actual $result.Success
         Assert-Equal -Expected $true -Actual $result.ProfileSaved
@@ -633,8 +733,15 @@ Test-Case 'Running live-config failure masks the webhook in the returned error a
             Assert-True -Condition (-not $text.Contains($script:sensitiveWebhook))
             Assert-True -Condition (-not $text.Contains('private-live-token'))
         }
+        Assert-Equal -Expected 1 -Actual (Read-AIFishBotJson -Path $livePath).configVersion
+        Assert-Equal -Expected 0 -Actual @(Get-ChildItem -LiteralPath $run `
+                -Filter 'live-config.json.*.tmp').Count
     }
-    finally { Remove-ControllerTestDirectory $root; Remove-Variable sensitiveWebhook -Scope Script -ErrorAction SilentlyContinue }
+    finally {
+        if ($null -ne $lock) { $lock.Dispose() }
+        Remove-ControllerTestDirectory $root
+        Remove-Variable sensitiveWebhook -Scope Script -ErrorAction SilentlyContinue
+    }
 }
 
 Test-Case 'A real hidden reset button click restores defaults through the controller binding' {
@@ -2377,32 +2484,121 @@ Test-Case 'Resume skips a newer incomplete candidate and restores the older comp
     finally { Remove-ControllerTestDirectory $root }
 }
 
-Test-Case 'Live config versions advance from the file across two stale controllers' {
+Test-Case 'Concurrent controller processes write complete consecutive live config versions' {
     $root = New-TestDirectory
+    $jobs = @()
+    $events = @()
+    $heldMutex = $null
     try {
-        $firstView = New-ControllerFakeView
-        $secondView = New-ControllerFakeView
-        $first = New-ControllerForTest -View $firstView -Root $root
-        $second = New-ControllerForTest -View $secondView -Root $root
         $config = New-ControllerTestConfig -Name '双控制器版本方案'
-        Set-AIFishBotViewFromConfig -Controller $first -Config $config
-        Set-AIFishBotViewFromConfig -Controller $second -Config $config
         $run = New-AIFishBotRunDirectory -RuntimeRoot (Join-Path $root 'runtime') `
             -StartConfig $config -LiveConfig ([pscustomobject]@{ configVersion = 4 })
-        foreach ($controller in @($first, $second)) {
-            $controller.CurrentRunDirectory = $run
-            $controller.ConfigVersion = 4
-            Set-AIFishBotRunningState -Controller $controller -Running $true
+        $id = [guid]::NewGuid().ToString('N')
+        $goName = "Local\AI-FishBot.ControllerVersion.Go.$id"
+        $go = New-Object System.Threading.EventWaitHandle(
+            $false, [System.Threading.EventResetMode]::ManualReset, $goName)
+        $events += $go
+        $readyNames = @()
+        $attemptNames = @()
+        foreach ($index in 1..2) {
+            $readyName = "Local\AI-FishBot.ControllerVersion.Ready.$id.$index"
+            $attemptName = "Local\AI-FishBot.ControllerVersion.Attempt.$id.$index"
+            $readyNames += $readyName
+            $attemptNames += $attemptName
+            $events += New-Object System.Threading.EventWaitHandle(
+                $false, [System.Threading.EventResetMode]::ManualReset, $readyName)
+            $events += New-Object System.Threading.EventWaitHandle(
+                $false, [System.Threading.EventResetMode]::ManualReset, $attemptName)
         }
 
-        Assert-Equal -Expected $true -Actual (Save-AIFishBotCurrentProfile -Controller $first).Success
-        Assert-Equal -Expected 5 -Actual (Read-AIFishBotJson -Path (Join-Path $run 'live-config.json')).configVersion
-        Assert-Equal -Expected $true -Actual (Save-AIFishBotCurrentProfile -Controller $second).Success
+        $controllerModule = Get-Module AI-FishBot.Controller
+        $mutexName = & $controllerModule {
+            param($path)
+            Get-AIFishBotControllerMutexName -Scope 'LiveConfig' -Path $path
+        } $run
+        $heldMutex = New-Object System.Threading.Mutex($false, $mutexName)
+        Assert-True -Condition $heldMutex.WaitOne(5000)
 
-        Assert-Equal -Expected 6 -Actual (Read-AIFishBotJson -Path (Join-Path $run 'live-config.json')).configVersion
-        Assert-Equal -Expected 6 -Actual $second.ConfigVersion
+        foreach ($index in 0..1) {
+            $jobs += Start-Job -ArgumentList @(
+                $controllerModulePath, $run, $config, $readyNames[$index],
+                $goName, $attemptNames[$index]
+            ) -ScriptBlock {
+                param($modulePath, $runDirectory, $configValue, $readyName, $goName, $attemptName)
+                Import-Module $modulePath -Force -ErrorAction Stop
+                $readyEvent = [System.Threading.EventWaitHandle]::OpenExisting($readyName)
+                $goEvent = [System.Threading.EventWaitHandle]::OpenExisting($goName)
+                $attemptEvent = [System.Threading.EventWaitHandle]::OpenExisting($attemptName)
+                try {
+                    [void]$readyEvent.Set()
+                    if (-not $goEvent.WaitOne(5000)) { throw 'concurrent writer start timed out' }
+                    [void]$attemptEvent.Set()
+                    $module = Get-Module AI-FishBot.Controller
+                    & $module {
+                        param($runDirectory, $configValue)
+                        $controller = [pscustomobject]@{
+                            IsRunning = $true
+                            CurrentRunDirectory = $runDirectory
+                            ConfigVersion = 4
+                            AvailablePortsProvider = { @('COM7') }
+                        }
+                        Write-AIFishBotControllerLiveConfig -Controller $controller -Config $configValue
+                    } $runDirectory $configValue
+                }
+                finally {
+                    $readyEvent.Dispose()
+                    $goEvent.Dispose()
+                    $attemptEvent.Dispose()
+                }
+            }
+        }
+
+        Assert-True -Condition $events[1].WaitOne(5000)
+        Assert-True -Condition $events[3].WaitOne(5000)
+        [void]$go.Set()
+        Assert-True -Condition $events[2].WaitOne(5000)
+        Assert-True -Condition $events[4].WaitOne(5000)
+        Assert-Equal -Expected @('Running', 'Running') `
+            -Actual @($jobs | ForEach-Object { [string]$_.State })
+
+        $heldMutex.ReleaseMutex()
+        $heldMutex.Dispose()
+        $heldMutex = $null
+        foreach ($job in $jobs) {
+            Wait-Job -Job $job -Timeout 10 | Out-Null
+            Assert-Equal -Expected 'Completed' -Actual ([string]$job.State)
+        }
+        $written = @($jobs | Receive-Job -ErrorAction Stop)
+        Assert-Equal -Expected @(5, 6) `
+            -Actual @($written.configVersion | Sort-Object)
+
+        $livePath = Join-Path $run 'live-config.json'
+        $live = Read-AIFishBotJson -Path $livePath
+        $expectedFields = @(
+            'audioSensitivity', 'autoLogout', 'autoStop', 'autoStopTime', 'biteResponseMaxSeconds',
+            'biteResponseMinSeconds', 'buffs', 'configVersion', 'discordWebhook', 'enableNotifications',
+            'postHookMaxSeconds', 'postHookMinSeconds', 'preCastMaxSeconds', 'preCastMinSeconds',
+            'preHookMaxSeconds', 'preHookMinSeconds', 'notifyOnStop'
+        ) | Sort-Object
+        Assert-Equal -Expected $expectedFields `
+            -Actual @($live.PSObject.Properties.Name | Sort-Object)
+        Assert-Equal -Expected 6 -Actual $live.configVersion
+        Assert-Equal -Expected '帽子' -Actual $live.buffs[0].name
+        Assert-Equal -Expected 0 -Actual @(Get-ChildItem -LiteralPath $run `
+                -Filter 'live-config.json.*.tmp').Count
     }
-    finally { Remove-ControllerTestDirectory $root }
+    finally {
+        if ($null -ne $heldMutex) {
+            try { $heldMutex.ReleaseMutex() } catch { }
+            $heldMutex.Dispose()
+        }
+        foreach ($job in $jobs) {
+            if ($job.State -eq 'Running') { Stop-Job -Job $job }
+            Remove-Job -Job $job -Force -ErrorAction SilentlyContinue
+        }
+        foreach ($event in $events) { $event.Dispose() }
+        Remove-ControllerTestDirectory $root
+    }
 }
 
 Test-Case 'Controller leaves shutdown and task-manager closes uncancelled' {

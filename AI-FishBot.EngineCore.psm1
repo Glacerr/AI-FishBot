@@ -723,6 +723,7 @@ function Test-AIFishBotEngineCheckpoint {
             $command = Get-AIFishBotEngineProperty -InputObject $controlValues[0] -Name 'command' `
                 -Found ([ref]$commandFound)
             if ($commandFound -and [string]$command -ieq 'stop') {
+                [void](Update-AIFishBotLiveConfig -State $State)
                 Invoke-AIFishBotStop -State $State -Reason 'control command' | Out-Null
                 return $false
             }

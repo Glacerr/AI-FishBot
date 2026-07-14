@@ -1652,6 +1652,92 @@ Test-Case 'a running webhook update changes only the later stop notification add
     }
 }
 
+Test-Case 'stop control reloads a live config written while the command is read' {
+    $adapter = New-SimulatedAdapter
+    $oldWebhook = 'https://discord.com/api/webhooks/123/old-control-token'
+    $newWebhook = 'https://discord.com/api/webhooks/456/new-control-token'
+    $config = New-EngineConfig -Values @{
+        enableNotifications = $true
+        notifyOnStart = $true
+        notifyOnStop = $true
+        discordWebhook = $oldWebhook
+    }
+    $updated = Copy-EngineConfig -Config $config
+    $updated.discordWebhook = $newWebhook
+    $updated | Add-Member -NotePropertyName configVersion -NotePropertyValue 1
+    $loader = {
+        param($state)
+        $path = Join-Path -Path $state.RunDirectory -ChildPath 'live-config.json'
+        if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return $null }
+        $live = Read-AIFishBotJson -Path $path
+        return [pscustomobject]@{ ConfigVersion = $live.configVersion; Config = $live }
+    }
+    $reader = {
+        param($state)
+        Write-AIFishBotAtomicJson -Path (Join-Path $state.RunDirectory 'live-config.json') `
+            -InputObject $updated | Out-Null
+        return [pscustomobject]@{ command = 'stop' }
+    }.GetNewClosure()
+    $state = $null
+    try {
+        $state = New-EngineTestState -Config $config -Adapter $adapter `
+            -LiveConfigLoader $loader -ControlReader $reader
+
+        Start-AIFishBotEngineLoop -State $state | Out-Null
+
+        Assert-Equal -Expected @('start', 'stop') -Actual @($adapter.Context.Notifications.EventName)
+        Assert-Equal -Expected @($oldWebhook, $newWebhook) -Actual @($adapter.Context.Notifications.Webhook)
+        Assert-Equal -Expected 1 -Actual (Get-EventCount -Adapter $adapter -Event 'notify:start')
+        Assert-Equal -Expected 1 -Actual (Get-EventCount -Adapter $adapter -Event 'notify:stop')
+    }
+    finally {
+        Remove-EngineTestState -State $state
+    }
+}
+
+Test-Case 'failed stop-time live reload keeps the last config and masks its warning' {
+    $adapter = New-SimulatedAdapter
+    $webhook = 'https://discord.com/api/webhooks/123/kept-control-token'
+    $config = New-EngineConfig -Values @{
+        enableNotifications = $true
+        notifyOnStart = $true
+        notifyOnStop = $true
+        discordWebhook = $webhook
+    }
+    $loadState = @{ Fail = $false }
+    $capturedLoadState = $loadState
+    $loader = {
+        param($state)
+        if ($capturedLoadState.Fail) {
+            throw 'failed to read https://discord.com/api/webhooks/999/private-load-token'
+        }
+        return $null
+    }.GetNewClosure()
+    $reader = {
+        param($state)
+        $capturedLoadState.Fail = $true
+        return [pscustomobject]@{ command = 'stop' }
+    }.GetNewClosure()
+    $state = $null
+    try {
+        $state = New-EngineTestState -Config $config -Adapter $adapter `
+            -LiveConfigLoader $loader -ControlReader $reader
+
+        Start-AIFishBotEngineLoop -State $state | Out-Null
+
+        Assert-Equal -Expected @($webhook, $webhook) -Actual @($adapter.Context.Notifications.Webhook)
+        Assert-Equal -Expected 0 -Actual $state.ConfigVersion
+        $logPath = Join-Path -Path $state.RunDirectory -ChildPath 'logs\2026-07-13.log'
+        $logText = [System.IO.File]::ReadAllText($logPath)
+        Assert-True -Condition ($logText -like '*Live config load failed*')
+        Assert-True -Condition (-not $logText.Contains('private-load-token'))
+        Assert-True -Condition ($logText -like '*https://discord.com/api/webhooks/***')
+    }
+    finally {
+        Remove-EngineTestState -State $state
+    }
+}
+
 Test-Case 'stop control follows stopping then stopped without logout' {
     $adapter = New-SimulatedAdapter
     $reader = { param($state) return [pscustomobject]@{ command = 'stop' } }
