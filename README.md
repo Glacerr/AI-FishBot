@@ -12,7 +12,7 @@
 - “基础”“按键与设备”“增益”“通知”“日志”五个分页。
 - 多方案的新建、复制、重命名、删除、切换和保存。
 - 运行中锁定模式、按键、Pico、WeakAura 等不能安全即时切换的设置；声音灵敏度、自动停止、四组等待、增益和停止通知等实时项目仍可编辑，点击保存后在后台的安全时机生效。
-- 四组随机等待的默认范围：咬钩响应 `0.3–0.7` 秒、收杆前 `0.5–0.5` 秒、收杆后 `1.1–1.5` 秒、再次抛竿前 `0.2–0.6` 秒。
+- 四组随机等待的默认范围：咬钩响应 `0.3–0.7` 秒、提竿前 `0.5–0.5` 秒、提竿后 `1.1–1.5` 秒、抛竿前 `0.2–0.6` 秒。
 - 最小化到系统托盘，以及从托盘恢复、开始或停止。
 - 实时状态和日志查看；缺少声音组件时可使用界面中的“安装声音组件”按钮。
 - 原版 `AI-FishBot.ps1` 继续保留。如果新界面不适合当前环境，仍可按下方原有说明配置并启动原脚本。
@@ -21,7 +21,7 @@
 
 ### 三种用法及前置条件
 
-- **普通模式：** 需要 Windows PowerShell、可用的声音输入/输出设置，以及游戏内“钓鱼”和“与目标互动”等按键。未使用 WeakAura 时，还需按下文手动设置声音和软目标互动。
+- **普通模式：** 需要 Windows PowerShell、可用的声音播放/输出设置，以及游戏内“钓鱼”和“与目标互动”等按键。未使用 WeakAura 时，还需按下文手动设置声音和软目标互动。
 - **Raspberry Pi Pico：** 除普通模式所需的游戏设置外，需要已刷入 CircuitPython 的 Pico、下文所述 HID 文件和正确的 COM 端口。Pico 只改变按键的发送方式，不保证规避检测或避免封禁。
 - **WeakAura：** 先从下方链接导入配套 WeakAura，再在方案中启用它。它可辅助判断软目标范围并设置相关游戏选项，经典版本尤其需要；它可以与普通输入或 Pico 配合使用，但同样不提供安全保证。
 
@@ -57,7 +57,7 @@ Using the Raspberry Pi Pico sends keyboard commands through hardware. It may be 
 2. Install CircuitPython on to the Pico.
    - instructions here: [adafruit.com](https://learn.adafruit.com/getting-started-with-raspberry-pi-pico-circuitpython/circuitpython)
 4. Install the CircuitPython HID module on to the Pico:
-   - Copy the 'adadruit_hid' folder in this repo into the 'lib' folder on the Raspberry Pi Pico drive
+   - Copy the 'adafruit_hid' folder in this repo into the 'lib' folder on the Raspberry Pi Pico drive
 5. Copy the 'code.py' file on to the Raspberry Pi Pico drive.
 6. Unplug/replug the Raspberry Pi Pico.
 
