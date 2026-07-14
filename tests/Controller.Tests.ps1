@@ -41,6 +41,12 @@ function New-ControllerFakeControl {
                 }
                 [void]$this.Events[$nameCopy].Add($Handler)
             }.GetNewClosure())
+        $control | Add-Member -MemberType ScriptMethod -Name ('Remove_{0}' -f $eventName) -Value ({
+                param([scriptblock]$Handler)
+                if ($this.Events.ContainsKey($nameCopy)) {
+                    [void]$this.Events[$nameCopy].Remove($Handler)
+                }
+            }.GetNewClosure())
     }
     $control | Add-Member -MemberType ScriptMethod -Name InvokeEvent -Value {
         param([string]$EventName, $EventArgs = $null)
@@ -86,10 +92,22 @@ function New-ControllerFakeView {
                 if (-not $this.Events.ContainsKey($copy)) { $this.Events[$copy] = New-Object System.Collections.ArrayList }
                 [void]$this.Events[$copy].Add($Handler)
             }.GetNewClosure())
+        $form | Add-Member -MemberType ScriptMethod -Name ('Remove_{0}' -f $eventName) -Value ({
+                param([scriptblock]$Handler)
+                if ($this.Events.ContainsKey($copy)) {
+                    [void]$this.Events[$copy].Remove($Handler)
+                }
+            }.GetNewClosure())
     }
     $form | Add-Member -MemberType ScriptMethod -Name Show -Value { $this.Visible = $true }
     $form | Add-Member -MemberType ScriptMethod -Name Hide -Value { $this.Visible = $false }
     $form | Add-Member -MemberType ScriptMethod -Name Activate -Value { $this.WasActivated = $true }
+    $form | Add-Member -MemberType ScriptMethod -Name InvokeEvent -Value {
+        param([string]$EventName, $EventArgs = $null)
+        foreach ($handler in @($this.Events[$EventName])) {
+            & $handler $this $EventArgs
+        }
+    }
 
     $view = [pscustomobject]@{
         Controls = $controls
@@ -147,7 +165,10 @@ function New-ControllerForTest {
         [Parameter(Mandatory = $true)][string]$Root,
         [scriptblock]$DependencyChecker = { [pscustomobject]@{ Status = 'Available'; IsAvailable = $true } },
         [scriptblock]$ProcessStarter = { throw '测试必须注入进程启动器。' },
-        [scriptblock]$ProcessLookup = { param($id) [pscustomobject]@{ Id = $id } },
+        [scriptblock]$ProcessLookup = {
+            param($id)
+            [pscustomobject]@{ Id = $id; StartTime = [datetime]'2026-07-13T01:59:00Z' }
+        },
         [scriptblock]$StatusReader = { param($path) throw '没有状态。' },
         [scriptblock]$Clock = { [datetimeoffset]'2026-07-13T10:00:00+08:00' },
         [scriptblock]$Sleeper = { param($milliseconds) },
@@ -592,7 +613,10 @@ Test-Case 'Start refuses another valid active run under the runtime root' {
         $runtime = Join-Path $root 'runtime'
         $existing = New-AIFishBotRunDirectory -RuntimeRoot $runtime -StartConfig (New-ControllerTestConfig) -LiveConfig ([pscustomobject]@{ configVersion = 1 })
         $now = [datetimeoffset]'2026-07-13T10:00:00+08:00'
-        $status = [pscustomobject]@{ processId = 90; state = 'ready'; heartbeatAt = $now.ToString('o') }
+        $status = [pscustomobject]@{
+            processId = 90; state = 'ready'; heartbeatAt = $now.ToString('o')
+            startedAt = $now.AddMinutes(-1).ToString('o')
+        }
         $script:starterCalls = 0
         $controller = New-ControllerForTest -View $view -Root $root -StatusReader { param($path) $status } `
             -ProcessStarter { param($request) $script:starterCalls += 1 }
@@ -665,16 +689,22 @@ Test-Case 'Tray Stop force-stops only after injected timeout confirmation' {
         $script:trayNow = [datetimeoffset]'2026-07-13T10:00:00+08:00'
         $script:trayForcedPid = 0
         $controller = New-ControllerForTest -View $view -Root $root `
-            -StatusReader { param($path) [pscustomobject]@{ processId = 334; state = 'stopping'; heartbeatAt = $script:trayNow.ToString('o') } } `
+            -StatusReader { param($path) [pscustomobject]@{
+                    processId = 334; state = 'stopping'; heartbeatAt = $script:trayNow.ToString('o')
+                    startedAt = '2026-07-13T09:59:00+08:00'
+                } } `
             -Clock { $script:trayNow } -Sleeper { param($milliseconds) $script:trayNow = $script:trayNow.AddSeconds(11) } `
             -ConfirmProvider { param($purpose) $purpose -eq 'ForceStop' } `
             -ForceStopper { param($id) $script:trayForcedPid = $id }
         $run = New-AIFishBotRunDirectory -RuntimeRoot (Join-Path $root 'runtime') -StartConfig (New-ControllerTestConfig) -LiveConfig ([pscustomobject]@{ configVersion = 1 })
         $controller.CurrentRunDirectory = $run
         $controller.CurrentProcessId = 334
+        $controller.StopTimeoutSeconds = 0
         Set-AIFishBotRunningState -Controller $controller -Running $true
 
         $view.TrayMenu.ByName.StopItem.InvokeEvent('Click')
+        Assert-Equal -Expected 0 -Actual $script:trayForcedPid
+        $view.Timers.Status.InvokeEvent('Tick')
 
         Assert-Equal -Expected 334 -Actual $script:trayForcedPid
         Assert-Equal -Expected $false -Actual $controller.IsRunning
@@ -696,15 +726,20 @@ Test-Case 'Default confirmation refuses a force stop when production wiring omit
             -DependencyChecker { [pscustomobject]@{ Status = 'Available'; IsAvailable = $true } } `
             -ProcessStarter { param($request) throw 'not used' } `
             -ProcessLookup { param($id) [pscustomobject]@{ Id = $id } } `
-            -StatusReader { param($path) [pscustomobject]@{ processId = 335; state = 'stopping'; heartbeatAt = $script:defaultNow.ToString('o') } } `
+            -StatusReader { param($path) [pscustomobject]@{
+                    processId = 335; state = 'stopping'; heartbeatAt = $script:defaultNow.ToString('o')
+                    startedAt = '2026-07-13T09:59:00+08:00'
+                } } `
             -Clock { $script:defaultNow } -Sleeper { param($milliseconds) $script:defaultNow = $script:defaultNow.AddSeconds(11) } `
             -ForceStopper { param($id) $script:defaultForceCalls += 1 } -AvailablePortsProvider { @() }
         $run = New-AIFishBotRunDirectory -RuntimeRoot (Join-Path $root 'runtime') -StartConfig (New-AIFishBotDefaultConfig) -LiveConfig ([pscustomobject]@{ configVersion = 1 })
         $controller.CurrentRunDirectory = $run
         $controller.CurrentProcessId = 335
+        $controller.StopTimeoutSeconds = 0
         Set-AIFishBotRunningState -Controller $controller -Running $true
 
         $view.TrayMenu.ByName.StopItem.InvokeEvent('Click')
+        $view.Timers.Status.InvokeEvent('Tick')
 
         Assert-Equal -Expected 0 -Actual $script:defaultForceCalls
         Assert-Equal -Expected $true -Actual $controller.IsRunning
@@ -720,7 +755,16 @@ Test-Case 'Force stop only runs after an explicit method call' {
     try {
         $view = New-ControllerFakeView
         $script:forcedPid = 0
-        $controller = New-ControllerForTest -View $view -Root $root -ForceStopper { param($id) $script:forcedPid = $id }
+        $now = [datetimeoffset]'2026-07-13T10:00:00+08:00'
+        $controller = New-ControllerForTest -View $view -Root $root `
+            -StatusReader { param($path) [pscustomobject]@{
+                    processId = 444; state = 'stopping'; heartbeatAt = $now.ToString('o')
+                    startedAt = $now.AddMinutes(-1).ToString('o')
+                } } `
+            -ForceStopper { param($id) $script:forcedPid = $id }
+        $run = New-AIFishBotRunDirectory -RuntimeRoot (Join-Path $root 'runtime') `
+            -StartConfig (New-ControllerTestConfig) -LiveConfig ([pscustomobject]@{ configVersion = 1 })
+        $controller.CurrentRunDirectory = $run
         $controller.CurrentProcessId = 444
         Set-AIFishBotRunningState -Controller $controller -Running $true
 
@@ -809,9 +853,15 @@ Test-Case 'Resume falls back from a stale marker to another valid run' {
         $controller = New-ControllerForTest -View $view -Root $root -StatusReader {
             param($path)
             if ([System.IO.Path]::GetFullPath($path) -eq [System.IO.Path]::GetFullPath($script:liveRun)) {
-                return [pscustomobject]@{ processId = 991; state = 'ready'; heartbeatAt = '2026-07-13T10:00:00+08:00'; configVersion = 2 }
+                return [pscustomobject]@{
+                    processId = 991; state = 'ready'; heartbeatAt = '2026-07-13T10:00:00+08:00'
+                    startedAt = '2026-07-13T09:59:00+08:00'; configVersion = 2
+                }
             }
-            return [pscustomobject]@{ processId = 990; state = 'ready'; heartbeatAt = '2026-07-13T09:00:00+08:00'; configVersion = 1 }
+            return [pscustomobject]@{
+                processId = 990; state = 'ready'; heartbeatAt = '2026-07-13T09:00:00+08:00'
+                startedAt = '2026-07-13T08:59:00+08:00'; configVersion = 1
+            }
         }
         Write-AIFishBotAtomicJson -Path $controller.ActiveMarkerPath -InputObject ([pscustomobject]@{ runDirectory = $script:staleRun; processId = 990 }) | Out-Null
 
@@ -837,6 +887,7 @@ Test-Case 'Resume scans a valid run after a readable marker has a missing empty 
             processId = 993
             state = 'ready'
             heartbeatAt = '2026-07-13T10:00:00+08:00'
+            startedAt = '2026-07-13T09:59:00+08:00'
             configVersion = 9
         }
         $markers = @(
@@ -878,7 +929,10 @@ Test-Case 'Resume keeps a validated process tracked when the active marker canno
         $now = [datetimeoffset]'2026-07-13T10:00:00+08:00'
         $config = New-ControllerTestConfig -Name '恢复标记失败'
         $run = New-AIFishBotRunDirectory -RuntimeRoot (Join-Path $root 'runtime') -StartConfig $config -LiveConfig ([pscustomobject]@{ configVersion = 6 })
-        $status = [pscustomobject]@{ processId = 992; state = 'ready'; heartbeatAt = $now.ToString('o'); configVersion = 6 }
+        $status = [pscustomobject]@{
+            processId = 992; state = 'ready'; heartbeatAt = $now.ToString('o')
+            startedAt = $now.AddMinutes(-1).ToString('o'); configVersion = 6
+        }
         $controller = New-ControllerForTest -View $view -Root $root -StatusReader { param($path) $status }
         New-Item -ItemType Directory -Path $controller.ActiveMarkerPath -Force | Out-Null
 
@@ -1047,7 +1101,10 @@ Test-Case 'Exit with Stop handles an injected force confirmation before disposin
         $script:exitNow = [datetimeoffset]'2026-07-13T10:00:00+08:00'
         $script:exitForcedPid = 0
         $controller = New-ControllerForTest -View $view -Root $root `
-            -StatusReader { param($path) [pscustomobject]@{ processId = 445; state = 'stopping'; heartbeatAt = $script:exitNow.ToString('o') } } `
+            -StatusReader { param($path) [pscustomobject]@{
+                    processId = 445; state = 'stopping'; heartbeatAt = $script:exitNow.ToString('o')
+                    startedAt = '2026-07-13T09:59:00+08:00'
+                } } `
             -Clock { $script:exitNow } -Sleeper { param($milliseconds) $script:exitNow = $script:exitNow.AddSeconds(11) } `
             -ConfirmProvider { param($purpose) $purpose -eq 'ForceStop' } `
             -ConfirmExitProvider { param($running) 'Stop' } `
@@ -1055,9 +1112,13 @@ Test-Case 'Exit with Stop handles an injected force confirmation before disposin
         $run = New-AIFishBotRunDirectory -RuntimeRoot (Join-Path $root 'runtime') -StartConfig (New-ControllerTestConfig) -LiveConfig ([pscustomobject]@{ configVersion = 1 })
         $controller.CurrentRunDirectory = $run
         $controller.CurrentProcessId = 445
+        $controller.StopTimeoutSeconds = 0
         Set-AIFishBotRunningState -Controller $controller -Running $true
 
         $view.TrayMenu.ByName.ExitItem.InvokeEvent('Click')
+        Assert-Equal -Expected 0 -Actual $script:exitForcedPid
+        Assert-Equal -Expected 0 -Actual $view.ExitCount
+        $view.Timers.Status.InvokeEvent('Tick')
 
         Assert-Equal -Expected 445 -Actual $script:exitForcedPid
         Assert-Equal -Expected 1 -Actual $view.ExitCount
@@ -1125,6 +1186,581 @@ Test-Case 'A real hidden WinForms view shows and clears Chinese validation error
     }
     finally {
         if ($null -ne $view) { $view.Dispose() }
+        Remove-ControllerTestDirectory $root
+    }
+}
+
+Test-Case 'Start marker records the launched process start time' {
+    $root = New-TestDirectory
+    try {
+        $view = New-ControllerFakeView
+        $startedAt = [datetimeoffset]'2026-07-13T01:59:59.125+00:00'
+        $controller = New-ControllerForTest -View $view -Root $root -ProcessStarter {
+            param($request)
+            [pscustomobject]@{ Id = 1201; StartTime = $startedAt.UtcDateTime }
+        }
+        Set-AIFishBotViewFromConfig -Controller $controller -Config (New-ControllerTestConfig -Name '进程身份方案')
+
+        $result = Start-AIFishBotRun -Controller $controller
+        $marker = Read-AIFishBotJson -Path $controller.ActiveMarkerPath
+
+        Assert-Equal -Expected $true -Actual $result.Success
+        Assert-True -Condition ($null -ne $marker.PSObject.Properties['processStartedAt'])
+        Assert-Equal -Expected $startedAt.ToString('o') -Actual ([datetimeoffset]$marker.processStartedAt).ToString('o')
+    }
+    finally { Remove-ControllerTestDirectory $root }
+}
+
+Test-Case 'Resume rejects a reused PID whose process start time differs from the marker' {
+    $root = New-TestDirectory
+    try {
+        $view = New-ControllerFakeView
+        $now = [datetimeoffset]'2026-07-13T10:00:00+08:00'
+        $originalStart = $now.AddMinutes(-1)
+        $run = New-AIFishBotRunDirectory -RuntimeRoot (Join-Path $root 'runtime') `
+            -StartConfig (New-ControllerTestConfig) -LiveConfig ([pscustomobject]@{ configVersion = 1 })
+        $status = [pscustomobject]@{
+            processId = 1202; state = 'ready'; heartbeatAt = $now.ToString('o')
+            startedAt = $originalStart.AddSeconds(1).ToString('o'); configVersion = 1
+        }
+        $controller = New-ControllerForTest -View $view -Root $root `
+            -StatusReader { param($path) $status } `
+            -ProcessLookup { param($id) [pscustomobject]@{ Id = $id; StartTime = $originalStart.AddMinutes(5).UtcDateTime } }
+        Write-AIFishBotAtomicJson -Path $controller.ActiveMarkerPath -InputObject ([pscustomobject]@{
+                runDirectory = $run; processId = 1202; processStartedAt = $originalStart.ToString('o')
+            }) | Out-Null
+
+        $result = Resume-AIFishBotRun -Controller $controller
+
+        Assert-Equal -Expected $false -Actual $result.Success
+        Assert-Equal -Expected $false -Actual $controller.IsRunning
+    }
+    finally { Remove-ControllerTestDirectory $root }
+}
+
+Test-Case 'Force stop rechecks process identity and refuses a PID reused after resume' {
+    $root = New-TestDirectory
+    try {
+        $view = New-ControllerFakeView
+        $now = [datetimeoffset]'2026-07-13T10:00:00+08:00'
+        $originalStart = $now.AddMinutes(-1)
+        $run = New-AIFishBotRunDirectory -RuntimeRoot (Join-Path $root 'runtime') `
+            -StartConfig (New-ControllerTestConfig) -LiveConfig ([pscustomobject]@{ configVersion = 1 })
+        $status = [pscustomobject]@{
+            processId = 1203; state = 'stopping'; heartbeatAt = $now.ToString('o')
+            startedAt = $originalStart.AddSeconds(1).ToString('o'); configVersion = 1
+        }
+        $script:identityLookups = 0
+        $script:identityForceCalls = 0
+        $controller = New-ControllerForTest -View $view -Root $root `
+            -StatusReader { param($path) $status } `
+            -ProcessLookup {
+                param($id)
+                $script:identityLookups += 1
+                $start = if ($script:identityLookups -eq 1) { $originalStart } else { $originalStart.AddMinutes(5) }
+                [pscustomobject]@{ Id = $id; StartTime = $start.UtcDateTime }
+            } `
+            -ForceStopper { param($id) $script:identityForceCalls += 1 }
+        Write-AIFishBotAtomicJson -Path $controller.ActiveMarkerPath -InputObject ([pscustomobject]@{
+                runDirectory = $run; processId = 1203; processStartedAt = $originalStart.ToString('o')
+            }) | Out-Null
+        Assert-Equal -Expected $true -Actual (Resume-AIFishBotRun -Controller $controller).Success
+
+        $result = $controller.ForceStop()
+
+        Assert-Equal -Expected $false -Actual $result.Success
+        Assert-Equal -Expected 0 -Actual $script:identityForceCalls
+        Assert-Equal -Expected $true -Actual $controller.IsRunning
+    }
+    finally {
+        Remove-ControllerTestDirectory $root
+        Remove-Variable identityLookups, identityForceCalls -Scope Script -ErrorAction SilentlyContinue
+    }
+}
+
+Test-Case 'Rebuilding a controller on the same view removes the previous event binding' {
+    $root = New-TestDirectory
+    try {
+        $view = New-ControllerFakeView
+        $first = New-ControllerForTest -View $view -Root $root
+        $second = New-ControllerForTest -View $view -Root $root
+        Set-AIFishBotViewFromConfig -Controller $second -Config (New-ControllerTestConfig)
+
+        $view.Controls.AutoStop.Checked = -not $view.Controls.AutoStop.Checked
+        $view.Controls.AutoStop.InvokeEvent('CheckedChanged')
+
+        Assert-Equal -Expected $false -Actual $first.IsDirty
+        Assert-Equal -Expected $true -Actual $second.IsDirty
+    }
+    finally { Remove-ControllerTestDirectory $root }
+}
+
+Test-Case 'Disposed controller binding no longer receives view events' {
+    $root = New-TestDirectory
+    try {
+        $view = New-ControllerFakeView
+        $controller = New-ControllerForTest -View $view -Root $root
+        Set-AIFishBotViewFromConfig -Controller $controller -Config (New-ControllerTestConfig)
+
+        $controller.Dispose()
+        $view.Controls.AutoStop.Checked = -not $view.Controls.AutoStop.Checked
+        $view.Controls.AutoStop.InvokeEvent('CheckedChanged')
+
+        Assert-Equal -Expected $false -Actual $controller.IsDirty
+    }
+    finally { Remove-ControllerTestDirectory $root }
+}
+
+Test-Case 'Two controllers sharing one data root start at most one background process' {
+    $root = New-TestDirectory
+    try {
+        $firstView = New-ControllerFakeView
+        $secondView = New-ControllerFakeView
+        $startedAt = [datetimeoffset]'2026-07-13T01:59:59+00:00'
+        $script:concurrentStarterCalls = 0
+        $starter = {
+            param($request)
+            $script:concurrentStarterCalls += 1
+            [pscustomobject]@{ Id = 1204; StartTime = $startedAt.UtcDateTime }
+        }
+        $lookup = { param($id) [pscustomobject]@{ Id = $id; StartTime = $startedAt.UtcDateTime } }
+        $first = New-ControllerForTest -View $firstView -Root $root -ProcessStarter $starter -ProcessLookup $lookup
+        $second = New-ControllerForTest -View $secondView -Root $root -ProcessStarter $starter -ProcessLookup $lookup
+        Set-AIFishBotViewFromConfig -Controller $first -Config (New-ControllerTestConfig -Name '并发方案')
+        Set-AIFishBotViewFromConfig -Controller $second -Config (New-ControllerTestConfig -Name '并发方案')
+
+        $firstResult = Start-AIFishBotRun -Controller $first
+        $secondResult = Start-AIFishBotRun -Controller $second
+
+        Assert-Equal -Expected $true -Actual $firstResult.Success
+        Assert-Equal -Expected $false -Actual $secondResult.Success
+        Assert-Equal -Expected $true -Actual $secondResult.AlreadyRunning
+        Assert-Equal -Expected 1 -Actual $script:concurrentStarterCalls
+    }
+    finally {
+        Remove-ControllerTestDirectory $root
+        Remove-Variable concurrentStarterCalls -Scope Script -ErrorAction SilentlyContinue
+    }
+}
+
+Test-Case 'Resume skips a newer incomplete candidate and restores the older complete run' {
+    $root = New-TestDirectory
+    try {
+        $view = New-ControllerFakeView
+        $runtime = Join-Path $root 'runtime'
+        $now = [datetimeoffset]'2026-07-13T10:00:00+08:00'
+        $processStart = $now.AddMinutes(-1)
+        $older = New-AIFishBotRunDirectory -RuntimeRoot $runtime -StartConfig (New-ControllerTestConfig -Name '完整方案') `
+            -LiveConfig ([pscustomobject]@{ configVersion = 5; audioSensitivity = 8 })
+        $newer = New-AIFishBotRunDirectory -RuntimeRoot $runtime -StartConfig (New-ControllerTestConfig -Name '不完整方案') `
+            -LiveConfig ([pscustomobject]@{ configVersion = 6 })
+        Remove-Item -LiteralPath (Join-Path $newer 'start-config.json') -Force
+        (Get-Item -LiteralPath $older).LastWriteTimeUtc = $now.AddMinutes(-2).UtcDateTime
+        (Get-Item -LiteralPath $newer).LastWriteTimeUtc = $now.AddMinutes(-1).UtcDateTime
+        $controller = New-ControllerForTest -View $view -Root $root `
+            -StatusReader {
+                param($path)
+                $pidValue = if ([System.IO.Path]::GetFullPath($path) -eq [System.IO.Path]::GetFullPath($newer)) { 1206 } else { 1205 }
+                [pscustomobject]@{
+                    processId = $pidValue; state = 'ready'; heartbeatAt = $now.ToString('o')
+                    startedAt = $processStart.AddSeconds(1).ToString('o'); configVersion = 5
+                }
+            } `
+            -ProcessLookup { param($id) [pscustomobject]@{ Id = $id; StartTime = $processStart.UtcDateTime } }
+
+        $result = Resume-AIFishBotRun -Controller $controller
+
+        Assert-Equal -Expected $true -Actual $result.Success
+        Assert-Equal -Expected ([System.IO.Path]::GetFullPath($older)) -Actual $controller.CurrentRunDirectory
+        Assert-Equal -Expected 1205 -Actual $controller.CurrentProcessId
+    }
+    finally { Remove-ControllerTestDirectory $root }
+}
+
+Test-Case 'Live config versions advance from the file across two stale controllers' {
+    $root = New-TestDirectory
+    try {
+        $firstView = New-ControllerFakeView
+        $secondView = New-ControllerFakeView
+        $first = New-ControllerForTest -View $firstView -Root $root
+        $second = New-ControllerForTest -View $secondView -Root $root
+        $config = New-ControllerTestConfig -Name '双控制器版本方案'
+        Set-AIFishBotViewFromConfig -Controller $first -Config $config
+        Set-AIFishBotViewFromConfig -Controller $second -Config $config
+        $run = New-AIFishBotRunDirectory -RuntimeRoot (Join-Path $root 'runtime') `
+            -StartConfig $config -LiveConfig ([pscustomobject]@{ configVersion = 4 })
+        foreach ($controller in @($first, $second)) {
+            $controller.CurrentRunDirectory = $run
+            $controller.ConfigVersion = 4
+            Set-AIFishBotRunningState -Controller $controller -Running $true
+        }
+
+        Assert-Equal -Expected $true -Actual (Save-AIFishBotCurrentProfile -Controller $first).Success
+        Assert-Equal -Expected 5 -Actual (Read-AIFishBotJson -Path (Join-Path $run 'live-config.json')).configVersion
+        Assert-Equal -Expected $true -Actual (Save-AIFishBotCurrentProfile -Controller $second).Success
+
+        Assert-Equal -Expected 6 -Actual (Read-AIFishBotJson -Path (Join-Path $run 'live-config.json')).configVersion
+        Assert-Equal -Expected 6 -Actual $second.ConfigVersion
+    }
+    finally { Remove-ControllerTestDirectory $root }
+}
+
+Test-Case 'Controller leaves shutdown and task-manager closes uncancelled' {
+    $root = New-TestDirectory
+    try {
+        foreach ($reason in @('WindowsShutDown', 'TaskManagerClosing')) {
+            $view = New-ControllerFakeView
+            $controller = New-ControllerForTest -View $view -Root $root
+            $view.TrayIcon.Visible = $false
+            $eventArgs = [pscustomobject]@{ CloseReason = $reason; Cancel = $false }
+
+            $view.Form.InvokeEvent('FormClosing', $eventArgs)
+
+            Assert-Equal -Expected $false -Actual $eventArgs.Cancel
+            Assert-Equal -Expected $true -Actual $view.Form.Visible
+            Assert-Equal -Expected $false -Actual $view.TrayIcon.Visible
+        }
+    }
+    finally { Remove-ControllerTestDirectory $root }
+}
+
+Test-Case 'Log polling preserves a UTF8 character split across appends without replacement text' {
+    $root = New-TestDirectory
+    try {
+        $view = New-ControllerFakeView
+        $controller = New-ControllerForTest -View $view -Root $root
+        $run = New-AIFishBotRunDirectory -RuntimeRoot (Join-Path $root 'runtime') `
+            -StartConfig (New-ControllerTestConfig) -LiveConfig ([pscustomobject]@{ configVersion = 1 })
+        $controller.CurrentRunDirectory = $run
+        New-Item -ItemType Directory -Path (Join-Path $run 'logs') -Force | Out-Null
+        $path = Join-Path $run 'logs\split.log'
+        $bytes = [System.Text.Encoding]::UTF8.GetBytes('鱼')
+        [System.IO.File]::WriteAllBytes($path, [byte[]]@($bytes[0]))
+
+        Update-AIFishBotViewLog -Controller $controller | Out-Null
+        Assert-Equal -Expected '' -Actual $view.Controls.LogBox.Text
+
+        $stream = New-Object System.IO.FileStream($path, [System.IO.FileMode]::Append, [System.IO.FileAccess]::Write, [System.IO.FileShare]::ReadWrite)
+        try { $stream.Write($bytes, 1, $bytes.Length - 1) }
+        finally { $stream.Dispose() }
+        Update-AIFishBotViewLog -Controller $controller | Out-Null
+
+        Assert-Equal -Expected '鱼' -Actual $view.Controls.LogBox.Text
+        Assert-True -Condition ($view.Controls.LogBox.Text -notlike "*$([char]0xFFFD)*")
+    }
+    finally { Remove-ControllerTestDirectory $root }
+}
+
+Test-Case 'Log polling detects truncate and rapid regrow before the previous offset' {
+    $root = New-TestDirectory
+    try {
+        $view = New-ControllerFakeView
+        $controller = New-ControllerForTest -View $view -Root $root
+        $run = New-AIFishBotRunDirectory -RuntimeRoot (Join-Path $root 'runtime') `
+            -StartConfig (New-ControllerTestConfig) -LiveConfig ([pscustomobject]@{ configVersion = 1 })
+        $controller.CurrentRunDirectory = $run
+        New-Item -ItemType Directory -Path (Join-Path $run 'logs') -Force | Out-Null
+        $path = Join-Path $run 'logs\truncate.log'
+        $strictUtf8 = New-Object System.Text.UTF8Encoding($false, $true)
+        [System.IO.File]::WriteAllBytes($path, $strictUtf8.GetBytes("old-line`n"))
+        Update-AIFishBotViewLog -Controller $controller | Out-Null
+
+        [System.IO.File]::WriteAllBytes($path, $strictUtf8.GetBytes("new-content-that-regrew-past-old-offset`n"))
+        Update-AIFishBotViewLog -Controller $controller | Out-Null
+
+        Assert-True -Condition ($view.Controls.LogBox.Text -like '*new-content-that-regrew-past-old-offset*')
+    }
+    finally { Remove-ControllerTestDirectory $root }
+}
+
+Test-Case 'UI stop returns without sleeping and the status tick handles force timeout' {
+    $root = New-TestDirectory
+    try {
+        $view = New-ControllerFakeView
+        $script:uiStopNow = [datetimeoffset]'2026-07-13T10:00:00+08:00'
+        $processStart = $script:uiStopNow.AddMinutes(-1)
+        $script:uiStopSleeps = 0
+        $script:uiStopForceCalls = 0
+        $status = [pscustomobject]@{
+            processId = 1207; state = 'stopping'; heartbeatAt = $script:uiStopNow.ToString('o')
+            startedAt = $processStart.AddSeconds(1).ToString('o'); configVersion = 1
+        }
+        $controller = New-ControllerForTest -View $view -Root $root `
+            -StatusReader { param($path) $status } `
+            -Clock { $script:uiStopNow } `
+            -Sleeper { param($milliseconds) $script:uiStopSleeps += 1; $script:uiStopNow = $script:uiStopNow.AddSeconds(11) } `
+            -ConfirmProvider { param($purpose) $purpose -eq 'ForceStop' } `
+            -ProcessLookup { param($id) [pscustomobject]@{ Id = $id; StartTime = $processStart.UtcDateTime } } `
+            -ForceStopper { param($id) $script:uiStopForceCalls += 1 }
+        $controller | Add-Member -MemberType NoteProperty -Name StopTimeoutSeconds -Value 0 -Force
+        $controller | Add-Member -MemberType NoteProperty -Name StopPending -Value $false -Force
+        $controller | Add-Member -MemberType NoteProperty -Name CurrentProcessStartedAt -Value $processStart.ToString('o') -Force
+        $run = New-AIFishBotRunDirectory -RuntimeRoot (Join-Path $root 'runtime') `
+            -StartConfig (New-ControllerTestConfig) -LiveConfig ([pscustomobject]@{ configVersion = 1 })
+        $controller.CurrentRunDirectory = $run
+        $controller.CurrentProcessId = 1207
+        Write-AIFishBotAtomicJson -Path $controller.ActiveMarkerPath -InputObject ([pscustomobject]@{
+                runDirectory = $run; processId = 1207; processStartedAt = $processStart.ToString('o')
+            }) | Out-Null
+        Set-AIFishBotRunningState -Controller $controller -Running $true
+
+        $view.Controls.StartStopButton.InvokeEvent('Click')
+
+        Assert-Equal -Expected 0 -Actual $script:uiStopSleeps
+        Assert-Equal -Expected 0 -Actual $script:uiStopForceCalls
+        Assert-Equal -Expected $true -Actual $controller.StopPending
+        Assert-Equal -Expected 'stop' -Actual (Read-AIFishBotControlCommand -RunDirectory $run).command
+
+        $view.Timers.Status.InvokeEvent('Tick')
+
+        Assert-Equal -Expected 1 -Actual $script:uiStopForceCalls
+        Assert-Equal -Expected $false -Actual $controller.IsRunning
+    }
+    finally {
+        Remove-ControllerTestDirectory $root
+        Remove-Variable uiStopNow, uiStopSleeps, uiStopForceCalls -Scope Script -ErrorAction SilentlyContinue
+    }
+}
+
+Test-Case 'UI stop timeout still reaches confirmation when status reading fails' {
+    $root = New-TestDirectory
+    try {
+        $view = New-ControllerFakeView
+        $script:failedStatusConfirmCalls = 0
+        $script:failedStatusSleeps = 0
+        $controller = New-ControllerForTest -View $view -Root $root `
+            -StatusReader { param($path) throw '模拟状态文件暂时不可读' } `
+            -Sleeper { param($milliseconds) $script:failedStatusSleeps += 1 } `
+            -ConfirmProvider {
+                param($purpose)
+                if ($purpose -eq 'ForceStop') { $script:failedStatusConfirmCalls += 1 }
+                return $false
+            }
+        $run = New-AIFishBotRunDirectory -RuntimeRoot (Join-Path $root 'runtime') `
+            -StartConfig (New-ControllerTestConfig) -LiveConfig ([pscustomobject]@{ configVersion = 1 })
+        $controller.CurrentRunDirectory = $run
+        $controller.CurrentProcessId = 1208
+        $controller.StopTimeoutSeconds = 0
+        Set-AIFishBotRunningState -Controller $controller -Running $true
+
+        $view.Controls.StartStopButton.InvokeEvent('Click')
+        $view.Timers.Status.InvokeEvent('Tick')
+
+        Assert-Equal -Expected 1 -Actual $script:failedStatusConfirmCalls
+        Assert-Equal -Expected 0 -Actual $script:failedStatusSleeps
+        Assert-Equal -Expected $true -Actual $controller.IsRunning
+    }
+    finally {
+        Remove-ControllerTestDirectory $root
+        Remove-Variable failedStatusConfirmCalls, failedStatusSleeps -Scope Script -ErrorAction SilentlyContinue
+    }
+}
+
+Test-Case 'Force stop always compares the current process with the tracked start time when marker is missing' {
+    $root = New-TestDirectory
+    try {
+        $view = New-ControllerFakeView
+        $now = [datetimeoffset]'2026-07-13T10:00:00+08:00'
+        $trackedStart = $now.AddMinutes(-1)
+        $reusedStart = $trackedStart.AddSeconds(10)
+        $script:trackedForceCalls = 0
+        $status = [pscustomobject]@{
+            processId = 1209; state = 'stopping'; heartbeatAt = $now.ToString('o')
+            startedAt = $reusedStart.ToString('o'); configVersion = 1
+        }
+        $controller = New-ControllerForTest -View $view -Root $root `
+            -StatusReader { param($path) $status } `
+            -ProcessLookup { param($id) [pscustomobject]@{ Id = $id; StartTime = $reusedStart.UtcDateTime } } `
+            -ForceStopper { param($id) $script:trackedForceCalls += 1 }
+        $run = New-AIFishBotRunDirectory -RuntimeRoot (Join-Path $root 'runtime') `
+            -StartConfig (New-ControllerTestConfig) -LiveConfig ([pscustomobject]@{ configVersion = 1 })
+        $controller.CurrentRunDirectory = $run
+        $controller.CurrentProcessId = 1209
+        $controller.CurrentProcessStartedAt = $trackedStart.ToString('o')
+        Set-AIFishBotRunningState -Controller $controller -Running $true
+
+        $result = $controller.ForceStop()
+
+        Assert-Equal -Expected $false -Actual $result.Success
+        Assert-Equal -Expected 0 -Actual $script:trackedForceCalls
+        Assert-Equal -Expected $true -Actual $controller.IsRunning
+    }
+    finally {
+        Remove-ControllerTestDirectory $root
+        Remove-Variable trackedForceCalls -Scope Script -ErrorAction SilentlyContinue
+    }
+}
+
+Test-Case 'Resume rejects a new-format marker whose process start time is invalid' {
+    $root = New-TestDirectory
+    try {
+        $view = New-ControllerFakeView
+        $now = [datetimeoffset]'2026-07-13T10:00:00+08:00'
+        $processStart = $now.AddMinutes(-1)
+        $run = New-AIFishBotRunDirectory -RuntimeRoot (Join-Path $root 'runtime') `
+            -StartConfig (New-ControllerTestConfig) -LiveConfig ([pscustomobject]@{ configVersion = 1 })
+        $status = [pscustomobject]@{
+            processId = 1210; state = 'ready'; heartbeatAt = $now.ToString('o')
+            startedAt = $processStart.ToString('o'); configVersion = 1
+        }
+        $controller = New-ControllerForTest -View $view -Root $root `
+            -StatusReader { param($path) $status } `
+            -ProcessLookup { param($id) [pscustomobject]@{ Id = $id; StartTime = $processStart.UtcDateTime } }
+        Write-AIFishBotAtomicJson -Path $controller.ActiveMarkerPath -InputObject ([pscustomobject]@{
+                runDirectory = $run; processId = 1210; processStartedAt = '损坏的时间'
+            }) | Out-Null
+
+        $result = Resume-AIFishBotRun -Controller $controller
+
+        Assert-Equal -Expected $false -Actual $result.Success
+        Assert-Equal -Expected $false -Actual $controller.IsRunning
+    }
+    finally { Remove-ControllerTestDirectory $root }
+}
+
+Test-Case 'Resume skips a newer readable but invalid config and restores the older valid run' {
+    $root = New-TestDirectory
+    try {
+        $view = New-ControllerFakeView
+        $runtime = Join-Path $root 'runtime'
+        $now = [datetimeoffset]'2026-07-13T10:00:00+08:00'
+        $processStart = $now.AddMinutes(-1)
+        $olderConfig = New-ControllerTestConfig -Name '旧有效方案'
+        $newerConfig = New-ControllerTestConfig -Name '新无效方案'
+        $newerConfig.audioSensitivity = 99
+        $older = New-AIFishBotRunDirectory -RuntimeRoot $runtime -StartConfig $olderConfig `
+            -LiveConfig ([pscustomobject]@{ configVersion = 5 })
+        $newer = New-AIFishBotRunDirectory -RuntimeRoot $runtime -StartConfig $newerConfig `
+            -LiveConfig ([pscustomobject]@{ configVersion = 6 })
+        (Get-Item -LiteralPath $older).LastWriteTimeUtc = $now.AddMinutes(-2).UtcDateTime
+        (Get-Item -LiteralPath $newer).LastWriteTimeUtc = $now.AddMinutes(-1).UtcDateTime
+        $controller = New-ControllerForTest -View $view -Root $root `
+            -StatusReader {
+                param($path)
+                $pidValue = if ([System.IO.Path]::GetFullPath($path) -eq [System.IO.Path]::GetFullPath($newer)) { 1212 } else { 1211 }
+                [pscustomobject]@{
+                    processId = $pidValue; state = 'ready'; heartbeatAt = $now.ToString('o')
+                    startedAt = $processStart.ToString('o'); configVersion = 5
+                }
+            } `
+            -ProcessLookup { param($id) [pscustomobject]@{ Id = $id; StartTime = $processStart.UtcDateTime } }
+
+        $result = Resume-AIFishBotRun -Controller $controller
+
+        Assert-Equal -Expected $true -Actual $result.Success
+        Assert-Equal -Expected ([System.IO.Path]::GetFullPath($older)) -Actual $controller.CurrentRunDirectory
+        Assert-Equal -Expected '旧有效方案' -Actual $controller.CurrentProfileName
+    }
+    finally { Remove-ControllerTestDirectory $root }
+}
+
+Test-Case 'Resume orders valid candidates by newest directory even when marker points to an older run' {
+    $root = New-TestDirectory
+    try {
+        $view = New-ControllerFakeView
+        $runtime = Join-Path $root 'runtime'
+        $now = [datetimeoffset]'2026-07-13T10:00:00+08:00'
+        $processStart = $now.AddMinutes(-1)
+        $older = New-AIFishBotRunDirectory -RuntimeRoot $runtime -StartConfig (New-ControllerTestConfig -Name '旧标记方案') `
+            -LiveConfig ([pscustomobject]@{ configVersion = 7 })
+        $newer = New-AIFishBotRunDirectory -RuntimeRoot $runtime -StartConfig (New-ControllerTestConfig -Name '新目录方案') `
+            -LiveConfig ([pscustomobject]@{ configVersion = 8 })
+        (Get-Item -LiteralPath $older).LastWriteTimeUtc = $now.AddMinutes(-2).UtcDateTime
+        (Get-Item -LiteralPath $newer).LastWriteTimeUtc = $now.AddMinutes(-1).UtcDateTime
+        $controller = New-ControllerForTest -View $view -Root $root `
+            -StatusReader {
+                param($path)
+                $pidValue = if ([System.IO.Path]::GetFullPath($path) -eq [System.IO.Path]::GetFullPath($newer)) { 1214 } else { 1213 }
+                [pscustomobject]@{
+                    processId = $pidValue; state = 'ready'; heartbeatAt = $now.ToString('o')
+                    startedAt = $processStart.ToString('o'); configVersion = 8
+                }
+            } `
+            -ProcessLookup { param($id) [pscustomobject]@{ Id = $id; StartTime = $processStart.UtcDateTime } }
+        Write-AIFishBotAtomicJson -Path $controller.ActiveMarkerPath -InputObject ([pscustomobject]@{
+                runDirectory = $older; processId = 1213; processStartedAt = $processStart.ToString('o')
+            }) | Out-Null
+
+        $result = Resume-AIFishBotRun -Controller $controller
+
+        Assert-Equal -Expected $true -Actual $result.Success
+        Assert-Equal -Expected ([System.IO.Path]::GetFullPath($newer)) -Actual $controller.CurrentRunDirectory
+        Assert-Equal -Expected '新目录方案' -Actual $controller.CurrentProfileName
+    }
+    finally { Remove-ControllerTestDirectory $root }
+}
+
+Test-Case 'Start mutex serializes separate PowerShell processes sharing one data root' {
+    $root = New-TestDirectory
+    $jobs = @()
+    $ready = $null
+    $release = $null
+    $second = $null
+    try {
+        $id = [guid]::NewGuid().ToString('N')
+        $readyName = "Local\AI-FishBot.ControllerTest.Ready.$id"
+        $releaseName = "Local\AI-FishBot.ControllerTest.Release.$id"
+        $secondName = "Local\AI-FishBot.ControllerTest.Second.$id"
+        $ready = New-Object System.Threading.EventWaitHandle(
+            $false, [System.Threading.EventResetMode]::ManualReset, $readyName)
+        $release = New-Object System.Threading.EventWaitHandle(
+            $false, [System.Threading.EventResetMode]::ManualReset, $releaseName)
+        $second = New-Object System.Threading.EventWaitHandle(
+            $false, [System.Threading.EventResetMode]::ManualReset, $secondName)
+
+        $jobs += Start-Job -ArgumentList $controllerModulePath, $root, $readyName, $releaseName -ScriptBlock {
+            param($modulePath, $dataRoot, $readyName, $releaseName)
+            Import-Module $modulePath -Force
+            $module = Get-Module AI-FishBot.Controller
+            & $module {
+                param($dataRoot, $readyName, $releaseName)
+                $readyEvent = [System.Threading.EventWaitHandle]::OpenExisting($readyName)
+                $releaseEvent = [System.Threading.EventWaitHandle]::OpenExisting($releaseName)
+                try {
+                    Invoke-AIFishBotControllerMutex -Scope 'Start' -Path $dataRoot -Operation {
+                        [void]$readyEvent.Set()
+                        [void]$releaseEvent.WaitOne(5000)
+                    }
+                }
+                finally { $readyEvent.Dispose(); $releaseEvent.Dispose() }
+            } $dataRoot $readyName $releaseName
+        }
+        Assert-True -Condition $ready.WaitOne(5000)
+
+        $jobs += Start-Job -ArgumentList $controllerModulePath, $root, $secondName -ScriptBlock {
+            param($modulePath, $dataRoot, $secondName)
+            Import-Module $modulePath -Force
+            $module = Get-Module AI-FishBot.Controller
+            & $module {
+                param($dataRoot, $secondName)
+                $secondEvent = [System.Threading.EventWaitHandle]::OpenExisting($secondName)
+                try {
+                    Invoke-AIFishBotControllerMutex -Scope 'Start' -Path $dataRoot -Operation {
+                        [void]$secondEvent.Set()
+                    }
+                }
+                finally { $secondEvent.Dispose() }
+            } $dataRoot $secondName
+        }
+
+        Assert-Equal -Expected $false -Actual $second.WaitOne(300)
+        [void]$release.Set()
+        Assert-True -Condition $second.WaitOne(5000)
+        foreach ($job in $jobs) {
+            Wait-Job -Job $job -Timeout 10 | Out-Null
+            Receive-Job -Job $job -ErrorAction Stop | Out-Null
+            Assert-Equal -Expected 'Completed' -Actual ([string]$job.State)
+        }
+    }
+    finally {
+        if ($null -ne $release) { [void]$release.Set() }
+        foreach ($job in $jobs) {
+            if ($job.State -eq 'Running') { Stop-Job -Job $job }
+            Remove-Job -Job $job -Force -ErrorAction SilentlyContinue
+        }
+        if ($null -ne $ready) { $ready.Dispose() }
+        if ($null -ne $release) { $release.Dispose() }
+        if ($null -ne $second) { $second.Dispose() }
         Remove-ControllerTestDirectory $root
     }
 }

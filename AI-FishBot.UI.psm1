@@ -699,6 +699,7 @@ function New-AIFishBotMainView {
         ErrorProvider = $errorProvider
         _Lifecycle = $lifecycleState
         _Disposed = $false
+        _ControllerBinding = $null
     }
 
     $disposeView = {
@@ -709,6 +710,10 @@ function New-AIFishBotMainView {
         $this._Lifecycle.AllowClose = $true
         $this._Lifecycle.Disposed = $true
         $this._Disposed = $true
+        if ($null -ne $this._ControllerBinding) {
+            $this._ControllerBinding.Dispose()
+            $this._ControllerBinding = $null
+        }
         $this.Controls.WebhookText.UseSystemPasswordChar = $false
         $this.Controls.WebhookText.PasswordChar = [char]0x25CF
         foreach ($timer in $this.Timers.PSObject.Properties.Value) {

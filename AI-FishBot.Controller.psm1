@@ -99,6 +99,156 @@ function Copy-AIFishBotControllerObject {
     return (($InputObject | ConvertTo-Json -Depth 100 -Compress) | ConvertFrom-Json)
 }
 
+function Get-AIFishBotControllerMutexName {
+    param(
+        [Parameter(Mandatory = $true)][string]$Scope,
+        [Parameter(Mandatory = $true)][string]$Path
+    )
+    $normalized = [System.IO.Path]::GetFullPath($Path).TrimEnd('\', '/').ToUpperInvariant()
+    $sha256 = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $bytes = [System.Text.Encoding]::UTF8.GetBytes($normalized)
+        $hash = [System.BitConverter]::ToString($sha256.ComputeHash($bytes)).Replace('-', '')
+    }
+    finally { $sha256.Dispose() }
+    return 'Local\AI-FishBot.Controller.{0}.{1}' -f $Scope, $hash
+}
+
+function Invoke-AIFishBotControllerMutex {
+    param(
+        [Parameter(Mandatory = $true)][string]$Scope,
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][scriptblock]$Operation
+    )
+    $mutex = New-Object System.Threading.Mutex($false, (Get-AIFishBotControllerMutexName -Scope $Scope -Path $Path))
+    $ownsMutex = $false
+    try {
+        try { $ownsMutex = $mutex.WaitOne() }
+        catch [System.Threading.AbandonedMutexException] { $ownsMutex = $true }
+        if (-not $ownsMutex) { throw '无法取得控制器运行锁。' }
+        return & $Operation
+    }
+    finally {
+        if ($ownsMutex) { $mutex.ReleaseMutex() }
+        $mutex.Dispose()
+    }
+}
+
+function ConvertTo-AIFishBotControllerDateTimeOffset {
+    param([AllowNull()]$Value)
+    if ($null -eq $Value) { return $null }
+    try {
+        if ($Value -is [datetimeoffset]) { return [datetimeoffset]$Value }
+        if ($Value -is [datetime]) { return [datetimeoffset]([datetime]$Value) }
+        $parsed = [datetimeoffset]::MinValue
+        if ([datetimeoffset]::TryParse(
+                [string]$Value,
+                [System.Globalization.CultureInfo]::InvariantCulture,
+                [System.Globalization.DateTimeStyles]::RoundtripKind,
+                [ref]$parsed)) {
+            return $parsed
+        }
+    }
+    catch { }
+    return $null
+}
+
+function Test-AIFishBotControllerPathEqual {
+    param([AllowNull()][string]$First, [AllowNull()][string]$Second)
+    if ([string]::IsNullOrWhiteSpace($First) -or [string]::IsNullOrWhiteSpace($Second)) { return $false }
+    try {
+        return [string]::Equals(
+            [System.IO.Path]::GetFullPath($First),
+            [System.IO.Path]::GetFullPath($Second),
+            [System.StringComparison]::OrdinalIgnoreCase)
+    }
+    catch { return $false }
+}
+
+function Get-AIFishBotControllerProcessStartTime {
+    param([AllowNull()]$Process)
+    if ($null -eq $Process) { return $null }
+    $property = $Process.PSObject.Properties['StartTime']
+    if ($null -eq $property) { return $null }
+    return ConvertTo-AIFishBotControllerDateTimeOffset $property.Value
+}
+
+function Get-AIFishBotControllerMarkerForRun {
+    param(
+        [Parameter(Mandatory = $true)]$Controller,
+        [Parameter(Mandatory = $true)][string]$RunDirectory,
+        [int]$ProcessId = 0
+    )
+    try {
+        $marker = Read-AIFishBotJson -Path $Controller.ActiveMarkerPath
+        $markerDirectory = [string](Get-AIFishBotObjectPropertyValue $marker 'runDirectory' '')
+        $markerPid = [int](Get-AIFishBotObjectPropertyValue $marker 'processId' 0)
+        if (-not (Test-AIFishBotControllerPathEqual $markerDirectory $RunDirectory)) { return $null }
+        if ($ProcessId -gt 0 -and $markerPid -ne $ProcessId) { return $null }
+        return $marker
+    }
+    catch { return $null }
+}
+
+function Test-AIFishBotControllerProcessIdentity {
+    param(
+        [Parameter(Mandatory = $true)]$Controller,
+        [Parameter(Mandatory = $true)][int]$ProcessId,
+        [Parameter(Mandatory = $true)]$Status,
+        [AllowNull()]$Marker,
+        [AllowNull()]$Process
+    )
+    $statusPid = [int](Get-AIFishBotObjectPropertyValue $Status 'processId' 0)
+    if ($statusPid -ne $ProcessId) {
+        return [pscustomobject]@{ Success = $false; Error = '后台状态中的进程编号不匹配。' }
+    }
+    if ($null -eq $Process) {
+        $processes = @(& $Controller.ProcessLookup $ProcessId)
+        if ($processes.Count -eq 0 -or $null -eq $processes[-1]) {
+            return [pscustomobject]@{ Success = $false; Error = '后台进程已经不存在。' }
+        }
+        $Process = $processes[-1]
+    }
+    $actualPid = [int](Get-AIFishBotObjectPropertyValue $Process 'Id' 0)
+    if ($actualPid -ne $ProcessId) {
+        return [pscustomobject]@{ Success = $false; Error = '查找到的进程编号不匹配。' }
+    }
+    if (-not (Test-AIFishBotHeartbeatFresh -Status $Status -Now (& $Controller.Clock) -MaxAgeSeconds $Controller.HeartbeatMaxAgeSeconds)) {
+        return [pscustomobject]@{ Success = $false; Error = '后台心跳已经过期。' }
+    }
+    $actualStart = Get-AIFishBotControllerProcessStartTime $Process
+    if ($null -eq $actualStart) {
+        return [pscustomobject]@{ Success = $false; Error = '无法核对后台进程的启动时间。' }
+    }
+
+    $source = 'Status'
+    $expectedStart = $null
+    $toleranceSeconds = [double]$Controller.LegacyProcessStartToleranceSeconds
+    if ($null -ne $Marker -and $null -ne $Marker.PSObject.Properties['processStartedAt']) {
+        $expectedStart = ConvertTo-AIFishBotControllerDateTimeOffset $Marker.processStartedAt
+        if ($null -eq $expectedStart) {
+            return [pscustomobject]@{ Success = $false; Error = '运行标记中的进程启动时间无效。' }
+        }
+        $source = 'Marker'
+        $toleranceSeconds = [double]$Controller.MarkerProcessStartToleranceSeconds
+    }
+    else {
+        $expectedStart = ConvertTo-AIFishBotControllerDateTimeOffset (Get-AIFishBotObjectPropertyValue $Status 'startedAt' $null)
+    }
+    if ($null -eq $expectedStart) {
+        return [pscustomobject]@{ Success = $false; Error = '后台记录缺少可核对的启动时间。' }
+    }
+    if ([math]::Abs(($actualStart - $expectedStart).TotalSeconds) -gt $toleranceSeconds) {
+        return [pscustomobject]@{ Success = $false; Error = '进程编号已被其他进程重复使用。' }
+    }
+    return [pscustomobject]@{
+        Success = $true
+        Process = $Process
+        ProcessStartedAt = $actualStart
+        IdentitySource = $source
+    }
+}
+
 function Set-AIFishBotControlEnabled {
     param([AllowNull()]$Control, [bool]$Enabled)
     if ($null -ne $Control -and $null -ne $Control.PSObject.Properties['Enabled']) {
@@ -363,11 +513,20 @@ function Write-AIFishBotControllerLiveConfig {
     if (-not $Controller.IsRunning -or [string]::IsNullOrWhiteSpace($Controller.CurrentRunDirectory)) { return $null }
     $validation = Test-AIFishBotConfig -Config $Config -AvailablePorts @(& $Controller.AvailablePortsProvider)
     if (-not $validation.IsValid) { return $null }
-    $nextVersion = [int]$Controller.ConfigVersion + 1
-    $live = New-AIFishBotLiveConfig -Config $Config -Version $nextVersion
-    Write-AIFishBotAtomicJson -Path (Join-Path $Controller.CurrentRunDirectory 'live-config.json') -InputObject $live | Out-Null
-    $Controller.ConfigVersion = $nextVersion
-    return $live
+    $operation = {
+        $livePath = Join-Path $Controller.CurrentRunDirectory 'live-config.json'
+        $fileVersion = 0
+        if (Test-Path -LiteralPath $livePath -PathType Leaf) {
+            $currentLive = Read-AIFishBotJson -Path $livePath
+            $fileVersion = [int](Get-AIFishBotObjectPropertyValue $currentLive 'configVersion' 0)
+        }
+        $nextVersion = [math]::Max($fileVersion, [int]$Controller.ConfigVersion) + 1
+        $live = New-AIFishBotLiveConfig -Config $Config -Version $nextVersion
+        Write-AIFishBotAtomicJson -Path $livePath -InputObject $live | Out-Null
+        $Controller.ConfigVersion = $nextVersion
+        return $live
+    }
+    return Invoke-AIFishBotControllerMutex -Scope 'LiveConfig' -Path $Controller.CurrentRunDirectory -Operation $operation
 }
 
 function Set-AIFishBotRunningState {
@@ -449,23 +608,78 @@ function Get-AIFishBotDependencyAvailable {
     return $status -in @('Available', 'Ready', 'Installed')
 }
 
+function Get-AIFishBotRunCandidate {
+    param(
+        [Parameter(Mandatory = $true)]$Controller,
+        [Parameter(Mandatory = $true)][string]$RunDirectory
+    )
+    try {
+        $fullPath = [System.IO.Path]::GetFullPath($RunDirectory)
+        if (-not (Test-Path -LiteralPath $fullPath -PathType Container)) { return $null }
+        $start = Read-AIFishBotJson -Path (Join-Path $fullPath 'start-config.json')
+        $live = Read-AIFishBotJson -Path (Join-Path $fullPath 'live-config.json')
+        $mergedConfig = Copy-AIFishBotControllerObject $start
+        foreach ($field in $script:AIFishBotLiveFields) {
+            $property = $live.PSObject.Properties[$field]
+            if ($null -ne $property) { Set-AIFishBotObjectPropertyValue $mergedConfig $field $property.Value }
+        }
+        $validation = Test-AIFishBotConfig -Config $mergedConfig -AvailablePorts @(& $Controller.AvailablePortsProvider)
+        if (-not $validation.IsValid) { return $null }
+        $status = & $Controller.StatusReader $fullPath
+        $state = [string](Get-AIFishBotObjectPropertyValue $status 'state' '')
+        $pidValue = [int](Get-AIFishBotObjectPropertyValue $status 'processId' 0)
+        if ($pidValue -le 0 -or $state -in @('stopped', 'error')) { return $null }
+        $marker = Get-AIFishBotControllerMarkerForRun -Controller $Controller -RunDirectory $fullPath -ProcessId $pidValue
+        $identity = Test-AIFishBotControllerProcessIdentity -Controller $Controller -ProcessId $pidValue `
+            -Status $status -Marker $marker -Process $null
+        if (-not $identity.Success) { return $null }
+        return [pscustomobject]@{
+            RunDirectory = $fullPath
+            Pid = $pidValue
+            Status = $status
+            StartConfig = $start
+            LiveConfig = $live
+            MergedConfig = $mergedConfig
+            ProcessStartedAt = $identity.ProcessStartedAt
+            IdentitySource = $identity.IdentitySource
+        }
+    }
+    catch { return $null }
+}
+
 function Get-AIFishBotActiveRun {
     param([Parameter(Mandatory = $true)]$Controller)
     if (-not (Test-Path -LiteralPath $Controller.RuntimeRoot -PathType Container)) { return $null }
-    foreach ($directory in @(Get-ChildItem -LiteralPath $Controller.RuntimeRoot -Directory -ErrorAction SilentlyContinue | Sort-Object LastWriteTimeUtc -Descending)) {
-        try {
-            $status = & $Controller.StatusReader $directory.FullName
-            $pidValue = [int](Get-AIFishBotObjectPropertyValue $status 'processId' 0)
-            $state = [string](Get-AIFishBotObjectPropertyValue $status 'state' '')
-            if ($pidValue -le 0 -or $state -in @('stopped', 'error')) { continue }
-            $process = @(& $Controller.ProcessLookup $pidValue)
-            if ($process.Count -eq 0 -or $null -eq $process[-1]) { continue }
-            if (-not (Test-AIFishBotHeartbeatFresh -Status $status -Now (& $Controller.Clock) -MaxAgeSeconds $Controller.HeartbeatMaxAgeSeconds)) { continue }
-            return [pscustomobject]@{ RunDirectory = $directory.FullName; Pid = $pidValue; Status = $status }
-        }
-        catch { continue }
+    foreach ($directory in @(Get-ChildItem -LiteralPath $Controller.RuntimeRoot -Directory -ErrorAction SilentlyContinue |
+            Sort-Object LastWriteTimeUtc -Descending)) {
+        $candidate = Get-AIFishBotRunCandidate -Controller $Controller -RunDirectory $directory.FullName
+        if ($null -ne $candidate) { return $candidate }
     }
     return $null
+}
+
+function Get-AIFishBotStartReservation {
+    param([Parameter(Mandatory = $true)]$Controller)
+    try {
+        $marker = Read-AIFishBotJson -Path $Controller.ActiveMarkerPath
+        $runDirectory = [string](Get-AIFishBotObjectPropertyValue $marker 'runDirectory' '')
+        $pidValue = [int](Get-AIFishBotObjectPropertyValue $marker 'processId' 0)
+        $expectedStart = ConvertTo-AIFishBotControllerDateTimeOffset `
+            (Get-AIFishBotObjectPropertyValue $marker 'processStartedAt' $null)
+        if ([string]::IsNullOrWhiteSpace($runDirectory) -or $pidValue -le 0 -or $null -eq $expectedStart) { return $null }
+        if (-not (Test-Path -LiteralPath $runDirectory -PathType Container)) { return $null }
+        $processes = @(& $Controller.ProcessLookup $pidValue)
+        if ($processes.Count -eq 0 -or $null -eq $processes[-1]) { return $null }
+        $process = $processes[-1]
+        if ([int](Get-AIFishBotObjectPropertyValue $process 'Id' 0) -ne $pidValue) { return $null }
+        $actualStart = Get-AIFishBotControllerProcessStartTime $process
+        if ($null -eq $actualStart -or
+            [math]::Abs(($actualStart - $expectedStart).TotalSeconds) -gt $Controller.MarkerProcessStartToleranceSeconds) {
+            return $null
+        }
+        return [pscustomobject]@{ RunDirectory = [System.IO.Path]::GetFullPath($runDirectory); Pid = $pidValue }
+    }
+    catch { return $null }
 }
 
 function ConvertTo-AIFishBotQuotedArgument {
@@ -481,6 +695,7 @@ function Write-AIFishBotActiveMarker {
     Write-AIFishBotAtomicJson -Path $Controller.ActiveMarkerPath -InputObject ([pscustomobject][ordered]@{
             runDirectory = $Controller.CurrentRunDirectory
             processId = $Controller.CurrentProcessId
+            processStartedAt = $Controller.CurrentProcessStartedAt
         }) | Out-Null
 }
 
@@ -495,7 +710,10 @@ function Start-AIFishBotRun {
     [CmdletBinding()]
     param([Parameter(Mandatory = $true)]$Controller)
     if ($Controller.IsRunning) {
-        return [pscustomobject]@{ Success = $false; AlreadyRunning = $true; RunDirectory = $Controller.CurrentRunDirectory; Pid = $Controller.CurrentProcessId }
+        return [pscustomobject]@{
+            Success = $false; AlreadyRunning = $true
+            RunDirectory = $Controller.CurrentRunDirectory; Pid = $Controller.CurrentProcessId
+        }
     }
     $config = Get-AIFishBotConfigFromView -Controller $Controller
     $validation = Test-AIFishBotView -Controller $Controller
@@ -508,71 +726,95 @@ function Start-AIFishBotRun {
     if (-not (Get-AIFishBotDependencyAvailable $dependency)) {
         return [pscustomobject]@{ Success = $false; RequiresDependencyInstall = $true; Dependency = $dependency }
     }
-    $active = Get-AIFishBotActiveRun -Controller $Controller
-    if ($null -ne $active) {
-        return [pscustomobject]@{ Success = $false; AlreadyRunning = $true; RunDirectory = $active.RunDirectory; Pid = $active.Pid }
-    }
-
-    $runDirectory = $null
-    $processStarted = $false
-    $processId = 0
-    $postStartStage = ''
-    try {
-        $version = 1
-        $startSnapshot = Copy-AIFishBotControllerObject $config
-        Set-AIFishBotObjectPropertyValue $startSnapshot 'configVersion' $version
-        $liveSnapshot = New-AIFishBotLiveConfig -Config $config -Version $version
-        $runDirectory = New-AIFishBotRunDirectory -RuntimeRoot $Controller.RuntimeRoot `
-            -StartConfig $startSnapshot -LiveConfig $liveSnapshot
-        $powershellPath = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
-        $arguments = '-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File {0} -RunDirectory {1}' -f `
-            (ConvertTo-AIFishBotQuotedArgument $Controller.EngineScriptPath),
-            (ConvertTo-AIFishBotQuotedArgument $runDirectory)
-        $request = [pscustomobject][ordered]@{
-            FilePath = $powershellPath
-            Arguments = $arguments
-            ArgumentList = $arguments
-            WindowStyle = 'Hidden'
-            EngineScriptPath = $Controller.EngineScriptPath
-            RunDirectory = $runDirectory
-        }
-        $processOutput = @(& $Controller.ProcessStarter $request)
-        if ($processOutput.Count -eq 0 -or $null -eq $processOutput[-1]) { throw '后台进程没有返回进程编号。' }
-        $processId = [int](Get-AIFishBotObjectPropertyValue $processOutput[-1] 'Id' 0)
-        if ($processId -le 0) { throw '后台进程返回了无效的进程编号。' }
-        $processStarted = $true
-        $Controller.CurrentRunDirectory = $runDirectory
-        $Controller.CurrentProcessId = $processId
-        $Controller.ConfigVersion = $version
-        $postStartStage = 'View'
-        Set-AIFishBotRunningState -Controller $Controller -Running $true | Out-Null
-        $postStartStage = 'Marker'
-        Write-AIFishBotActiveMarker -Controller $Controller
-        return [pscustomobject]@{ Success = $true; RunDirectory = $runDirectory; Pid = $processId }
-    }
-    catch {
-        if ($processStarted) {
-            $Controller.CurrentRunDirectory = $runDirectory
-            $Controller.CurrentProcessId = $processId
-            $Controller.ConfigVersion = 1
-            $Controller.IsRunning = $true
+    $operation = {
+        if ($Controller.IsRunning) {
             return [pscustomobject]@{
-                Success = $true
-                RunDirectory = $runDirectory
-                Pid = $processId
-                MarkerWriteFailed = ($postStartStage -eq 'Marker')
-                RecoveryStateWriteFailed = $true
-                Warning = $_.Exception.Message
+                Success = $false; AlreadyRunning = $true
+                RunDirectory = $Controller.CurrentRunDirectory; Pid = $Controller.CurrentProcessId
             }
         }
-        if ($null -ne $runDirectory -and (Test-Path -LiteralPath $runDirectory)) {
-            Remove-Item -LiteralPath $runDirectory -Recurse -Force -ErrorAction SilentlyContinue
+        $active = Get-AIFishBotActiveRun -Controller $Controller
+        if ($null -eq $active) { $active = Get-AIFishBotStartReservation -Controller $Controller }
+        if ($null -ne $active) {
+            return [pscustomobject]@{
+                Success = $false; AlreadyRunning = $true
+                RunDirectory = $active.RunDirectory; Pid = $active.Pid
+            }
         }
-        $Controller.CurrentRunDirectory = $null
-        $Controller.CurrentProcessId = 0
-        Set-AIFishBotRunningState -Controller $Controller -Running $false | Out-Null
-        return [pscustomobject]@{ Success = $false; Error = $_.Exception.Message }
+
+        $runDirectory = $null
+        $processStarted = $false
+        $processId = 0
+        $postStartStage = ''
+        try {
+            $version = 1
+            $startSnapshot = Copy-AIFishBotControllerObject $config
+            Set-AIFishBotObjectPropertyValue $startSnapshot 'configVersion' $version
+            $liveSnapshot = New-AIFishBotLiveConfig -Config $config -Version $version
+            $runDirectory = New-AIFishBotRunDirectory -RuntimeRoot $Controller.RuntimeRoot `
+                -StartConfig $startSnapshot -LiveConfig $liveSnapshot
+            $powershellPath = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+            $arguments = '-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File {0} -RunDirectory {1}' -f `
+                (ConvertTo-AIFishBotQuotedArgument $Controller.EngineScriptPath),
+                (ConvertTo-AIFishBotQuotedArgument $runDirectory)
+            $request = [pscustomobject][ordered]@{
+                FilePath = $powershellPath
+                Arguments = $arguments
+                ArgumentList = $arguments
+                WindowStyle = 'Hidden'
+                EngineScriptPath = $Controller.EngineScriptPath
+                RunDirectory = $runDirectory
+            }
+            $processOutput = @(& $Controller.ProcessStarter $request)
+            if ($processOutput.Count -eq 0 -or $null -eq $processOutput[-1]) { throw '后台进程没有返回进程编号。' }
+            $process = $processOutput[-1]
+            $processId = [int](Get-AIFishBotObjectPropertyValue $process 'Id' 0)
+            if ($processId -le 0) { throw '后台进程返回了无效的进程编号。' }
+            $processStarted = $true
+            $processStart = Get-AIFishBotControllerProcessStartTime $process
+            if ($null -eq $processStart) {
+                $lookedUp = @(& $Controller.ProcessLookup $processId)
+                if ($lookedUp.Count -gt 0 -and $null -ne $lookedUp[-1]) {
+                    $processStart = Get-AIFishBotControllerProcessStartTime $lookedUp[-1]
+                }
+            }
+            if ($null -eq $processStart) { throw '后台进程没有提供可核对的启动时间。' }
+            $Controller.CurrentRunDirectory = $runDirectory
+            $Controller.CurrentProcessId = $processId
+            $Controller.CurrentProcessStartedAt = $processStart.ToString('o')
+            $Controller.ConfigVersion = $version
+            $postStartStage = 'View'
+            Set-AIFishBotRunningState -Controller $Controller -Running $true | Out-Null
+            $postStartStage = 'Marker'
+            Write-AIFishBotActiveMarker -Controller $Controller
+            return [pscustomobject]@{ Success = $true; RunDirectory = $runDirectory; Pid = $processId }
+        }
+        catch {
+            if ($processStarted) {
+                $Controller.CurrentRunDirectory = $runDirectory
+                $Controller.CurrentProcessId = $processId
+                $Controller.ConfigVersion = 1
+                $Controller.IsRunning = $true
+                return [pscustomobject]@{
+                    Success = $true
+                    RunDirectory = $runDirectory
+                    Pid = $processId
+                    MarkerWriteFailed = ($postStartStage -eq 'Marker')
+                    RecoveryStateWriteFailed = $true
+                    Warning = $_.Exception.Message
+                }
+            }
+            if ($null -ne $runDirectory -and (Test-Path -LiteralPath $runDirectory)) {
+                Remove-Item -LiteralPath $runDirectory -Recurse -Force -ErrorAction SilentlyContinue
+            }
+            $Controller.CurrentRunDirectory = $null
+            $Controller.CurrentProcessId = 0
+            $Controller.CurrentProcessStartedAt = $null
+            Set-AIFishBotRunningState -Controller $Controller -Running $false | Out-Null
+            return [pscustomobject]@{ Success = $false; Error = $_.Exception.Message }
+        }
     }
+    return Invoke-AIFishBotControllerMutex -Scope 'Start' -Path $Controller.DataRoot -Operation $operation
 }
 
 function Stop-AIFishBotRun {
@@ -613,12 +855,73 @@ function Stop-AIFishBotRun {
     }
 }
 
+function Request-AIFishBotRunStop {
+    param([Parameter(Mandatory = $true)]$Controller)
+    if (-not $Controller.IsRunning -or [string]::IsNullOrWhiteSpace($Controller.CurrentRunDirectory)) {
+        return [pscustomobject]@{ Success = $true; AlreadyStopped = $true }
+    }
+    if ($Controller.StopPending) {
+        return [pscustomobject]@{ Success = $true; Pending = $true; Pid = $Controller.CurrentProcessId }
+    }
+    try { Write-AIFishBotControlCommand -RunDirectory $Controller.CurrentRunDirectory -Command 'stop' | Out-Null }
+    catch { return [pscustomobject]@{ Success = $false; Error = $_.Exception.Message; Pid = $Controller.CurrentProcessId } }
+    $Controller.StopStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+    $Controller.StopDeadlineMilliseconds = [double]$Controller.StopTimeoutSeconds * 1000.0
+    $Controller.StopPending = $true
+    return [pscustomobject]@{
+        Success = $true
+        Pending = $true
+        Pid = $Controller.CurrentProcessId
+        RunDirectory = $Controller.CurrentRunDirectory
+    }
+}
+
+function Complete-AIFishBotPendingExit {
+    param([Parameter(Mandatory = $true)]$Controller)
+    if (-not $Controller.ExitAfterStop) { return }
+    $Controller.ExitAfterStop = $false
+    $Controller.Exiting = $true
+    $Controller.View.Exit()
+}
+
+function Update-AIFishBotStopPoll {
+    param(
+        [Parameter(Mandatory = $true)]$Controller,
+        [AllowNull()]$Status
+    )
+    if ($null -ne $Status) {
+        $state = [string](Get-AIFishBotObjectPropertyValue $Status 'state' '')
+        if ($state -in @('stopped', 'error')) {
+            Update-AIFishBotViewStatus -Controller $Controller -Status $Status | Out-Null
+            Complete-AIFishBotPendingExit -Controller $Controller
+            return
+        }
+        Update-AIFishBotViewStatus -Controller $Controller -Status $Status | Out-Null
+    }
+    if (-not $Controller.StopPending -or $null -eq $Controller.StopStopwatch) { return }
+    if ($Controller.StopStopwatch.Elapsed.TotalMilliseconds -lt $Controller.StopDeadlineMilliseconds) { return }
+
+    $Controller.StopPending = $false
+    $Controller.StopStopwatch.Stop()
+    $Controller.StopStopwatch = $null
+    if (& $Controller.ConfirmProvider 'ForceStop') {
+        $result = $Controller.ForceStop()
+        if ($result.Success) { Complete-AIFishBotPendingExit -Controller $Controller }
+        else { $Controller.ExitAfterStop = $false }
+    }
+    else { $Controller.ExitAfterStop = $false }
+}
+
 function Clear-AIFishBotStaleRun {
     param([Parameter(Mandatory = $true)]$Controller)
     Clear-AIFishBotActiveMarker $Controller
     $Controller.CurrentRunDirectory = $null
     $Controller.CurrentProcessId = 0
+    $Controller.CurrentProcessStartedAt = $null
     $Controller.ConfigVersion = 0
+    $Controller.StopPending = $false
+    if ($null -ne $Controller.StopStopwatch) { $Controller.StopStopwatch.Stop() }
+    $Controller.StopStopwatch = $null
     Set-AIFishBotRunningState -Controller $Controller -Running $false | Out-Null
 }
 
@@ -637,78 +940,60 @@ function Resume-AIFishBotRun {
         }
     }
     $allowFallback = -not $PSBoundParameters.ContainsKey('RunDirectory')
+    $candidatePaths = New-Object System.Collections.ArrayList
     if ($allowFallback) {
-        $markerHasUsableDirectory = $false
+        if (Test-Path -LiteralPath $Controller.RuntimeRoot -PathType Container) {
+            foreach ($directory in @(Get-ChildItem -LiteralPath $Controller.RuntimeRoot -Directory -ErrorAction SilentlyContinue |
+                    Sort-Object LastWriteTimeUtc -Descending)) {
+                [void]$candidatePaths.Add($directory.FullName)
+            }
+        }
+    }
+    elseif (-not [string]::IsNullOrWhiteSpace($RunDirectory)) {
+        [void]$candidatePaths.Add($RunDirectory)
+    }
+
+    $seen = @{}
+    foreach ($candidatePath in @($candidatePaths)) {
+        if ([string]::IsNullOrWhiteSpace([string]$candidatePath)) { continue }
+        try { $key = [System.IO.Path]::GetFullPath([string]$candidatePath).ToUpperInvariant() }
+        catch { continue }
+        if ($seen.ContainsKey($key)) { continue }
+        $seen[$key] = $true
+        $candidate = Get-AIFishBotRunCandidate -Controller $Controller -RunDirectory ([string]$candidatePath)
+        if ($null -eq $candidate) { continue }
+
         try {
-            $marker = Read-AIFishBotJson -Path $Controller.ActiveMarkerPath
-            $RunDirectory = [string](Get-AIFishBotObjectPropertyValue $marker 'runDirectory' '')
-            $markerHasUsableDirectory = -not [string]::IsNullOrWhiteSpace($RunDirectory)
-        }
-        catch { }
-        if (-not $markerHasUsableDirectory) {
-            Clear-AIFishBotActiveMarker $Controller
-            $active = Get-AIFishBotActiveRun $Controller
-            if ($null -ne $active) { $RunDirectory = $active.RunDirectory }
-        }
-    }
-    if ([string]::IsNullOrWhiteSpace($RunDirectory)) {
-        Clear-AIFishBotStaleRun $Controller
-        return [pscustomobject]@{ Success = $false; IsStale = $true; Error = '没有可恢复的后台运行。' }
-    }
-    try {
-        $status = & $Controller.StatusReader $RunDirectory
-        $processId = [int](Get-AIFishBotObjectPropertyValue $status 'processId' 0)
-        if ($processId -le 0) { throw '后台状态缺少有效的进程编号。' }
-        $process = @(& $Controller.ProcessLookup $processId)
-        if ($process.Count -eq 0 -or $null -eq $process[-1]) { throw '后台进程已经不存在。' }
-        if (-not (Test-AIFishBotHeartbeatFresh -Status $status -Now (& $Controller.Clock) -MaxAgeSeconds $Controller.HeartbeatMaxAgeSeconds)) {
-            throw '后台心跳已经过期。'
-        }
-        $state = [string](Get-AIFishBotObjectPropertyValue $status 'state' '')
-        if ($state -in @('stopped', 'error')) { throw '后台运行已经结束。' }
-        $start = Read-AIFishBotJson -Path (Join-Path $RunDirectory 'start-config.json')
-        $live = Read-AIFishBotJson -Path (Join-Path $RunDirectory 'live-config.json')
-        foreach ($field in $script:AIFishBotLiveFields) {
-            $property = $live.PSObject.Properties[$field]
-            if ($null -ne $property) { Set-AIFishBotObjectPropertyValue $start $field $property.Value }
-        }
-        Set-AIFishBotViewFromConfig -Controller $Controller -Config $start | Out-Null
-        $Controller.CurrentRunDirectory = [System.IO.Path]::GetFullPath($RunDirectory)
-        $Controller.CurrentProcessId = $processId
-        $Controller.ConfigVersion = [int](Get-AIFishBotObjectPropertyValue $live 'configVersion' (Get-AIFishBotObjectPropertyValue $status 'configVersion' 0))
-        Set-AIFishBotRunningState -Controller $Controller -Running $true | Out-Null
-        $markerWriteError = $null
-        try { Write-AIFishBotActiveMarker $Controller }
-        catch { $markerWriteError = $_.Exception.Message }
-        Update-AIFishBotViewStatus -Controller $Controller -Status $status | Out-Null
-        return [pscustomobject]@{
-            Success = $true
-            RunDirectory = $Controller.CurrentRunDirectory
-            Pid = $processId
-            MarkerWriteFailed = ($null -ne $markerWriteError)
-            Warning = $markerWriteError
-        }
-    }
-    catch {
-        Clear-AIFishBotStaleRun $Controller
-        if ($allowFallback) {
-            $active = Get-AIFishBotActiveRun $Controller
-            $sameDirectory = $false
-            if ($null -ne $active) {
-                try {
-                    $sameDirectory = [string]::Equals(
-                        [System.IO.Path]::GetFullPath($active.RunDirectory),
-                        [System.IO.Path]::GetFullPath($RunDirectory),
-                        [System.StringComparison]::OrdinalIgnoreCase)
-                }
-                catch { $sameDirectory = $false }
-            }
-            if ($null -ne $active -and -not $sameDirectory) {
-                return Resume-AIFishBotRun -Controller $Controller -RunDirectory $active.RunDirectory
+            $start = Copy-AIFishBotControllerObject $candidate.MergedConfig
+            $live = $candidate.LiveConfig
+            Set-AIFishBotViewFromConfig -Controller $Controller -Config $start | Out-Null
+            $Controller.CurrentRunDirectory = $candidate.RunDirectory
+            $Controller.CurrentProcessId = $candidate.Pid
+            $Controller.CurrentProcessStartedAt = $candidate.ProcessStartedAt.ToString('o')
+            $Controller.ConfigVersion = [int](Get-AIFishBotObjectPropertyValue $live 'configVersion' `
+                    (Get-AIFishBotObjectPropertyValue $candidate.Status 'configVersion' 0))
+            Set-AIFishBotRunningState -Controller $Controller -Running $true | Out-Null
+            $markerWriteError = $null
+            try { Write-AIFishBotActiveMarker $Controller }
+            catch { $markerWriteError = $_.Exception.Message }
+            Update-AIFishBotViewStatus -Controller $Controller -Status $candidate.Status | Out-Null
+            return [pscustomobject]@{
+                Success = $true
+                RunDirectory = $Controller.CurrentRunDirectory
+                Pid = $candidate.Pid
+                MarkerWriteFailed = ($null -ne $markerWriteError)
+                Warning = $markerWriteError
             }
         }
-        return [pscustomobject]@{ Success = $false; IsStale = $true; Error = $_.Exception.Message }
+        catch {
+            Clear-AIFishBotStaleRun $Controller
+            if (-not $allowFallback) {
+                return [pscustomobject]@{ Success = $false; IsStale = $true; Error = $_.Exception.Message }
+            }
+        }
     }
+    Clear-AIFishBotStaleRun $Controller
+    return [pscustomobject]@{ Success = $false; IsStale = $true; Error = '没有可恢复的后台运行。' }
 }
 
 function Get-AIFishBotTrayItem {
@@ -776,20 +1061,59 @@ function Read-AIFishBotControllerLogDelta {
         [System.IO.FileMode]::Open,
         [System.IO.FileAccess]::Read,
         $share)
-    $reader = $null
     try {
-        $reset = -not $sameFile -or $stream.Length -lt $Controller.LastLogFileOffset
-        $offset = if ($reset) { [math]::Max(0, $stream.Length - 262144) } else { $Controller.LastLogFileOffset }
+        $signatureMatches = $true
+        if ($sameFile -and $Controller.LastLogFileOffset -gt 0 -and
+            -not [string]::IsNullOrWhiteSpace($Controller.LastLogByteSignature)) {
+            $expectedBytes = [System.Convert]::FromBase64String($Controller.LastLogByteSignature)
+            $signatureStart = $Controller.LastLogFileOffset - $expectedBytes.Length
+            if ($signatureStart -lt 0 -or $stream.Length -lt $Controller.LastLogFileOffset) {
+                $signatureMatches = $false
+            }
+            else {
+                [void]$stream.Seek($signatureStart, [System.IO.SeekOrigin]::Begin)
+                $actualBytes = New-Object byte[] $expectedBytes.Length
+                $actualCount = $stream.Read($actualBytes, 0, $actualBytes.Length)
+                $signatureMatches = $actualCount -eq $expectedBytes.Length -and
+                    [System.Convert]::ToBase64String($actualBytes) -ceq $Controller.LastLogByteSignature
+            }
+        }
+        $reset = -not $sameFile -or $stream.Length -lt $Controller.LastLogFileOffset -or -not $signatureMatches
+        if ($reset -or $null -eq $Controller.LastLogDecoder) {
+            $Controller.LastLogDecoder = (New-Object System.Text.UTF8Encoding($false, $true)).GetDecoder()
+            $Controller.LastLogByteSignature = ''
+        }
+        $offset = if ($reset) { 0L } else { [long]$Controller.LastLogFileOffset }
         [void]$stream.Seek($offset, [System.IO.SeekOrigin]::Begin)
-        $reader = New-Object System.IO.StreamReader($stream, [System.Text.Encoding]::UTF8, $true, 4096, $true)
-        if ($reset -and $offset -gt 0) { [void]$reader.ReadLine() }
-        $delta = $reader.ReadToEnd()
+        $builder = New-Object System.Text.StringBuilder
+        $buffer = New-Object byte[] 4096
+        while (($read = $stream.Read($buffer, 0, $buffer.Length)) -gt 0) {
+            $characters = New-Object char[] ($read + 2)
+            $characterCount = $Controller.LastLogDecoder.GetChars(
+                $buffer, 0, $read, $characters, 0, $false)
+            if ($characterCount -gt 0) { [void]$builder.Append($characters, 0, $characterCount) }
+        }
+        $delta = $builder.ToString()
+        if ($reset -and $offset -eq 0 -and $delta.Length -gt 0 -and
+            $delta.StartsWith([string][char]0xFEFF, [System.StringComparison]::Ordinal)) {
+            $delta = $delta.Substring(1)
+        }
         $Controller.LastLogPath = $fullPath
         $Controller.LastLogFileOffset = $stream.Position
+        $signatureLength = [int][math]::Min(256, $Controller.LastLogFileOffset)
+        if ($signatureLength -gt 0) {
+            [void]$stream.Seek($Controller.LastLogFileOffset - $signatureLength, [System.IO.SeekOrigin]::Begin)
+            $signature = New-Object byte[] $signatureLength
+            $signatureRead = $stream.Read($signature, 0, $signature.Length)
+            if ($signatureRead -eq $signatureLength) {
+                $Controller.LastLogByteSignature = [System.Convert]::ToBase64String($signature)
+            }
+            else { $Controller.LastLogByteSignature = '' }
+        }
+        else { $Controller.LastLogByteSignature = '' }
         return $delta
     }
     finally {
-        if ($null -ne $reader) { $reader.Dispose() }
         $stream.Dispose()
     }
 }
@@ -863,10 +1187,50 @@ function Update-AIFishBotViewLog {
 }
 
 function Add-AIFishBotEventHandler {
-    param([AllowNull()]$Target, [Parameter(Mandatory = $true)][string]$EventName, [Parameter(Mandatory = $true)][scriptblock]$Handler)
+    param(
+        [AllowNull()]$Target,
+        [Parameter(Mandatory = $true)][string]$EventName,
+        [Parameter(Mandatory = $true)][scriptblock]$Handler,
+        [AllowNull()]$Binding
+    )
     if ($null -eq $Target) { return }
     $method = $Target.PSObject.Methods['Add_' + $EventName]
-    if ($null -ne $method) { $method.Invoke($Handler) | Out-Null }
+    if ($null -ne $method) {
+        $method.Invoke($Handler) | Out-Null
+        if ($null -ne $Binding) {
+            [void]$Binding.Entries.Add([pscustomobject]@{
+                    Target = $Target
+                    EventName = $EventName
+                    Handler = $Handler
+                })
+        }
+    }
+}
+
+function New-AIFishBotControllerBinding {
+    param([Parameter(Mandatory = $true)]$View)
+    $binding = [pscustomobject]@{
+        View = $View
+        Entries = New-Object System.Collections.ArrayList
+        Disposed = $false
+    }
+    $binding | Add-Member -MemberType ScriptMethod -Name Dispose -Value {
+        if ($this.Disposed) { return }
+        $this.Disposed = $true
+        for ($index = $this.Entries.Count - 1; $index -ge 0; $index -= 1) {
+            $entry = $this.Entries[$index]
+            $method = $entry.Target.PSObject.Methods['Remove_' + $entry.EventName]
+            if ($null -ne $method) {
+                try { $method.Invoke($entry.Handler) | Out-Null } catch { }
+            }
+        }
+        $this.Entries.Clear()
+        $property = $this.View.PSObject.Properties['_ControllerBinding']
+        if ($null -ne $property -and [object]::ReferenceEquals($property.Value, $this)) {
+            $property.Value = $null
+        }
+    }
+    return $binding
 }
 
 function Invoke-AIFishBotControllerViewChanged {
@@ -894,8 +1258,13 @@ function Invoke-AIFishBotExit {
             $Controller.View.Exit()
             return [pscustomobject]@{ Success = $true; ContinuedInBackground = $true }
         }
-        $stopped = $Controller.RequestStop()
-        if (-not $stopped.Success) { return $stopped }
+        $Controller.ExitAfterStop = $true
+        $requested = $Controller.BeginStop()
+        if (-not $requested.Success) {
+            $Controller.ExitAfterStop = $false
+            return $requested
+        }
+        return [pscustomobject]@{ Success = $true; Pending = $true }
     }
     $Controller.Exiting = $true
     $Controller.View.Exit()
@@ -904,6 +1273,15 @@ function Invoke-AIFishBotExit {
 
 function Bind-AIFishBotControllerEvents {
     param([Parameter(Mandatory = $true)]$Controller)
+    $viewBindingProperty = $Controller.View.PSObject.Properties['_ControllerBinding']
+    if ($null -ne $viewBindingProperty -and $null -ne $viewBindingProperty.Value) {
+        $viewBindingProperty.Value.Dispose()
+    }
+    $binding = New-AIFishBotControllerBinding -View $Controller.View
+    if ($null -eq $viewBindingProperty) {
+        $Controller.View | Add-Member -MemberType NoteProperty -Name '_ControllerBinding' -Value $binding
+    }
+    else { $viewBindingProperty.Value = $binding }
     foreach ($entry in $script:AIFishBotFieldMap.GetEnumerator()) {
         $controlName = $entry.Value
         $control = Get-AIFishBotControllerControl $Controller $controlName
@@ -911,50 +1289,55 @@ function Bind-AIFishBotControllerEvents {
         elseif ($entry.Key -in $script:AIFishBotNumericFields) { 'ValueChanged' }
         elseif ($entry.Key -in @('castKey', 'bobberKey', 'logoutKey', 'picoComPort')) { 'SelectedIndexChanged' }
         else { 'TextChanged' }
-        Add-AIFishBotEventHandler $control $eventName ({ $Controller.HandleViewChanged($controlName) }.GetNewClosure())
+        Add-AIFishBotEventHandler $control $eventName ({ $Controller.HandleViewChanged($controlName) }.GetNewClosure()) -Binding $binding
     }
     $grid = Get-AIFishBotControllerControl $Controller 'BuffGrid'
     foreach ($eventName in @('CellValueChanged', 'RowsAdded', 'RowsRemoved')) {
-        Add-AIFishBotEventHandler $grid $eventName ({ $Controller.HandleViewChanged('BuffGrid') }.GetNewClosure())
+        Add-AIFishBotEventHandler $grid $eventName ({ $Controller.HandleViewChanged('BuffGrid') }.GetNewClosure()) -Binding $binding
     }
-    Add-AIFishBotEventHandler (Get-AIFishBotControllerControl $Controller 'SaveButton') 'Click' ({ Save-AIFishBotCurrentProfile $Controller | Out-Null }.GetNewClosure())
+    Add-AIFishBotEventHandler (Get-AIFishBotControllerControl $Controller 'SaveButton') 'Click' ({ Save-AIFishBotCurrentProfile $Controller | Out-Null }.GetNewClosure()) -Binding $binding
     Add-AIFishBotEventHandler (Get-AIFishBotControllerControl $Controller 'StartStopButton') 'Click' ({
-            if ($Controller.IsRunning) { $Controller.RequestStop() | Out-Null }
+            if ($Controller.IsRunning) { $Controller.BeginStop() | Out-Null }
             else { Start-AIFishBotRun $Controller | Out-Null }
-        }.GetNewClosure())
-    Add-AIFishBotEventHandler (Get-AIFishBotControllerControl $Controller 'NewProfileButton') 'Click' ({ $Controller.NewProfile() | Out-Null }.GetNewClosure())
-    Add-AIFishBotEventHandler (Get-AIFishBotControllerControl $Controller 'CopyProfileButton') 'Click' ({ $Controller.CopyProfile() | Out-Null }.GetNewClosure())
-    Add-AIFishBotEventHandler (Get-AIFishBotControllerControl $Controller 'RenameProfileButton') 'Click' ({ $Controller.RenameProfile() | Out-Null }.GetNewClosure())
-    Add-AIFishBotEventHandler (Get-AIFishBotControllerControl $Controller 'DeleteProfileButton') 'Click' ({ $Controller.DeleteProfile() | Out-Null }.GetNewClosure())
+        }.GetNewClosure()) -Binding $binding
+    Add-AIFishBotEventHandler (Get-AIFishBotControllerControl $Controller 'NewProfileButton') 'Click' ({ $Controller.NewProfile() | Out-Null }.GetNewClosure()) -Binding $binding
+    Add-AIFishBotEventHandler (Get-AIFishBotControllerControl $Controller 'CopyProfileButton') 'Click' ({ $Controller.CopyProfile() | Out-Null }.GetNewClosure()) -Binding $binding
+    Add-AIFishBotEventHandler (Get-AIFishBotControllerControl $Controller 'RenameProfileButton') 'Click' ({ $Controller.RenameProfile() | Out-Null }.GetNewClosure()) -Binding $binding
+    Add-AIFishBotEventHandler (Get-AIFishBotControllerControl $Controller 'DeleteProfileButton') 'Click' ({ $Controller.DeleteProfile() | Out-Null }.GetNewClosure()) -Binding $binding
     Add-AIFishBotEventHandler (Get-AIFishBotControllerControl $Controller 'ProfileSelector') 'SelectedIndexChanged' ({
             if (-not $Controller.SuppressDirty) {
                 $selected = [string](Get-AIFishBotControllerControl $Controller 'ProfileSelector').SelectedItem
                 if (-not [string]::IsNullOrWhiteSpace($selected) -and $selected -ne $Controller.CurrentProfileName) { $Controller.SwitchProfile($selected) | Out-Null }
             }
-        }.GetNewClosure())
-    Add-AIFishBotEventHandler (Get-AIFishBotTrayItem $Controller 'OpenItem') 'Click' ({ $Controller.OpenView() }.GetNewClosure())
-    Add-AIFishBotEventHandler $Controller.View.TrayIcon 'DoubleClick' ({ $Controller.OpenView() }.GetNewClosure())
-    Add-AIFishBotEventHandler (Get-AIFishBotTrayItem $Controller 'StartItem') 'Click' ({ Start-AIFishBotRun $Controller | Out-Null }.GetNewClosure())
-    Add-AIFishBotEventHandler (Get-AIFishBotTrayItem $Controller 'StopItem') 'Click' ({ $Controller.RequestStop() | Out-Null }.GetNewClosure())
-    Add-AIFishBotEventHandler (Get-AIFishBotTrayItem $Controller 'ExitItem') 'Click' ({ $Controller.ExitApplication() | Out-Null }.GetNewClosure())
+        }.GetNewClosure()) -Binding $binding
+    Add-AIFishBotEventHandler (Get-AIFishBotTrayItem $Controller 'OpenItem') 'Click' ({ $Controller.OpenView() }.GetNewClosure()) -Binding $binding
+    Add-AIFishBotEventHandler $Controller.View.TrayIcon 'DoubleClick' ({ $Controller.OpenView() }.GetNewClosure()) -Binding $binding
+    Add-AIFishBotEventHandler (Get-AIFishBotTrayItem $Controller 'StartItem') 'Click' ({ Start-AIFishBotRun $Controller | Out-Null }.GetNewClosure()) -Binding $binding
+    Add-AIFishBotEventHandler (Get-AIFishBotTrayItem $Controller 'StopItem') 'Click' ({ $Controller.BeginStop() | Out-Null }.GetNewClosure()) -Binding $binding
+    Add-AIFishBotEventHandler (Get-AIFishBotTrayItem $Controller 'ExitItem') 'Click' ({ $Controller.ExitApplication() | Out-Null }.GetNewClosure()) -Binding $binding
     Add-AIFishBotEventHandler $Controller.View.Form 'Resize' ({
             if ([string]$Controller.View.Form.WindowState -like '*Minimized*') {
                 $Controller.View.Form.Hide(); $Controller.View.TrayIcon.Visible = $true
             }
-        }.GetNewClosure())
+        }.GetNewClosure()) -Binding $binding
     Add-AIFishBotEventHandler $Controller.View.Form 'FormClosing' ({
             param($sender, $eventArgs)
-            if (-not $Controller.Exiting) {
+            if (-not $Controller.Exiting -and $null -ne $eventArgs -and
+                [string]$eventArgs.CloseReason -eq 'UserClosing') {
                 if ($null -ne $eventArgs -and $null -ne $eventArgs.PSObject.Properties['Cancel']) { $eventArgs.Cancel = $true }
                 $Controller.View.Form.Hide(); $Controller.View.TrayIcon.Visible = $true
             }
-        }.GetNewClosure())
+        }.GetNewClosure()) -Binding $binding
     Add-AIFishBotEventHandler $Controller.View.Timers.Status 'Tick' ({
             if ($Controller.IsRunning -and -not [string]::IsNullOrWhiteSpace($Controller.CurrentRunDirectory)) {
-                try { Update-AIFishBotViewStatus $Controller (& $Controller.StatusReader $Controller.CurrentRunDirectory) | Out-Null } catch { }
+                $status = $null
+                try { $status = & $Controller.StatusReader $Controller.CurrentRunDirectory } catch { }
+                if ($Controller.StopPending) { $Controller.HandleStatusTick($status) }
+                elseif ($null -ne $status) { Update-AIFishBotViewStatus $Controller $status | Out-Null }
             }
-        }.GetNewClosure())
-    Add-AIFishBotEventHandler $Controller.View.Timers.Log 'Tick' ({ Update-AIFishBotViewLog $Controller | Out-Null }.GetNewClosure())
+        }.GetNewClosure()) -Binding $binding
+    Add-AIFishBotEventHandler $Controller.View.Timers.Log 'Tick' ({ Update-AIFishBotViewLog $Controller | Out-Null }.GetNewClosure()) -Binding $binding
+    return $binding
 }
 
 function New-AIFishBotController {
@@ -979,14 +1362,18 @@ function New-AIFishBotController {
         [scriptblock]$ForceStopper = { param($ProcessId) Stop-Process -Id $ProcessId -Force -ErrorAction Stop },
         [scriptblock]$AvailablePortsProvider = { Get-AIFishBotControllerAvailablePorts },
         [ValidateRange(0.1, 3600)][double]$HeartbeatMaxAgeSeconds = 5,
-        [ValidateRange(1, 60000)][int]$PollIntervalMilliseconds = 100
+        [ValidateRange(1, 60000)][int]$PollIntervalMilliseconds = 100,
+        [ValidateRange(0, 3600)][double]$StopTimeoutSeconds = 10
     )
     $profilesPath = [System.IO.Path]::GetFullPath($ProfilesDirectory)
     $runtimePath = [System.IO.Path]::GetFullPath($RuntimeRoot)
+    $dataRoot = [System.IO.Path]::GetDirectoryName($runtimePath.TrimEnd('\', '/'))
+    if ([string]::IsNullOrWhiteSpace($dataRoot)) { $dataRoot = $runtimePath }
     $controller = [pscustomobject]@{
         View = $View
         ProfilesDirectory = $profilesPath
         RuntimeRoot = $runtimePath
+        DataRoot = $dataRoot
         ActiveMarkerPath = (Join-Path $runtimePath 'active-run.json')
         EngineScriptPath = [System.IO.Path]::GetFullPath($EngineScriptPath)
         DependencyChecker = $DependencyChecker
@@ -1002,21 +1389,32 @@ function New-AIFishBotController {
         AvailablePortsProvider = $AvailablePortsProvider
         HeartbeatMaxAgeSeconds = $HeartbeatMaxAgeSeconds
         PollIntervalMilliseconds = $PollIntervalMilliseconds
+        StopTimeoutSeconds = $StopTimeoutSeconds
+        MarkerProcessStartToleranceSeconds = 2.0
+        LegacyProcessStartToleranceSeconds = 30.0
         CurrentProfileName = ''
         CurrentConfig = $null
         CurrentRunDirectory = $null
         CurrentProcessId = 0
+        CurrentProcessStartedAt = $null
         ConfigVersion = 0
         IsRunning = $false
         IsDirty = $false
         SuppressDirty = $false
         Exiting = $false
+        ExitAfterStop = $false
+        StopPending = $false
+        StopStopwatch = $null
+        StopDeadlineMilliseconds = 0.0
         LastStatus = $null
         LastLogSourceLength = 0
         LastLogSourceTail = ''
         LastLogPath = ''
         LastLogFileOffset = 0L
+        LastLogDecoder = $null
+        LastLogByteSignature = ''
         RawLogHistory = ''
+        Binding = $null
     }
     $controller | Add-Member -MemberType ScriptMethod -Name MarkDirty -Value {
         if (-not $this.SuppressDirty) { Set-AIFishBotSaveState -Controller $this -Dirty $true }
@@ -1039,6 +1437,13 @@ function New-AIFishBotController {
             return $this.ForceStop()
         }
         return $result
+    }
+    $controller | Add-Member -MemberType ScriptMethod -Name BeginStop -Value {
+        return Request-AIFishBotRunStop -Controller $this
+    }
+    $controller | Add-Member -MemberType ScriptMethod -Name HandleStatusTick -Value {
+        param($Status)
+        Update-AIFishBotStopPoll -Controller $this -Status $Status
     }
     $controller | Add-Member -MemberType ScriptMethod -Name SwitchProfile -Value {
         param([string]$ProfileName)
@@ -1129,6 +1534,26 @@ function New-AIFishBotController {
         if ($this.CurrentProcessId -le 0) { return [pscustomobject]@{ Success = $false; Error = '没有可强制停止的进程。' } }
         try {
             $pidValue = $this.CurrentProcessId
+            if ([string]::IsNullOrWhiteSpace($this.CurrentRunDirectory)) { throw '没有可核对的后台运行目录。' }
+            $status = & $this.StatusReader $this.CurrentRunDirectory
+            $marker = Get-AIFishBotControllerMarkerForRun -Controller $this `
+                -RunDirectory $this.CurrentRunDirectory -ProcessId $pidValue
+            $trackedStart = ConvertTo-AIFishBotControllerDateTimeOffset $this.CurrentProcessStartedAt
+            if ($null -ne $trackedStart -and $null -ne $marker -and
+                $null -ne $marker.PSObject.Properties['processStartedAt']) {
+                $markerStart = ConvertTo-AIFishBotControllerDateTimeOffset $marker.processStartedAt
+                if ($null -eq $markerStart -or
+                    [math]::Abs(($markerStart - $trackedStart).TotalSeconds) -gt $this.MarkerProcessStartToleranceSeconds) {
+                    throw '运行标记中的进程启动时间已经改变。'
+                }
+            }
+            $identity = Test-AIFishBotControllerProcessIdentity -Controller $this -ProcessId $pidValue `
+                -Status $status -Marker $marker -Process $null
+            if (-not $identity.Success) { throw $identity.Error }
+            if ($null -ne $trackedStart -and
+                [math]::Abs(($identity.ProcessStartedAt - $trackedStart).TotalSeconds) -gt $this.MarkerProcessStartToleranceSeconds) {
+                throw '当前进程的启动时间与已跟踪运行不匹配。'
+            }
             & $this.ForceStopper $pidValue
             Clear-AIFishBotStaleRun $this
             return [pscustomobject]@{ Success = $true; Pid = $pidValue }
@@ -1136,7 +1561,14 @@ function New-AIFishBotController {
         catch { return [pscustomobject]@{ Success = $false; Error = $_.Exception.Message; Pid = $this.CurrentProcessId } }
     }
 
-    Bind-AIFishBotControllerEvents $controller
+    $controller | Add-Member -MemberType ScriptMethod -Name Dispose -Value {
+        if ($null -ne $this.Binding) {
+            $this.Binding.Dispose()
+            $this.Binding = $null
+        }
+    }
+
+    $controller.Binding = Bind-AIFishBotControllerEvents $controller
     Set-AIFishBotProfileItems $controller @(Get-AIFishBotProfiles $profilesPath)
     Set-AIFishBotRunningState $controller $false | Out-Null
     return $controller
