@@ -683,12 +683,39 @@ function Invoke-AIFishBotStop {
         Set-AIFishBotEngineStateValue -State $State -Value 'stopping'
     }
     if ($Logout) {
-        try {
-            Invoke-AIFishBotEngineKey -State $State -Key ([string]$State.LockedConfig.logoutKey)
+        $sendLogoutKey = $true
+        if ([bool]$State.LockedConfig.useWindowFocus) {
+            try {
+                $focusValues = @(
+                    Invoke-AIFishBotAdapterMember -Adapter $State.Adapter -Name 'FocusWindow'
+                )
+                foreach ($focusValue in $focusValues) {
+                    if ($focusValue -is [bool] -and -not [bool]$focusValue) {
+                        $sendLogoutKey = $false
+                        break
+                    }
+                }
+                if (-not $sendLogoutKey) {
+                    Write-AIFishBotEngineLog -State $State -Level Warning `
+                        -Message 'Logout key skipped because window focus returned false.'
+                }
+            }
+            catch {
+                $sendLogoutKey = $false
+                Write-AIFishBotEngineLog -State $State -Level Warning `
+                    -Message ('Logout key skipped because window focus failed: {0}' -f
+                        $_.Exception.Message)
+            }
         }
-        catch {
-            Write-AIFishBotEngineLog -State $State -Level Warning `
-                -Message ('Logout key failed: {0}' -f $_.Exception.Message)
+        if ($sendLogoutKey) {
+            try {
+                Invoke-AIFishBotEngineKey -State $State `
+                    -Key ([string]$State.LockedConfig.logoutKey)
+            }
+            catch {
+                Write-AIFishBotEngineLog -State $State -Level Warning `
+                    -Message ('Logout key failed: {0}' -f $_.Exception.Message)
+            }
         }
     }
     Send-AIFishBotEngineNotification -State $State -EventName stop

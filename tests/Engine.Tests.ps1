@@ -1616,6 +1616,161 @@ Test-Case 'latest auto-stop settings stop immediately and send the locked logout
     }
 }
 
+Test-Case 'auto logout focuses before sending the locked key when focus succeeds' {
+    $adapter = New-SimulatedAdapter
+    $capturedContext = $adapter.Context
+    $adapter.FocusWindow = ({
+            [void]$capturedContext.Events.Add('focus')
+            return $true
+        }.GetNewClosure())
+    $config = New-EngineConfig -Values @{
+        autoStop = $true
+        autoStopTime = 0.5
+        autoLogout = $true
+        useWindowFocus = $true
+        logoutKey = 'F8'
+    }
+    $state = $null
+    try {
+        $state = New-EngineTestState -Config $config -Adapter $adapter
+        $adapter.Context.MonotonicMilliseconds = 60000
+
+        Start-AIFishBotEngineLoop -State $state | Out-Null
+
+        Assert-Equal -Expected @('focus', 'key:F8') -Actual @($adapter.Context.Events)
+        Assert-Equal -Expected @('ready', 'stopping', 'stopped') -Actual @($state.StateHistory)
+        Assert-Equal -Expected 1 -Actual $adapter.Context.DisposeCount
+    }
+    finally {
+        Remove-EngineTestState -State $state
+    }
+}
+
+Test-Case 'auto logout accepts a legacy focus adapter with no return value' {
+    $adapter = New-SimulatedAdapter
+    $config = New-EngineConfig -Values @{
+        autoStop = $true
+        autoStopTime = 0.5
+        autoLogout = $true
+        useWindowFocus = $true
+        logoutKey = 'F8'
+    }
+    $state = $null
+    try {
+        $state = New-EngineTestState -Config $config -Adapter $adapter
+        $adapter.Context.MonotonicMilliseconds = 60000
+
+        Start-AIFishBotEngineLoop -State $state | Out-Null
+
+        Assert-Equal -Expected @('focus', 'key:F8') -Actual @($adapter.Context.Events)
+        Assert-Equal -Expected 'stopped' -Actual $state.State
+        Assert-Equal -Expected 1 -Actual $adapter.Context.DisposeCount
+    }
+    finally {
+        Remove-EngineTestState -State $state
+    }
+}
+
+Test-Case 'auto logout skips the key when focus explicitly returns false' {
+    $adapter = New-SimulatedAdapter
+    $capturedContext = $adapter.Context
+    $adapter.FocusWindow = ({
+            [void]$capturedContext.Events.Add('focus')
+            return $false
+        }.GetNewClosure())
+    $config = New-EngineConfig -Values @{
+        autoStop = $true
+        autoStopTime = 0.5
+        autoLogout = $true
+        useWindowFocus = $true
+        enableNotifications = $true
+        notifyOnStart = $false
+        notifyOnStop = $true
+        discordWebhook = 'https://discord.com/api/webhooks/123/focus-false-test-token'
+    }
+    $state = $null
+    try {
+        $state = New-EngineTestState -Config $config -Adapter $adapter
+        $adapter.Context.MonotonicMilliseconds = 60000
+
+        Start-AIFishBotEngineLoop -State $state | Out-Null
+
+        Assert-Equal -Expected @('focus', 'notify:stop') -Actual @($adapter.Context.Events)
+        Assert-Equal -Expected 0 -Actual (Get-EventCount -Adapter $adapter -Event 'key:F8')
+        Assert-Equal -Expected @('ready', 'stopping', 'stopped') -Actual @($state.StateHistory)
+        Assert-Equal -Expected 1 -Actual $adapter.Context.DisposeCount
+        $logPath = Join-Path -Path $state.RunDirectory -ChildPath 'logs\2026-07-13.log'
+        $logText = [System.IO.File]::ReadAllText($logPath)
+        Assert-True -Condition ($logText -like '*Logout key skipped*focus*false*')
+    }
+    finally {
+        Remove-EngineTestState -State $state
+    }
+}
+
+Test-Case 'auto logout skips the key and stops cleanly when focus throws' {
+    $adapter = New-SimulatedAdapter
+    $capturedContext = $adapter.Context
+    $adapter.FocusWindow = ({
+            [void]$capturedContext.Events.Add('focus')
+            throw 'simulated focus failure'
+        }.GetNewClosure())
+    $config = New-EngineConfig -Values @{
+        autoStop = $true
+        autoStopTime = 0.5
+        autoLogout = $true
+        useWindowFocus = $true
+        enableNotifications = $true
+        notifyOnStart = $false
+        notifyOnStop = $true
+        discordWebhook = 'https://discord.com/api/webhooks/123/focus-throw-test-token'
+    }
+    $state = $null
+    try {
+        $state = New-EngineTestState -Config $config -Adapter $adapter
+        $adapter.Context.MonotonicMilliseconds = 60000
+
+        Start-AIFishBotEngineLoop -State $state | Out-Null
+
+        Assert-Equal -Expected @('focus', 'notify:stop') -Actual @($adapter.Context.Events)
+        Assert-Equal -Expected 0 -Actual (Get-EventCount -Adapter $adapter -Event 'key:F8')
+        Assert-Equal -Expected @('ready', 'stopping', 'stopped') -Actual @($state.StateHistory)
+        Assert-Equal -Expected 1 -Actual $adapter.Context.DisposeCount
+        $logPath = Join-Path -Path $state.RunDirectory -ChildPath 'logs\2026-07-13.log'
+        $logText = [System.IO.File]::ReadAllText($logPath)
+        Assert-True -Condition ($logText -like '*Logout key skipped*simulated focus failure*')
+    }
+    finally {
+        Remove-EngineTestState -State $state
+    }
+}
+
+Test-Case 'auto logout sends the key directly when window focus is disabled' {
+    $adapter = New-SimulatedAdapter
+    $adapter.FocusWindow = { throw 'focus should not be called' }
+    $config = New-EngineConfig -Values @{
+        autoStop = $true
+        autoStopTime = 0.5
+        autoLogout = $true
+        useWindowFocus = $false
+        logoutKey = 'F8'
+    }
+    $state = $null
+    try {
+        $state = New-EngineTestState -Config $config -Adapter $adapter
+        $adapter.Context.MonotonicMilliseconds = 60000
+
+        Start-AIFishBotEngineLoop -State $state | Out-Null
+
+        Assert-Equal -Expected @('key:F8') -Actual @($adapter.Context.Events)
+        Assert-Equal -Expected 'stopped' -Actual $state.State
+        Assert-Equal -Expected 1 -Actual $adapter.Context.DisposeCount
+    }
+    finally {
+        Remove-EngineTestState -State $state
+    }
+}
+
 Test-Case 'a running webhook update changes only the later stop notification address' {
     $adapter = New-SimulatedAdapter
     $oldWebhook = 'https://discord.com/api/webhooks/123/old-secret-token'
