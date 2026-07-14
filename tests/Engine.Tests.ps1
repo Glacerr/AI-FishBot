@@ -1738,6 +1738,71 @@ Test-Case 'failed stop-time live reload keeps the last config and masks its warn
     }
 }
 
+Test-Case 'stop remains final when its live refresh status write fails once' {
+    $holder = @{ State = $null }
+    $refresh = @{ StopRead = $false; CandidateReturned = $false; StatusFailed = $false }
+    $capturedHolder = $holder
+    $capturedRefresh = $refresh
+    $adapter = New-SimulatedAdapter -ThrowOnReadPeak
+    $adapterContext = $adapter.Context
+    $adapter.Now = {
+        if ($null -ne $capturedHolder.State -and
+            $capturedHolder.State.ConfigVersion -eq 1 -and
+            -not $capturedRefresh.StatusFailed) {
+            $capturedRefresh.StatusFailed = $true
+            throw 'status failed for https://discord.com/api/webhooks/999/private-status-token'
+        }
+        return $adapterContext.Now
+    }.GetNewClosure()
+    $webhook = 'https://discord.com/api/webhooks/123/usable-stop-token'
+    $config = New-EngineConfig -Values @{
+        useWeakAura = $false
+        enableNotifications = $true
+        notifyOnStart = $false
+        notifyOnStop = $true
+        discordWebhook = $webhook
+    }
+    $loader = {
+        param($state)
+        if (-not $capturedRefresh.StopRead -or $capturedRefresh.CandidateReturned) {
+            return $null
+        }
+        $capturedRefresh.CandidateReturned = $true
+        return [pscustomobject]@{
+            ConfigVersion = 1
+            Config = [pscustomobject]@{ audioSensitivity = 9 }
+        }
+    }.GetNewClosure()
+    $reader = {
+        param($state)
+        if ($capturedRefresh.StopRead) { return $null }
+        $capturedRefresh.StopRead = $true
+        return [pscustomobject]@{ command = 'stop' }
+    }.GetNewClosure()
+    $state = $null
+    try {
+        $state = New-EngineTestState -Config $config -Adapter $adapter `
+            -LiveConfigLoader $loader -ControlReader $reader
+        $holder.State = $state
+
+        Start-AIFishBotEngineLoop -State $state | Out-Null
+
+        Assert-Equal -Expected $true -Actual $refresh.StatusFailed
+        Assert-Equal -Expected $true -Actual $state.StopRequested
+        Assert-Equal -Expected @('ready', 'stopping', 'stopped') -Actual @($state.StateHistory)
+        Assert-Equal -Expected 0 -Actual (Get-EventCount -Adapter $adapter -Event 'key:F6')
+        Assert-Equal -Expected @('stop') -Actual @($adapter.Context.Notifications.EventName)
+        Assert-Equal -Expected @($webhook) -Actual @($adapter.Context.Notifications.Webhook)
+        $logPath = Join-Path -Path $state.RunDirectory -ChildPath 'logs\2026-07-13.log'
+        $logText = [System.IO.File]::ReadAllText($logPath)
+        Assert-True -Condition ($logText -like '*Stop-time live config refresh failed*')
+        Assert-True -Condition (-not $logText.Contains('private-status-token'))
+    }
+    finally {
+        Remove-EngineTestState -State $state
+    }
+}
+
 Test-Case 'stop control follows stopping then stopped without logout' {
     $adapter = New-SimulatedAdapter
     $reader = { param($state) return [pscustomobject]@{ command = 'stop' } }

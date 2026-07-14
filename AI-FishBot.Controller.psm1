@@ -76,6 +76,22 @@ function Get-AIFishBotControllerControl {
     return $property.Value
 }
 
+function Format-AIFishBotControllerError {
+    param(
+        [AllowNull()]
+        [AllowEmptyString()]
+        [string]$Message,
+
+        [AllowEmptyString()]
+        [string]$Prefix = ''
+    )
+
+    $safeMessage = Protect-AIFishBotSecret -Text $Message
+    if ([string]::IsNullOrWhiteSpace($Prefix)) { return $safeMessage }
+    if ([string]::IsNullOrWhiteSpace($safeMessage)) { return $Prefix }
+    return '{0}：{1}' -f $Prefix, $safeMessage
+}
+
 function Get-AIFishBotObjectPropertyValue {
     param([AllowNull()]$InputObject, [string]$Name, $Default = $null)
     if ($null -eq $InputObject) { return $Default }
@@ -736,7 +752,7 @@ function Save-AIFishBotCurrentProfile {
             Success = $false
             ProfileSaved = $false
             LiveConfigSaved = $false
-            Error = $_.Exception.Message
+            Error = Format-AIFishBotControllerError -Message $_.Exception.Message
         }
     }
     $Controller.CurrentConfig = Copy-AIFishBotControllerObject $saved
@@ -746,8 +762,8 @@ function Save-AIFishBotCurrentProfile {
             [void](Write-AIFishBotControllerLiveConfig $Controller $config)
         }
         catch {
-            $safeDetail = Protect-AIFishBotSecret -Text ([string]$_.Exception.Message)
-            $errorMessage = '方案已保存，但后台实时配置写入失败：{0}' -f $safeDetail
+            $errorMessage = Format-AIFishBotControllerError -Message $_.Exception.Message `
+                -Prefix '方案已保存，但后台实时配置写入失败'
             $saveState = Get-AIFishBotControllerControl -Controller $Controller -Name 'SaveStateLabel'
             if ($null -ne $saveState) { $saveState.Text = $errorMessage }
             return [pscustomobject]@{
@@ -964,7 +980,7 @@ function Invoke-AIFishBotDependencyInstall {
         $result = [pscustomobject]@{
             Success = $false
             Summary = '声音组件安装失败。'
-            Details = $_.Exception.Message
+            Details = Format-AIFishBotControllerError -Message $_.Exception.Message
         }
     }
     finally {
@@ -1133,7 +1149,7 @@ function Start-AIFishBotRun {
                     Pid = $processId
                     MarkerWriteFailed = ($postStartStage -eq 'Marker')
                     RecoveryStateWriteFailed = $true
-                    Warning = $_.Exception.Message
+                    Warning = Format-AIFishBotControllerError -Message $_.Exception.Message
                 }
             }
             if ($null -ne $runDirectory -and (Test-Path -LiteralPath $runDirectory)) {
@@ -1143,7 +1159,10 @@ function Start-AIFishBotRun {
             $Controller.CurrentProcessId = 0
             $Controller.CurrentProcessStartedAt = $null
             Set-AIFishBotRunningState -Controller $Controller -Running $false | Out-Null
-            return [pscustomobject]@{ Success = $false; Error = $_.Exception.Message }
+            return [pscustomobject]@{
+                Success = $false
+                Error = Format-AIFishBotControllerError -Message $_.Exception.Message
+            }
         }
     }
     return Invoke-AIFishBotControllerMutex -Scope 'Start' -Path $Controller.DataRoot -Operation $operation
@@ -1161,7 +1180,13 @@ function Stop-AIFishBotRun {
     $runDirectory = $Controller.CurrentRunDirectory
     $pidValue = $Controller.CurrentProcessId
     try { Write-AIFishBotControlCommand -RunDirectory $runDirectory -Command 'stop' | Out-Null }
-    catch { return [pscustomobject]@{ Success = $false; Error = $_.Exception.Message; Pid = $pidValue } }
+    catch {
+        return [pscustomobject]@{
+            Success = $false
+            Error = Format-AIFishBotControllerError -Message $_.Exception.Message
+            Pid = $pidValue
+        }
+    }
     $deadline = (& $Controller.Clock).AddSeconds($TimeoutSeconds)
     do {
         try {
@@ -1196,7 +1221,13 @@ function Request-AIFishBotRunStop {
         return [pscustomobject]@{ Success = $true; Pending = $true; Pid = $Controller.CurrentProcessId }
     }
     try { Write-AIFishBotControlCommand -RunDirectory $Controller.CurrentRunDirectory -Command 'stop' | Out-Null }
-    catch { return [pscustomobject]@{ Success = $false; Error = $_.Exception.Message; Pid = $Controller.CurrentProcessId } }
+    catch {
+        return [pscustomobject]@{
+            Success = $false
+            Error = Format-AIFishBotControllerError -Message $_.Exception.Message
+            Pid = $Controller.CurrentProcessId
+        }
+    }
     $Controller.StopStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
     $Controller.StopDeadlineMilliseconds = [double]$Controller.StopTimeoutSeconds * 1000.0
     $Controller.StopPending = $true
@@ -1320,7 +1351,9 @@ function Resume-AIFishBotRun {
             Set-AIFishBotRunningState -Controller $Controller -Running $true | Out-Null
             $markerWriteError = $null
             try { Write-AIFishBotActiveMarker $Controller }
-            catch { $markerWriteError = $_.Exception.Message }
+            catch {
+                $markerWriteError = Format-AIFishBotControllerError -Message $_.Exception.Message
+            }
             Update-AIFishBotViewStatus -Controller $Controller -Status $candidate.Status | Out-Null
             return [pscustomobject]@{
                 Success = $true
@@ -1333,7 +1366,11 @@ function Resume-AIFishBotRun {
         catch {
             Clear-AIFishBotStaleRun $Controller
             if (-not $allowFallback) {
-                return [pscustomobject]@{ Success = $false; IsStale = $true; Error = $_.Exception.Message }
+                return [pscustomobject]@{
+                    Success = $false
+                    IsStale = $true
+                    Error = Format-AIFishBotControllerError -Message $_.Exception.Message
+                }
             }
         }
     }
@@ -1896,7 +1933,12 @@ function New-AIFishBotController {
             Set-AIFishBotProfileItems $this @(Get-AIFishBotProfiles $this.ProfilesDirectory)
             return [pscustomobject]@{ Success = $true; Config = $config }
         }
-        catch { return [pscustomobject]@{ Success = $false; Error = $_.Exception.Message } }
+        catch {
+            return [pscustomobject]@{
+                Success = $false
+                Error = Format-AIFishBotControllerError -Message $_.Exception.Message
+            }
+        }
     }
     $controller | Add-Member -MemberType ScriptMethod -Name NewProfile -Value {
         if ($this.IsRunning) { return [pscustomobject]@{ Success = $false; Error = '运行中不能新建方案。' } }
@@ -1914,7 +1956,12 @@ function New-AIFishBotController {
             Set-AIFishBotProfileItems $this @(Get-AIFishBotProfiles $this.ProfilesDirectory)
             return [pscustomobject]@{ Success = $true; Config = $saved }
         }
-        catch { return [pscustomobject]@{ Success = $false; Error = $_.Exception.Message } }
+        catch {
+            return [pscustomobject]@{
+                Success = $false
+                Error = Format-AIFishBotControllerError -Message $_.Exception.Message
+            }
+        }
     }
     $controller | Add-Member -MemberType ScriptMethod -Name CopyProfile -Value {
         if ($this.IsRunning) { return [pscustomobject]@{ Success = $false; Error = '运行中不能复制方案。' } }
@@ -1934,7 +1981,12 @@ function New-AIFishBotController {
             Set-AIFishBotProfileItems $this @(Get-AIFishBotProfiles $this.ProfilesDirectory)
             return [pscustomobject]@{ Success = $true; Config = $saved }
         }
-        catch { return [pscustomobject]@{ Success = $false; Error = $_.Exception.Message } }
+        catch {
+            return [pscustomobject]@{
+                Success = $false
+                Error = Format-AIFishBotControllerError -Message $_.Exception.Message
+            }
+        }
     }
     $controller | Add-Member -MemberType ScriptMethod -Name RenameProfile -Value {
         if ($this.IsRunning) { return [pscustomobject]@{ Success = $false; Error = '运行中不能重命名方案。' } }
@@ -1946,7 +1998,12 @@ function New-AIFishBotController {
             Set-AIFishBotProfileItems $this @(Get-AIFishBotProfiles $this.ProfilesDirectory)
             return [pscustomobject]@{ Success = $true; Config = $saved }
         }
-        catch { return [pscustomobject]@{ Success = $false; Error = $_.Exception.Message } }
+        catch {
+            return [pscustomobject]@{
+                Success = $false
+                Error = Format-AIFishBotControllerError -Message $_.Exception.Message
+            }
+        }
     }
     $controller | Add-Member -MemberType ScriptMethod -Name ResetProfile -Value {
         if ($this.IsRunning) {
@@ -2031,7 +2088,12 @@ function New-AIFishBotController {
             Set-AIFishBotProfileItems $this @($saved.profileName)
             return [pscustomobject]@{ Success = $true; Config = $saved }
         }
-        catch { return [pscustomobject]@{ Success = $false; Error = $_.Exception.Message } }
+        catch {
+            return [pscustomobject]@{
+                Success = $false
+                Error = Format-AIFishBotControllerError -Message $_.Exception.Message
+            }
+        }
     }
     $controller | Add-Member -MemberType ScriptMethod -Name ForceStop -Value {
         if ($this.CurrentProcessId -le 0) { return [pscustomobject]@{ Success = $false; Error = '没有可强制停止的进程。' } }
@@ -2061,7 +2123,13 @@ function New-AIFishBotController {
             Clear-AIFishBotStaleRun $this
             return [pscustomobject]@{ Success = $true; Pid = $pidValue }
         }
-        catch { return [pscustomobject]@{ Success = $false; Error = $_.Exception.Message; Pid = $this.CurrentProcessId } }
+        catch {
+            return [pscustomobject]@{
+                Success = $false
+                Error = Format-AIFishBotControllerError -Message $_.Exception.Message
+                Pid = $this.CurrentProcessId
+            }
+        }
     }
 
     $controller | Add-Member -MemberType ScriptMethod -Name Dispose -Value {

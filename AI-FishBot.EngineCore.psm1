@@ -723,7 +723,17 @@ function Test-AIFishBotEngineCheckpoint {
             $command = Get-AIFishBotEngineProperty -InputObject $controlValues[0] -Name 'command' `
                 -Found ([ref]$commandFound)
             if ($commandFound -and [string]$command -ieq 'stop') {
-                [void](Update-AIFishBotLiveConfig -State $State)
+                try {
+                    [void](Update-AIFishBotLiveConfig -State $State)
+                }
+                catch {
+                    try {
+                        Write-AIFishBotEngineLog -State $State -Level Warning `
+                            -Message ('Stop-time live config refresh failed: {0}' -f $_.Exception.Message)
+                    }
+                    catch {
+                    }
+                }
                 Invoke-AIFishBotStop -State $State -Reason 'control command' | Out-Null
                 return $false
             }

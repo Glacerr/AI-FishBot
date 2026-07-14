@@ -302,6 +302,27 @@ Test-Case 'Controller owns a resolvable default serial-port provider' {
     Assert-True -Condition ($null -ne $command)
 }
 
+Test-Case 'Controller private error formatter masks webhook exceptions for every display surface' {
+    $webhook = 'https://discord.com/api/webhooks/654321/private-controller-token'
+    $exception = $null
+    try { throw ('simulated controller failure: {0}' -f $webhook) }
+    catch { $exception = $_.Exception }
+    $safeError = & (Get-Module 'AI-FishBot.Controller') {
+        param($message)
+        Format-AIFishBotControllerError -Message $message `
+            -Prefix '后台实时配置写入失败'
+    } $exception.Message
+    $result = [pscustomobject]@{ Success = $false; Error = $safeError }
+    $view = New-ControllerFakeView
+    $view.Controls.SaveStateLabel.Text = $safeError
+
+    Assert-True -Condition ($result.Error -like '后台实时配置写入失败*')
+    Assert-Equal -Expected $result.Error -Actual $view.Controls.SaveStateLabel.Text
+    Assert-True -Condition (-not $result.Error.Contains($webhook))
+    Assert-True -Condition (-not $result.Error.Contains('private-controller-token'))
+    Assert-True -Condition ($result.Error -like '*https://discord.com/api/webhooks/***')
+}
+
 Test-Case 'Config and every editable view field round trip without marking a load dirty' {
     $root = New-TestDirectory
     try {
