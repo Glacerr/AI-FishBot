@@ -59,6 +59,45 @@ Test-Case 'test directories are unique and created on disk' {
     }
 }
 
+Test-Case 'repository ignores every root profile JSON artifact' {
+    $repositoryRoot = Split-Path -Path $script:SmokeTestRoot -Parent
+    $temporaryId = [guid]::NewGuid().ToString()
+    $profileArtifacts = @(
+        'profiles/default.json',
+        'profiles/default.json.backup',
+        "profiles/default.json.$temporaryId.tmp",
+        'profiles/default.json.failed',
+        'profiles/default.json.backup.stale'
+    )
+    $exitCodes = @()
+
+    foreach ($relativePath in $profileArtifacts) {
+        & git -C $repositoryRoot check-ignore --quiet --no-index -- $relativePath
+        $exitCodes += $LASTEXITCODE
+    }
+
+    Assert-Equal -Expected @(0, 0, 0, 0, 0) -Actual $exitCodes
+}
+
+Test-Case 'profile ignore rule stays scoped to the root profile directory' {
+    $repositoryRoot = Split-Path -Path $script:SmokeTestRoot -Parent
+    $temporaryId = [guid]::NewGuid().ToString()
+    $neighboringFiles = @(
+        'profiles.ps1',
+        'profiles.md',
+        'docs/profiles/example.json.backup',
+        "tests/fixtures/profiles/example.json.$temporaryId.tmp"
+    )
+    $exitCodes = @()
+
+    foreach ($relativePath in $neighboringFiles) {
+        & git -C $repositoryRoot check-ignore --quiet --no-index -- $relativePath
+        $exitCodes += $LASTEXITCODE
+    }
+
+    Assert-Equal -Expected @(1, 1, 1, 1) -Actual $exitCodes
+}
+
 Test-Case 'Assert-Throws matches exception messages' {
     Assert-Throws -ScriptBlock {
         throw 'fishing hook failed'
