@@ -222,22 +222,89 @@ Test-Case 'engine state keeps locked and live snapshots with runtime counters' {
     }
 }
 
-Test-Case 'a below-threshold peak is written by the natural retry heartbeat without stopping' {
-    $adapter = New-SimulatedAdapter -Peaks @([double]4.75, [double]5)
-    $config = New-EngineConfig -Values @{
-        useWeakAura = $true
-        fishingRetries = 2
-        audioSensitivity = 5
+Test-Case 'waiting-for-bite publishes a below-threshold peak only at the next periodic heartbeat' {
+    $holder = @{ State = $null }
+    $observation = @{
+        WaitingHeartbeat = $null
+        Before = $null
+        EngineAtBefore = $null
+        After = $null
+        EngineAtAfter = $null
+        StopReady = $false
     }
+    $capturedHolder = $holder
+    $capturedObservation = $observation
+    $onSleep = {
+        param($milliseconds)
+        $state = $capturedHolder.State
+        if ($null -eq $state -or $state.State -ne 'waiting-for-bite') {
+            return
+        }
+        if ($null -eq $capturedObservation.WaitingHeartbeat) {
+            $capturedObservation.WaitingHeartbeat =
+                [double]$state.LastHeartbeatMonotonicMilliseconds
+        }
+        $heartbeatDue = [double]$capturedObservation.WaitingHeartbeat + 1000
+        $monotonicNow = [double]$state.Adapter.Context.MonotonicMilliseconds
+        if ($null -eq $capturedObservation.Before -and
+            $monotonicNow -ge ($heartbeatDue - 100) -and $monotonicNow -lt $heartbeatDue) {
+            $capturedObservation.Before = Read-AIFishBotStatus -RunDirectory $state.RunDirectory
+            $capturedObservation.EngineAtBefore = [pscustomobject]@{
+                MonotonicMilliseconds = $monotonicNow
+                LastHeartbeatMonotonicMilliseconds =
+                    [double]$state.LastHeartbeatMonotonicMilliseconds
+            }
+        }
+        if ($null -eq $capturedObservation.After -and
+            [double]$state.LastHeartbeatMonotonicMilliseconds -ge $heartbeatDue) {
+            $capturedObservation.After = Read-AIFishBotStatus -RunDirectory $state.RunDirectory
+            $capturedObservation.EngineAtAfter = [pscustomobject]@{
+                MonotonicMilliseconds = $monotonicNow
+                LastHeartbeatMonotonicMilliseconds =
+                    [double]$state.LastHeartbeatMonotonicMilliseconds
+                HookCount = [int]$state.HookCount
+                RetryCount = [int]$state.RetryCount
+                StopRequested = [bool]$state.StopRequested
+                StateHistory = @($state.StateHistory)
+            }
+            $capturedObservation.StopReady = $true
+        }
+    }.GetNewClosure()
+    $peaks = @(1..12 | ForEach-Object { [double]4.75 })
+    $adapter = New-SimulatedAdapter -Peaks $peaks -OnSleep $onSleep
+    $reader = {
+        param($state)
+        if ($capturedObservation.StopReady) {
+            return [pscustomobject]@{ command = 'stop' }
+        }
+        return $null
+    }.GetNewClosure()
+    $config = New-EngineConfig -Values @{ useWeakAura = $false; audioSensitivity = 5 }
     $state = $null
     try {
-        $state = New-EngineTestState -Config $config -Adapter $adapter
+        $state = New-EngineTestState -Config $config -Adapter $adapter -ControlReader $reader
+        $holder.State = $state
 
-        Assert-Equal -Expected $true -Actual (Invoke-AIFishBotCast -State $state)
-        $status = Read-AIFishBotStatus -RunDirectory $state.RunDirectory
-        Assert-Equal -Expected ([double]4.75) -Actual $status.audioPeak
-        Assert-Equal -Expected $false -Actual $state.StopRequested
-        Assert-Equal -Expected 'casting' -Actual $status.state
+        Start-AIFishBotEngineLoop -State $state | Out-Null
+
+        Assert-True -Condition ($null -ne $observation.Before)
+        Assert-True -Condition ($null -ne $observation.After)
+        Assert-Equal -Expected ([double]0) -Actual $observation.Before.audioPeak
+        Assert-Equal -Expected 'waiting-for-bite' -Actual $observation.Before.state
+        Assert-True -Condition ($observation.EngineAtBefore.MonotonicMilliseconds -lt
+            ([double]$observation.WaitingHeartbeat + 1000))
+        Assert-Equal -Expected ([double]$observation.WaitingHeartbeat) `
+            -Actual $observation.EngineAtBefore.LastHeartbeatMonotonicMilliseconds
+        Assert-Equal -Expected ([double]4.75) -Actual $observation.After.audioPeak
+        Assert-Equal -Expected 'waiting-for-bite' -Actual $observation.After.state
+        Assert-Equal -Expected ([double]($observation.WaitingHeartbeat + 1000)) `
+            -Actual $observation.EngineAtAfter.LastHeartbeatMonotonicMilliseconds
+        Assert-Equal -Expected 0 -Actual $observation.EngineAtAfter.HookCount
+        Assert-Equal -Expected 0 -Actual $observation.EngineAtAfter.RetryCount
+        Assert-Equal -Expected $false -Actual $observation.EngineAtAfter.StopRequested
+        Assert-Equal -Expected @('ready', 'casting', 'waiting-for-bite') `
+            -Actual $observation.EngineAtAfter.StateHistory
+        Assert-Equal -Expected 0 -Actual (Get-EventCount -Adapter $adapter -Event 'key:F7')
     }
     finally {
         Remove-EngineTestState -State $state
