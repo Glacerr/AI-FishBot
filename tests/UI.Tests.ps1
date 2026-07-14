@@ -544,6 +544,14 @@ Test-Case 'notification and log controls are controller ready' {
     Assert-Equal -Expected ([System.Windows.Forms.ComboBoxStyle]::DropDownList) -Actual $script:View.Controls.LogLevel.DropDownStyle
 }
 
+Test-Case 'footer has enough room for the full unverified background warning' {
+    $warning = '发现无法验证的后台，可能仍在运行，需要手动处理。'
+    $label = $script:View.Controls.SaveStateLabel
+    $requiredWidth = [System.Windows.Forms.TextRenderer]::MeasureText($warning, $label.Font).Width
+
+    Assert-True -Condition ($label.ClientSize.Width -ge $requiredWidth)
+}
+
 Test-Case 'tray menu and timers expose lifecycle actions without running them' {
     Assert-True -Condition ($script:View.TrayIcon -is [System.Windows.Forms.NotifyIcon])
     Assert-Equal -Expected $false -Actual $script:View.TrayIcon.Visible

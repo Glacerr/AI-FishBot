@@ -241,7 +241,7 @@ function New-AIFishBotMainView {
     $footerPanel.BackColor = $script:AIFishBotColors.Card
     $controls.FooterPanel = $footerPanel
 
-    $saveStateLabel = New-AIFishBotLabel -Text '所有更改已保存' -X 16 -Y 20 -Width 220 -Height 28 -ForeColor $script:AIFishBotColors.Muted
+    $saveStateLabel = New-AIFishBotLabel -Text '所有更改已保存' -X 16 -Y 20 -Width 400 -Height 28 -ForeColor $script:AIFishBotColors.Muted
     $saveStateLabel.Anchor = [System.Windows.Forms.AnchorStyles]::Left -bor [System.Windows.Forms.AnchorStyles]::Top
     $footerPanel.Controls.Add($saveStateLabel)
     $controls.SaveStateLabel = $saveStateLabel

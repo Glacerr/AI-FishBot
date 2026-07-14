@@ -229,7 +229,16 @@ try {
             return ($choice -eq [Windows.Forms.DialogResult]::Yes)
         }.GetNewClosure()
         $confirmExitProvider = {
-            param($Running)
+            param($Running, $Unverified)
+            if ($Unverified) {
+                $choice = [Windows.Forms.MessageBox]::Show(
+                    '发现无法验证的后台，它可能仍在运行且不能安全停止。是否仍然退出？',
+                    'AI FishBot',
+                    [Windows.Forms.MessageBoxButtons]::YesNo,
+                    [Windows.Forms.MessageBoxIcon]::Warning)
+                if ($choice -eq [Windows.Forms.DialogResult]::Yes) { return 'Continue' }
+                return 'Cancel'
+            }
             $choice = [Windows.Forms.MessageBox]::Show(
                 '后台仍在运行。是否先停止后台再退出？选择“否”会让后台继续运行。',
                 'AI FishBot',

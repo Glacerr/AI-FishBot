@@ -217,6 +217,70 @@ function Remove-ControllerTestDirectory {
     }
 }
 
+function Invoke-ControllerRealButtonClick {
+    param([Parameter(Mandatory = $true)]$Button)
+    $method = $Button.GetType().GetMethod(
+        'OnClick',
+        [System.Reflection.BindingFlags]::Instance -bor [System.Reflection.BindingFlags]::NonPublic)
+    if ($null -eq $method) { throw '无法触发真实按钮的点击事件。' }
+    $method.Invoke($Button, [object[]]@([System.EventArgs]::Empty)) | Out-Null
+}
+
+function Assert-UnverifiedMarkerBlocksRealViewStart {
+    param([Parameter(Mandatory = $true)][scriptblock]$MarkerFactory)
+
+    $root = New-TestDirectory
+    $view = $null
+    try {
+        Import-Module (Join-Path -Path (Split-Path -Path $PSScriptRoot -Parent) `
+                -ChildPath 'AI-FishBot.UI.psm1') -Force
+        $view = New-AIFishBotMainView
+        $processStart = [datetimeoffset]'2026-07-13T10:00:00.1234567+08:00'
+        $run = New-AIFishBotRunDirectory -RuntimeRoot (Join-Path $root 'runtime') `
+            -StartConfig (New-ControllerTestConfig) `
+            -LiveConfig ([pscustomobject]@{ configVersion = 1 })
+        $status = [pscustomobject]@{
+            processId = 1562; state = 'ready'; startedAt = $processStart.ToString('o')
+            processStartedAt = $processStart.ToString('o')
+            heartbeatAt = $processStart.AddSeconds(5).ToString('o'); configVersion = 1
+        }
+        $marker = & $MarkerFactory $run $processStart
+        $markerPath = Join-Path (Join-Path $root 'runtime') 'active-run.json'
+        Write-AIFishBotAtomicJson -Path $markerPath -InputObject $marker | Out-Null
+        $markerBefore = Get-Content -LiteralPath $markerPath -Raw
+        $state = [pscustomobject]@{ StarterCalls = 0 }
+        $controller = New-ControllerForTest -View $view -Root $root `
+            -StatusReader { param($path) $status } `
+            -ProcessLookup {
+                param($id)
+                if ($id -eq 1562) {
+                    [pscustomobject]@{ Id = $id; StartTime = $processStart.UtcDateTime }
+                }
+            } `
+            -ProcessStarter {
+                param($request)
+                $state.StarterCalls += 1
+                [pscustomobject]@{ Id = 2562; StartTime = $processStart.AddMinutes(1).UtcDateTime }
+            }
+        Set-AIFishBotViewFromConfig -Controller $controller -Config (New-ControllerTestConfig) | Out-Null
+
+        Invoke-ControllerRealButtonClick $view.Controls.StartStopButton
+
+        Assert-Equal -Expected 0 -Actual $state.StarterCalls
+        Assert-Equal -Expected $false -Actual $controller.IsRunning
+        Assert-True -Condition ($null -ne $controller.UnverifiedBackground)
+        Assert-Equal -Expected 1562 -Actual $controller.UnverifiedBackground.Pid
+        Assert-Equal -Expected '发现无法验证的后台，可能仍在运行，需要手动处理。' `
+            -Actual $view.Controls.SaveStateLabel.Text
+        Assert-True -Condition ($view.Controls.StatusBadge.Text -like '*后台身份待处理*')
+        Assert-Equal -Expected $markerBefore -Actual (Get-Content -LiteralPath $markerPath -Raw)
+    }
+    finally {
+        if ($null -ne $view) { $view.Dispose() }
+        Remove-ControllerTestDirectory $root
+    }
+}
+
 Test-Case 'Controller exports its public commands' {
     $expected = @(
         'New-AIFishBotController', 'Set-AIFishBotViewFromConfig', 'Get-AIFishBotConfigFromView',
@@ -1137,6 +1201,34 @@ Test-Case 'Exact process identity rejects PID reuse after a wall-clock rollback'
     }
 }
 
+Test-Case 'Real hidden view blocks start and warns when marker start identity is damaged' {
+    Assert-UnverifiedMarkerBlocksRealViewStart -MarkerFactory {
+        param($run, $processStart)
+        [pscustomobject]@{
+            runDirectory = $run; processId = 1562; processStartedAt = '损坏的启动时间'
+        }
+    }
+}
+
+Test-Case 'Real hidden view blocks start and warns when marker PID conflicts with status' {
+    Assert-UnverifiedMarkerBlocksRealViewStart -MarkerFactory {
+        param($run, $processStart)
+        [pscustomobject]@{
+            runDirectory = $run; processId = 9999; processStartedAt = $processStart.ToString('o')
+        }
+    }
+}
+
+Test-Case 'Real hidden view blocks start and warns when marker start conflicts with status' {
+    Assert-UnverifiedMarkerBlocksRealViewStart -MarkerFactory {
+        param($run, $processStart)
+        [pscustomobject]@{
+            runDirectory = $run; processId = 1562
+            processStartedAt = $processStart.AddSeconds(1).ToString('o')
+        }
+    }
+}
+
 Test-Case 'Legacy status without exact identity blocks recovery force stop and duplicate start' {
     $root = New-TestDirectory
     try {
@@ -1190,6 +1282,180 @@ Test-Case 'Legacy status without exact identity blocks recovery force stop and d
         Remove-Variable legacyUnknownForceCalls, legacyUnknownStarterCalls -Scope Script `
             -ErrorAction SilentlyContinue
     }
+}
+
+Test-Case 'Real hidden view keeps a legacy background warning through Start and Exit bindings' {
+    $root = New-TestDirectory
+    $view = $null
+    try {
+        Import-Module (Join-Path -Path (Split-Path -Path $PSScriptRoot -Parent) `
+                -ChildPath 'AI-FishBot.UI.psm1') -Force
+        $view = New-AIFishBotMainView
+        $processStart = [datetimeoffset]'2026-07-13T10:00:00+08:00'
+        $run = New-AIFishBotRunDirectory -RuntimeRoot (Join-Path $root 'runtime') `
+            -StartConfig (New-ControllerTestConfig) `
+            -LiveConfig ([pscustomobject]@{ configVersion = 1 })
+        $status = [pscustomobject]@{
+            processId = 1563; state = 'ready'; startedAt = $processStart.ToString('o')
+            heartbeatAt = $processStart.AddSeconds(5).ToString('o'); configVersion = 1
+        }
+        Write-AIFishBotAtomicJson -Path (Join-Path $run 'status.json') -InputObject $status | Out-Null
+        $state = [pscustomobject]@{
+            StarterCalls = 0; ForceCalls = 0; ExitConfirmCalls = 0
+            ExitRunning = $null; ExitUnverified = $null; ExitChoice = 'Cancel'
+        }
+        $controller = New-ControllerForTest -View $view -Root $root `
+            -StatusReader { param($path) Read-AIFishBotStatus -RunDirectory $path } `
+            -ProcessLookup {
+                param($id)
+                if ($id -eq 1563) {
+                    [pscustomobject]@{ Id = $id; StartTime = $processStart.UtcDateTime }
+                }
+            } `
+            -ProcessStarter { param($request) $state.StarterCalls += 1 } `
+            -ForceStopper { param($id) $state.ForceCalls += 1 } `
+            -ConfirmExitProvider {
+                param($running, $unverified)
+                $state.ExitConfirmCalls += 1
+                $state.ExitRunning = $running
+                $state.ExitUnverified = $unverified
+                $state.ExitChoice
+            }
+        Set-AIFishBotViewFromConfig -Controller $controller -Config (New-ControllerTestConfig) | Out-Null
+
+        Resume-AIFishBotRun -Controller $controller | Out-Null
+
+        Assert-True -Condition ($null -ne $controller.UnverifiedBackground)
+        Assert-Equal -Expected 1563 -Actual $controller.UnverifiedBackground.Pid
+        Assert-Equal -Expected ([System.IO.Path]::GetFullPath($run)) `
+            -Actual $controller.UnverifiedBackground.RunDirectory
+        Assert-True -Condition ($controller.UnverifiedBackground.Reason -like '*需要手动处理*')
+        Assert-Equal -Expected '发现无法验证的后台，可能仍在运行，需要手动处理。' `
+            -Actual $view.Controls.SaveStateLabel.Text
+        Assert-True -Condition ($view.Controls.StatusBadge.Text -like '*后台身份待处理*')
+
+        Invoke-ControllerRealButtonClick $view.Controls.StartStopButton
+
+        Assert-Equal -Expected 0 -Actual $state.StarterCalls
+        Assert-Equal -Expected '发现无法验证的后台，可能仍在运行，需要手动处理。' `
+            -Actual $view.Controls.SaveStateLabel.Text
+        Assert-True -Condition ($view.Controls.StatusBadge.Text -like '*后台身份待处理*')
+
+        $exitItem = @($view.TrayMenu.Items | Where-Object { $_.Name -eq 'ExitItem' })[0]
+        $exitItem.PerformClick()
+
+        Assert-Equal -Expected 1 -Actual $state.ExitConfirmCalls
+        Assert-Equal -Expected $false -Actual $state.ExitRunning
+        Assert-Equal -Expected $true -Actual $state.ExitUnverified
+        Assert-Equal -Expected 0 -Actual $state.ForceCalls
+        Assert-Equal -Expected $false -Actual $view.Form.IsDisposed
+        Assert-Equal -Expected '发现无法验证的后台，可能仍在运行，需要手动处理。' `
+            -Actual $view.Controls.SaveStateLabel.Text
+
+        $state.ExitChoice = 'Continue'
+        $exitItem.PerformClick()
+
+        Assert-Equal -Expected 2 -Actual $state.ExitConfirmCalls
+        Assert-Equal -Expected 0 -Actual $state.ForceCalls
+        Assert-Equal -Expected $true -Actual $view.Form.IsDisposed
+    }
+    finally {
+        if ($null -ne $view) { $view.Dispose() }
+        Remove-ControllerTestDirectory $root
+    }
+}
+
+Test-Case 'An unverified block clears only after its process disappears and Start can continue' {
+    $root = New-TestDirectory
+    try {
+        $view = New-ControllerFakeView
+        $processStart = [datetimeoffset]'2026-07-13T10:00:00+08:00'
+        $run = New-AIFishBotRunDirectory -RuntimeRoot (Join-Path $root 'runtime') `
+            -StartConfig (New-ControllerTestConfig) `
+            -LiveConfig ([pscustomobject]@{ configVersion = 1 })
+        $status = [pscustomobject]@{
+            processId = 1564; state = 'ready'; startedAt = $processStart.ToString('o')
+            processStartedAt = $processStart.ToString('o')
+            heartbeatAt = $processStart.AddSeconds(5).ToString('o'); configVersion = 1
+        }
+        $state = [pscustomobject]@{ ProcessExists = $true; StarterCalls = 0 }
+        $controller = New-ControllerForTest -View $view -Root $root `
+            -StatusReader { param($path) $status } `
+            -ProcessLookup {
+                param($id)
+                if ($state.ProcessExists -and $id -eq 1564) {
+                    [pscustomobject]@{ Id = $id; StartTime = $processStart.UtcDateTime }
+                }
+            } `
+            -ProcessStarter {
+                param($request)
+                $state.StarterCalls += 1
+                [pscustomobject]@{ Id = 2564; StartTime = $processStart.AddMinutes(1).UtcDateTime }
+            }
+        Set-AIFishBotViewFromConfig -Controller $controller -Config (New-ControllerTestConfig) | Out-Null
+        Write-AIFishBotAtomicJson -Path $controller.ActiveMarkerPath -InputObject ([pscustomobject]@{
+                runDirectory = $run; processId = 1564; processStartedAt = '损坏的启动时间'
+            }) | Out-Null
+
+        Resume-AIFishBotRun -Controller $controller | Out-Null
+        Assert-True -Condition ($null -ne $controller.UnverifiedBackground)
+        $state.ProcessExists = $false
+
+        $view.Controls.StartStopButton.InvokeEvent('Click')
+
+        Assert-Equal -Expected 1 -Actual $state.StarterCalls
+        Assert-Equal -Expected $true -Actual $controller.IsRunning
+        Assert-Equal -Expected $null -Actual $controller.UnverifiedBackground
+    }
+    finally { Remove-ControllerTestDirectory $root }
+}
+
+Test-Case 'An unverified block clears after status becomes terminal and Start can continue' {
+    $root = New-TestDirectory
+    try {
+        $view = New-ControllerFakeView
+        $processStart = [datetimeoffset]'2026-07-13T10:00:00+08:00'
+        $run = New-AIFishBotRunDirectory -RuntimeRoot (Join-Path $root 'runtime') `
+            -StartConfig (New-ControllerTestConfig) `
+            -LiveConfig ([pscustomobject]@{ configVersion = 1 })
+        $state = [pscustomobject]@{ StatusState = 'ready'; StarterCalls = 0 }
+        $controller = New-ControllerForTest -View $view -Root $root `
+            -StatusReader {
+                param($path)
+                [pscustomobject]@{
+                    processId = 1565; state = $state.StatusState
+                    startedAt = $processStart.ToString('o')
+                    processStartedAt = $processStart.ToString('o')
+                    heartbeatAt = $processStart.AddSeconds(5).ToString('o'); configVersion = 1
+                }
+            } `
+            -ProcessLookup {
+                param($id)
+                if ($id -eq 1565) {
+                    [pscustomobject]@{ Id = $id; StartTime = $processStart.UtcDateTime }
+                }
+            } `
+            -ProcessStarter {
+                param($request)
+                $state.StarterCalls += 1
+                [pscustomobject]@{ Id = 2565; StartTime = $processStart.AddMinutes(1).UtcDateTime }
+            }
+        Set-AIFishBotViewFromConfig -Controller $controller -Config (New-ControllerTestConfig) | Out-Null
+        Write-AIFishBotAtomicJson -Path $controller.ActiveMarkerPath -InputObject ([pscustomobject]@{
+                runDirectory = $run; processId = 1565; processStartedAt = '损坏的启动时间'
+            }) | Out-Null
+
+        Resume-AIFishBotRun -Controller $controller | Out-Null
+        Assert-True -Condition ($null -ne $controller.UnverifiedBackground)
+        $state.StatusState = 'stopped'
+
+        $view.Controls.StartStopButton.InvokeEvent('Click')
+
+        Assert-Equal -Expected 1 -Actual $state.StarterCalls
+        Assert-Equal -Expected $true -Actual $controller.IsRunning
+        Assert-Equal -Expected $null -Actual $controller.UnverifiedBackground
+    }
+    finally { Remove-ControllerTestDirectory $root }
 }
 
 Test-Case 'Expired legacy status rejects a PID reused after its last heartbeat' {

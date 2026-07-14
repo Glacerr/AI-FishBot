@@ -58,6 +58,7 @@ $script:AIFishBotLiveControls = @(
     'BiteResponseMax', 'PreHookMin', 'PreHookMax', 'PostHookMin', 'PostHookMax',
     'PreCastMin', 'PreCastMax', 'BuffGrid', 'EnableNotifications', 'NotifyOnStop'
 )
+$script:AIFishBotUnverifiedWarning = '发现无法验证的后台，可能仍在运行，需要手动处理。'
 
 function Get-AIFishBotControllerAvailablePorts {
     return @([System.IO.Ports.SerialPort]::GetPortNames())
@@ -182,9 +183,7 @@ function Get-AIFishBotControllerMarkerForRun {
     try {
         $marker = Read-AIFishBotJson -Path $Controller.ActiveMarkerPath
         $markerDirectory = [string](Get-AIFishBotObjectPropertyValue $marker 'runDirectory' '')
-        $markerPid = [int](Get-AIFishBotObjectPropertyValue $marker 'processId' 0)
         if (-not (Test-AIFishBotControllerPathEqual $markerDirectory $RunDirectory)) { return $null }
-        if ($ProcessId -gt 0 -and $markerPid -ne $ProcessId) { return $null }
         return $marker
     }
     catch { return $null }
@@ -211,11 +210,17 @@ function Test-AIFishBotControllerProcessIdentity {
     }
     $actualPid = [int](Get-AIFishBotObjectPropertyValue $Process 'Id' 0)
     if ($actualPid -ne $ProcessId) {
-        return [pscustomobject]@{ Success = $false; Error = '查找到的进程编号不匹配。' }
+        return [pscustomobject]@{
+            Success = $false; IdentityUnverified = $true
+            Error = '查找到的进程编号不匹配，需要手动处理。'
+        }
     }
     $actualStart = Get-AIFishBotControllerProcessStartTime $Process
     if ($null -eq $actualStart) {
-        return [pscustomobject]@{ Success = $false; Error = '无法核对后台进程的启动时间。' }
+        return [pscustomobject]@{
+            Success = $false; IdentityUnverified = $true
+            Error = '无法核对后台进程的启动时间，需要手动处理。'
+        }
     }
 
     $statusStart = ConvertTo-AIFishBotControllerDateTimeOffset `
@@ -230,19 +235,36 @@ function Test-AIFishBotControllerProcessIdentity {
 
     $source = 'Status'
     $expectedStart = $statusStart
-    if ($null -ne $Marker -and $null -ne $Marker.PSObject.Properties['processStartedAt']) {
-        $markerStart = ConvertTo-AIFishBotControllerDateTimeOffset $Marker.processStartedAt
+    if ($null -ne $Marker) {
+        $markerPid = [int](Get-AIFishBotObjectPropertyValue $Marker 'processId' 0)
+        if ($markerPid -ne $ProcessId) {
+            return [pscustomobject]@{
+                Success = $false; IdentityUnverified = $true
+                Error = '运行标记与后台状态的进程编号不一致，需要手动处理。'
+            }
+        }
+        $markerStart = ConvertTo-AIFishBotControllerDateTimeOffset `
+            (Get-AIFishBotObjectPropertyValue $Marker 'processStartedAt' $null)
         if ($null -eq $markerStart) {
-            return [pscustomobject]@{ Success = $false; Error = '运行标记中的进程启动时间无效。' }
+            return [pscustomobject]@{
+                Success = $false; IdentityUnverified = $true
+                Error = '运行标记中的进程启动时间无效，需要手动处理。'
+            }
         }
         if ($markerStart.UtcDateTime.Ticks -ne $statusStart.UtcDateTime.Ticks) {
-            return [pscustomobject]@{ Success = $false; Error = '运行标记与后台状态的精确进程身份不一致。' }
+            return [pscustomobject]@{
+                Success = $false; IdentityUnverified = $true
+                Error = '运行标记与后台状态的精确进程身份不一致，需要手动处理。'
+            }
         }
         $expectedStart = $markerStart
         $source = 'Marker'
     }
     if ($actualStart.UtcDateTime.Ticks -ne $expectedStart.UtcDateTime.Ticks) {
-        return [pscustomobject]@{ Success = $false; Error = '进程编号已被其他进程重复使用。' }
+        return [pscustomobject]@{
+            Success = $false; IdentityUnverified = $true
+            Error = '进程编号可能已被其他进程重复使用，需要手动处理。'
+        }
     }
     return [pscustomobject]@{
         Success = $true
@@ -298,8 +320,136 @@ function Set-AIFishBotSaveState {
     $Controller.IsDirty = $Dirty
     $label = Get-AIFishBotControllerControl -Controller $Controller -Name 'SaveStateLabel'
     if ($null -ne $label) {
-        $label.Text = if ($Dirty) { '未保存' } else { '已保存' }
+        $label.Text = if ($null -ne $Controller.UnverifiedBackground) {
+            $script:AIFishBotUnverifiedWarning
+        }
+        elseif ($Dirty) { '未保存' }
+        else { '已保存' }
     }
+}
+
+function Show-AIFishBotUnverifiedBackground {
+    param([Parameter(Mandatory = $true)]$Controller)
+    if ($null -eq $Controller.UnverifiedBackground) { return }
+
+    $badge = Get-AIFishBotControllerControl $Controller 'StatusBadge'
+    if ($null -ne $badge) { $badge.Text = '● 后台身份待处理' }
+    $saveState = Get-AIFishBotControllerControl $Controller 'SaveStateLabel'
+    if ($null -ne $saveState) { $saveState.Text = $script:AIFishBotUnverifiedWarning }
+    $statusItem = Get-AIFishBotTrayItem $Controller 'StatusItem'
+    if ($null -ne $statusItem) { $statusItem.Text = '状态：后台身份待处理' }
+    if ($null -ne $Controller.View.Timers.Status) { $Controller.View.Timers.Status.Enabled = $true }
+}
+
+function Set-AIFishBotUnverifiedBackground {
+    param([Parameter(Mandatory = $true)]$Controller, [Parameter(Mandatory = $true)]$Reservation)
+    $runDirectory = [string](Get-AIFishBotObjectPropertyValue $Reservation 'RunDirectory' '')
+    try { $runDirectory = [System.IO.Path]::GetFullPath($runDirectory) } catch { }
+    $Controller.UnverifiedBackground = [pscustomobject][ordered]@{
+        Pid = [int](Get-AIFishBotObjectPropertyValue $Reservation 'Pid' 0)
+        RunDirectory = $runDirectory
+        Reason = $script:AIFishBotUnverifiedWarning
+        Detail = [string](Get-AIFishBotObjectPropertyValue $Reservation 'Error' '')
+    }
+    Show-AIFishBotUnverifiedBackground $Controller
+    return $Controller.UnverifiedBackground
+}
+
+function Read-AIFishBotControllerStatusRelaxed {
+    param([Parameter(Mandatory = $true)]$Controller, [Parameter(Mandatory = $true)][string]$RunDirectory)
+    try {
+        $status = & $Controller.StatusReader $RunDirectory
+        if ($null -ne $status) { return $status }
+    }
+    catch { }
+    try {
+        $statusPath = Join-Path $RunDirectory 'status.json'
+        if (Test-Path -LiteralPath $statusPath -PathType Leaf) {
+            return Read-AIFishBotJson -Path $statusPath
+        }
+    }
+    catch { }
+    return $null
+}
+
+function Clear-AIFishBotMatchingActiveMarker {
+    param(
+        [Parameter(Mandatory = $true)]$Controller,
+        [Parameter(Mandatory = $true)][string]$RunDirectory,
+        [Parameter(Mandatory = $true)][int]$ProcessId
+    )
+    try {
+        $marker = Read-AIFishBotJson -Path $Controller.ActiveMarkerPath
+        $markerDirectory = [string](Get-AIFishBotObjectPropertyValue $marker 'runDirectory' '')
+        $markerPid = [int](Get-AIFishBotObjectPropertyValue $marker 'processId' 0)
+        if ($markerPid -eq $ProcessId -and
+            (Test-AIFishBotControllerPathEqual $markerDirectory $RunDirectory)) {
+            Clear-AIFishBotActiveMarker $Controller
+        }
+    }
+    catch { }
+}
+
+function Clear-AIFishBotUnverifiedBackground {
+    param(
+        [Parameter(Mandatory = $true)]$Controller,
+        [switch]$RemoveMatchingMarker,
+        [AllowNull()]$Status
+    )
+    $reservation = $Controller.UnverifiedBackground
+    if ($null -eq $reservation) { return }
+    if ($RemoveMatchingMarker) {
+        Clear-AIFishBotMatchingActiveMarker -Controller $Controller `
+            -RunDirectory ([string]$reservation.RunDirectory) -ProcessId ([int]$reservation.Pid)
+    }
+    $Controller.UnverifiedBackground = $null
+    if (-not $Controller.IsRunning -and $null -ne $Controller.View.Timers.Status) {
+        $Controller.View.Timers.Status.Enabled = $false
+    }
+    [void](Test-AIFishBotView -Controller $Controller)
+    if ($null -ne $Status) {
+        Update-AIFishBotViewStatus -Controller $Controller -Status $Status | Out-Null
+    }
+    else {
+        $badge = Get-AIFishBotControllerControl $Controller 'StatusBadge'
+        if ($null -ne $badge) { $badge.Text = '● 已停止' }
+        $statusItem = Get-AIFishBotTrayItem $Controller 'StatusItem'
+        if ($null -ne $statusItem) { $statusItem.Text = '状态：已停止' }
+    }
+}
+
+function Update-AIFishBotUnverifiedBackground {
+    param([Parameter(Mandatory = $true)]$Controller)
+    $reservation = $Controller.UnverifiedBackground
+    if ($null -eq $reservation) { return $false }
+
+    $pidValue = [int]$reservation.Pid
+    $runDirectory = [string]$reservation.RunDirectory
+    $status = Read-AIFishBotControllerStatusRelaxed -Controller $Controller -RunDirectory $runDirectory
+    if ($null -ne $status) {
+        $statusPid = [int](Get-AIFishBotObjectPropertyValue $status 'processId' 0)
+        $state = [string](Get-AIFishBotObjectPropertyValue $status 'state' '')
+        if ($statusPid -eq $pidValue -and $state -in @('stopped', 'error')) {
+            Clear-AIFishBotUnverifiedBackground -Controller $Controller -RemoveMatchingMarker -Status $status
+            return $false
+        }
+    }
+
+    $lookupCompleted = $false
+    $processes = @()
+    try {
+        $processes = @(& $Controller.ProcessLookup $pidValue)
+        $lookupCompleted = $true
+    }
+    catch { }
+    if ($lookupCompleted -and
+        ($processes.Count -eq 0 -or $null -eq $processes[-1])) {
+        Clear-AIFishBotUnverifiedBackground -Controller $Controller -RemoveMatchingMarker
+        return $false
+    }
+
+    Show-AIFishBotUnverifiedBackground $Controller
+    return $true
 }
 
 function Get-AIFishBotControlValue {
@@ -490,7 +640,10 @@ function Test-AIFishBotView {
     }
     $saveState = Get-AIFishBotControllerControl $Controller 'SaveStateLabel'
     if ($null -ne $saveState) {
-        $saveState.Text = if ($orderedErrors.Count -gt 0) {
+        $saveState.Text = if ($null -ne $Controller.UnverifiedBackground) {
+            $script:AIFishBotUnverifiedWarning
+        }
+        elseif ($orderedErrors.Count -gt 0) {
             '配置错误：{0}' -f [string]$orderedErrors[0].Value
         }
         elseif ($Controller.IsDirty) { '未保存' }
@@ -536,6 +689,7 @@ function Set-AIFishBotRunningState {
     [CmdletBinding()]
     param([Parameter(Mandatory = $true)]$Controller, [Parameter(Mandatory = $true)][bool]$Running)
     $Controller.IsRunning = $Running
+    if ($Running) { $Controller.UnverifiedBackground = $null }
     foreach ($name in $script:AIFishBotLockedControls) {
         Set-AIFishBotControlEnabled (Get-AIFishBotControllerControl $Controller $name) (-not $Running)
     }
@@ -555,10 +709,16 @@ function Set-AIFishBotRunningState {
         $timerProperty = $Controller.View.Timers.PSObject.Properties[$timerName]
         if ($null -ne $timerProperty -and $null -ne $timerProperty.Value -and
             $null -ne $timerProperty.Value.PSObject.Properties['Enabled']) {
-            $timerProperty.Value.Enabled = $Running
+            $timerProperty.Value.Enabled = if ($timerName -eq 'Status') {
+                $Running -or $null -ne $Controller.UnverifiedBackground
+            }
+            else { $Running }
         }
     }
-    if (-not $Running) { [void](Test-AIFishBotView -Controller $Controller) }
+    if (-not $Running) {
+        [void](Test-AIFishBotView -Controller $Controller)
+        Show-AIFishBotUnverifiedBackground $Controller
+    }
 }
 
 function Save-AIFishBotCurrentProfile {
@@ -683,30 +843,26 @@ function Get-AIFishBotUnverifiedRunReservation {
         try {
             $fullPath = [System.IO.Path]::GetFullPath([string]$path)
             if (-not (Test-Path -LiteralPath $fullPath -PathType Container)) { continue }
-            $status = $null
-            try { $status = & $Controller.StatusReader $fullPath }
-            catch {
-                $statusPath = Join-Path $fullPath 'status.json'
-                if (Test-Path -LiteralPath $statusPath -PathType Leaf) {
-                    $status = Read-AIFishBotJson -Path $statusPath
-                }
-            }
+            $status = Read-AIFishBotControllerStatusRelaxed -Controller $Controller `
+                -RunDirectory $fullPath
             if ($null -eq $status) { continue }
             $state = [string](Get-AIFishBotObjectPropertyValue $status 'state' '')
             $pidValue = [int](Get-AIFishBotObjectPropertyValue $status 'processId' 0)
             if ($pidValue -le 0 -or $state -in @('stopped', 'error')) { continue }
-            $exactStart = ConvertTo-AIFishBotControllerDateTimeOffset `
-                (Get-AIFishBotObjectPropertyValue $status 'processStartedAt' $null)
-            if ($null -ne $exactStart) { continue }
             $processes = @(& $Controller.ProcessLookup $pidValue)
             if ($processes.Count -eq 0 -or $null -eq $processes[-1]) { continue }
             $process = $processes[-1]
-            if ([int](Get-AIFishBotObjectPropertyValue $process 'Id' 0) -ne $pidValue) { continue }
+            $marker = Get-AIFishBotControllerMarkerForRun -Controller $Controller `
+                -RunDirectory $fullPath -ProcessId $pidValue
+            $identity = Test-AIFishBotControllerProcessIdentity -Controller $Controller `
+                -ProcessId $pidValue -Status $status -Marker $marker -Process $process
+            if ($identity.Success) { continue }
             return [pscustomobject]@{
                 RunDirectory = $fullPath
                 Pid = $pidValue
                 IdentityUnverified = $true
-                Error = '检测到旧格式后台，但缺少精确进程身份；已阻止启动，请手动处理。'
+                Error = [string](Get-AIFishBotObjectPropertyValue $identity 'Error' `
+                        $script:AIFishBotUnverifiedWarning)
             }
         }
         catch { continue }
@@ -720,18 +876,41 @@ function Get-AIFishBotStartReservation {
         $marker = Read-AIFishBotJson -Path $Controller.ActiveMarkerPath
         $runDirectory = [string](Get-AIFishBotObjectPropertyValue $marker 'runDirectory' '')
         $pidValue = [int](Get-AIFishBotObjectPropertyValue $marker 'processId' 0)
-        $expectedStart = ConvertTo-AIFishBotControllerDateTimeOffset `
-            (Get-AIFishBotObjectPropertyValue $marker 'processStartedAt' $null)
-        if ([string]::IsNullOrWhiteSpace($runDirectory) -or $pidValue -le 0 -or $null -eq $expectedStart) { return $null }
-        if (-not (Test-Path -LiteralPath $runDirectory -PathType Container)) { return $null }
+        if ($pidValue -le 0) { return $null }
         $processes = @(& $Controller.ProcessLookup $pidValue)
         if ($processes.Count -eq 0 -or $null -eq $processes[-1]) { return $null }
         $process = $processes[-1]
-        if ([int](Get-AIFishBotObjectPropertyValue $process 'Id' 0) -ne $pidValue) { return $null }
+        if ([string]::IsNullOrWhiteSpace($runDirectory) -or
+            -not (Test-Path -LiteralPath $runDirectory -PathType Container)) {
+            return [pscustomobject]@{
+                RunDirectory = $runDirectory; Pid = $pidValue; IdentityUnverified = $true
+                Error = '运行标记缺少可核对的目录，需要手动处理。'
+            }
+        }
+        $expectedStart = ConvertTo-AIFishBotControllerDateTimeOffset `
+            (Get-AIFishBotObjectPropertyValue $marker 'processStartedAt' $null)
+        if ($null -eq $expectedStart) {
+            return [pscustomobject]@{
+                RunDirectory = [System.IO.Path]::GetFullPath($runDirectory)
+                Pid = $pidValue; IdentityUnverified = $true
+                Error = '运行标记中的进程启动时间无效，需要手动处理。'
+            }
+        }
+        if ([int](Get-AIFishBotObjectPropertyValue $process 'Id' 0) -ne $pidValue) {
+            return [pscustomobject]@{
+                RunDirectory = [System.IO.Path]::GetFullPath($runDirectory)
+                Pid = $pidValue; IdentityUnverified = $true
+                Error = '运行标记指向的进程编号无法核对，需要手动处理。'
+            }
+        }
         $actualStart = Get-AIFishBotControllerProcessStartTime $process
         if ($null -eq $actualStart -or
             $actualStart.UtcDateTime.Ticks -ne $expectedStart.UtcDateTime.Ticks) {
-            return $null
+            return [pscustomobject]@{
+                RunDirectory = [System.IO.Path]::GetFullPath($runDirectory)
+                Pid = $pidValue; IdentityUnverified = $true
+                Error = '运行标记与现有进程的精确身份不一致，需要手动处理。'
+            }
         }
         return [pscustomobject]@{ RunDirectory = [System.IO.Path]::GetFullPath($runDirectory); Pid = $pidValue }
     }
@@ -829,6 +1008,15 @@ function Start-AIFishBotRun {
             RunDirectory = $Controller.CurrentRunDirectory; Pid = $Controller.CurrentProcessId
         }
     }
+    if ($null -ne $Controller.UnverifiedBackground -and
+        (Update-AIFishBotUnverifiedBackground -Controller $Controller)) {
+        return [pscustomobject]@{
+            Success = $false; AlreadyRunning = $true; IdentityUnverified = $true
+            RunDirectory = $Controller.UnverifiedBackground.RunDirectory
+            Pid = $Controller.UnverifiedBackground.Pid
+            Error = $Controller.UnverifiedBackground.Reason
+        }
+    }
     $config = Get-AIFishBotConfigFromView -Controller $Controller
     $validation = Test-AIFishBotView -Controller $Controller
     if (-not $validation.IsValid) {
@@ -847,18 +1035,34 @@ function Start-AIFishBotRun {
                 RunDirectory = $Controller.CurrentRunDirectory; Pid = $Controller.CurrentProcessId
             }
         }
+        if ($null -ne $Controller.UnverifiedBackground -and
+            (Update-AIFishBotUnverifiedBackground -Controller $Controller)) {
+            return [pscustomobject]@{
+                Success = $false; AlreadyRunning = $true; IdentityUnverified = $true
+                RunDirectory = $Controller.UnverifiedBackground.RunDirectory
+                Pid = $Controller.UnverifiedBackground.Pid
+                Error = $Controller.UnverifiedBackground.Reason
+            }
+        }
         $active = Get-AIFishBotActiveRun -Controller $Controller
         if ($null -eq $active) {
             $active = Get-AIFishBotUnverifiedRunReservation -Controller $Controller
         }
         if ($null -eq $active) { $active = Get-AIFishBotStartReservation -Controller $Controller }
         if ($null -ne $active) {
+            $identityUnverified = [bool](Get-AIFishBotObjectPropertyValue `
+                    $active 'IdentityUnverified' $false)
+            if ($identityUnverified) {
+                [void](Set-AIFishBotUnverifiedBackground -Controller $Controller -Reservation $active)
+            }
             return [pscustomobject]@{
                 Success = $false; AlreadyRunning = $true
                 RunDirectory = $active.RunDirectory; Pid = $active.Pid
-                IdentityUnverified = [bool](Get-AIFishBotObjectPropertyValue `
-                        $active 'IdentityUnverified' $false)
-                Error = Get-AIFishBotObjectPropertyValue $active 'Error' $null
+                IdentityUnverified = $identityUnverified
+                Error = if ($identityUnverified) {
+                    $Controller.UnverifiedBackground.Reason
+                }
+                else { Get-AIFishBotObjectPropertyValue $active 'Error' $null }
             }
         }
 
@@ -1042,6 +1246,7 @@ function Clear-AIFishBotStaleRun {
     $Controller.CurrentRunDirectory = $null
     $Controller.CurrentProcessId = 0
     $Controller.CurrentProcessStartedAt = $null
+    $Controller.UnverifiedBackground = $null
     $Controller.ConfigVersion = 0
     $Controller.StopPending = $false
     if ($null -ne $Controller.StopStopwatch) { $Controller.StopStopwatch.Stop() }
@@ -1061,6 +1266,15 @@ function Resume-AIFishBotRun {
             AlreadyRunning = $true
             RunDirectory = $Controller.CurrentRunDirectory
             Pid = $Controller.CurrentProcessId
+        }
+    }
+    if ($null -ne $Controller.UnverifiedBackground -and
+        (Update-AIFishBotUnverifiedBackground -Controller $Controller)) {
+        return [pscustomobject]@{
+            Success = $false; IsStale = $false; IdentityUnverified = $true; StartBlocked = $true
+            RunDirectory = $Controller.UnverifiedBackground.RunDirectory
+            Pid = $Controller.UnverifiedBackground.Pid
+            Error = $Controller.UnverifiedBackground.Reason
         }
     }
     $allowFallback = -not $PSBoundParameters.ContainsKey('RunDirectory')
@@ -1122,8 +1336,18 @@ function Resume-AIFishBotRun {
     else {
         Get-AIFishBotUnverifiedRunReservation -Controller $Controller -RunDirectory $RunDirectory
     }
+    if ($null -eq $unverified) {
+        $markerReservation = Get-AIFishBotStartReservation -Controller $Controller
+        $markerUnverified = [bool](Get-AIFishBotObjectPropertyValue `
+                $markerReservation 'IdentityUnverified' $false)
+        if ($markerUnverified -and ($allowFallback -or
+                (Test-AIFishBotControllerPathEqual $markerReservation.RunDirectory $RunDirectory))) {
+            $unverified = $markerReservation
+        }
+    }
     if ($null -ne $unverified) {
         Clear-AIFishBotStaleRun -Controller $Controller -PreserveActiveMarker
+        [void](Set-AIFishBotUnverifiedBackground -Controller $Controller -Reservation $unverified)
         return [pscustomobject]@{
             Success = $false
             IsStale = $false
@@ -1131,7 +1355,7 @@ function Resume-AIFishBotRun {
             StartBlocked = $true
             RunDirectory = $unverified.RunDirectory
             Pid = $unverified.Pid
-            Error = $unverified.Error
+            Error = $Controller.UnverifiedBackground.Reason
         }
     }
     Clear-AIFishBotStaleRun $Controller
@@ -1149,6 +1373,11 @@ function Get-AIFishBotTrayItem {
 function Update-AIFishBotViewStatus {
     [CmdletBinding()]
     param([Parameter(Mandatory = $true)]$Controller, [Parameter(Mandatory = $true)][AllowNull()]$Status)
+    if ($null -ne $Controller.UnverifiedBackground) {
+        Show-AIFishBotUnverifiedBackground $Controller
+        $Controller.LastStatus = $Status
+        return '后台身份待处理'
+    }
     $state = [string](Get-AIFishBotObjectPropertyValue $Status 'state' 'stopped')
     if ($Controller.IsRunning -and $state -in @('stopped', 'error')) {
         Clear-AIFishBotStaleRun -Controller $Controller
@@ -1411,8 +1640,24 @@ function Open-AIFishBotView {
 
 function Invoke-AIFishBotExit {
     param([Parameter(Mandatory = $true)]$Controller)
+    if ($null -ne $Controller.UnverifiedBackground -and
+        (Update-AIFishBotUnverifiedBackground -Controller $Controller)) {
+        $choice = & $Controller.ConfirmExitProvider $false $true
+        if ([string]$choice -in @('Continue', '继续') -or $choice -eq $true) {
+            $Controller.Exiting = $true
+            $Controller.View.Exit()
+            return [pscustomobject]@{
+                Success = $true; ContinuedInBackground = $true; IdentityUnverified = $true
+            }
+        }
+        Show-AIFishBotUnverifiedBackground $Controller
+        return [pscustomobject]@{
+            Success = $false; Cancelled = $true; IdentityUnverified = $true
+            Error = $Controller.UnverifiedBackground.Reason
+        }
+    }
     if ($Controller.IsRunning) {
-        $choice = & $Controller.ConfirmExitProvider $true
+        $choice = & $Controller.ConfirmExitProvider $true $false
         if ([string]$choice -notin @('Stop', '停止') -and $choice -ne $true) {
             $Controller.Exiting = $true
             $Controller.View.Exit()
@@ -1499,6 +1744,9 @@ function Bind-AIFishBotControllerEvents {
                 if ($Controller.StopPending) { $Controller.HandleStatusTick($status) }
                 elseif ($null -ne $status) { Update-AIFishBotViewStatus $Controller $status | Out-Null }
             }
+            elseif ($null -ne $Controller.UnverifiedBackground) {
+                Update-AIFishBotUnverifiedBackground -Controller $Controller | Out-Null
+            }
         }.GetNewClosure()) -Binding $binding
     Add-AIFishBotEventHandler $Controller.View.Timers.Log 'Tick' ({ Update-AIFishBotViewLog $Controller | Out-Null }.GetNewClosure()) -Binding $binding
     return $binding
@@ -1526,7 +1774,7 @@ function New-AIFishBotController {
         [scriptblock]$Clock = { [datetimeoffset]::UtcNow },
         [scriptblock]$Sleeper = { param($Milliseconds) Start-Sleep -Milliseconds $Milliseconds },
         [scriptblock]$ConfirmProvider = { param($Purpose) $false },
-        [scriptblock]$ConfirmExitProvider = { param($Running) 'Continue' },
+        [scriptblock]$ConfirmExitProvider = { param($Running, $Unverified) 'Continue' },
         [scriptblock]$ProfileNameProvider = { param($Action, $CurrentName, $SuggestedName) $SuggestedName },
         [scriptblock]$ForceStopper = { param($ProcessId) Stop-Process -Id $ProcessId -Force -ErrorAction Stop },
         [scriptblock]$AvailablePortsProvider = { Get-AIFishBotControllerAvailablePorts },
@@ -1568,6 +1816,7 @@ function New-AIFishBotController {
         CurrentRunDirectory = $null
         CurrentProcessId = 0
         CurrentProcessStartedAt = $null
+        UnverifiedBackground = $null
         ConfigVersion = 0
         IsRunning = $false
         IsDirty = $false
