@@ -210,11 +210,35 @@ Test-Case 'engine state keeps locked and live snapshots with runtime counters' {
         Assert-Equal -Expected 0 -Actual $state.ConfigVersion
         Assert-Equal -Expected 0 -Actual $state.HookCount
         Assert-Equal -Expected 0 -Actual $state.RetryCount
+        Assert-Equal -Expected ([double]0) -Actual $state.AudioPeak
         Assert-Equal -Expected 'ready' -Actual $state.State
         Assert-Equal -Expected $false -Actual $state.StopRequested
         Assert-Equal -Expected $adapter -Actual $state.Adapter
         Assert-True -Condition ([System.IO.Path]::IsPathRooted($state.RunDirectory))
         Assert-True -Condition ($state.BuffExpirations -is [hashtable])
+    }
+    finally {
+        Remove-EngineTestState -State $state
+    }
+}
+
+Test-Case 'a valid injected peak is kept and written by the next engine heartbeat' {
+    $adapter = New-SimulatedAdapter -Peaks @([double]47.25)
+    $config = New-EngineConfig -Values @{
+        useWeakAura = $true
+        fishingRetries = 2
+        audioSensitivity = 3
+    }
+    $state = $null
+    try {
+        $state = New-EngineTestState -Config $config -Adapter $adapter
+
+        Assert-Equal -Expected $true -Actual (Invoke-AIFishBotCast -State $state)
+        Assert-Equal -Expected ([double]47.25) -Actual $state.AudioPeak
+
+        Invoke-AIFishBotStop -State $state | Out-Null
+        $status = Read-AIFishBotStatus -RunDirectory $state.RunDirectory
+        Assert-Equal -Expected ([double]47.25) -Actual $status.audioPeak
     }
     finally {
         Remove-EngineTestState -State $state

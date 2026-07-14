@@ -86,6 +86,7 @@ function Write-AIFishBotEngineEntryError {
                 startedAt = $startedAt
                 processStartedAt = $processStartedAt
                 remainingSeconds = $null
+                audioPeak = [double]0
                 lastError = $safeMessage
                 heartbeatAt = $now
                 configVersion = [math]::Max(0, $ConfigVersion)

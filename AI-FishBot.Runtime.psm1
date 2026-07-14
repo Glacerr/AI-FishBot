@@ -21,6 +21,7 @@ $script:AIFishBotStatusFields = @(
     'profileName',
     'startedAt',
     'remainingSeconds',
+    'audioPeak',
     'lastError',
     'heartbeatAt',
     'configVersion'
@@ -535,6 +536,36 @@ function ConvertTo-AIFishBotRemainingSeconds {
     return [double]$converted
 }
 
+function ConvertTo-AIFishBotAudioPeak {
+    param(
+        [AllowNull()]
+        [object]$Value
+    )
+
+    $isNumericType = $Value -is [sbyte] -or $Value -is [byte] -or
+        $Value -is [int16] -or $Value -is [uint16] -or
+        $Value -is [int32] -or $Value -is [uint32] -or
+        $Value -is [int64] -or $Value -is [uint64] -or
+        $Value -is [single] -or $Value -is [double] -or $Value -is [decimal]
+    if (-not $isNumericType) {
+        throw 'The protocol field "audioPeak" must be a number from zero through one hundred.'
+    }
+
+    try {
+        $converted = [convert]::ToDouble(
+            $Value,
+            [System.Globalization.CultureInfo]::InvariantCulture)
+    }
+    catch {
+        throw 'The protocol field "audioPeak" must be a number from zero through one hundred.'
+    }
+    if ([double]::IsNaN($converted) -or [double]::IsInfinity($converted) -or
+        $converted -lt 0 -or $converted -gt 100) {
+        throw 'The protocol field "audioPeak" must be a number from zero through one hundred.'
+    }
+    return [double]$converted
+}
+
 function ConvertTo-AIFishBotStatusObject {
     param(
         [Parameter(Mandatory = $true)]
@@ -591,6 +622,8 @@ function ConvertTo-AIFishBotStatusObject {
                 -FieldName 'processStartedAt'
             remainingSeconds = ConvertTo-AIFishBotRemainingSeconds `
                 -Value (Get-AIFishBotRequiredProtocolValue -InputObject $Status -Name 'remainingSeconds')
+            audioPeak = ConvertTo-AIFishBotAudioPeak `
+                -Value (Get-AIFishBotRequiredProtocolValue -InputObject $Status -Name 'audioPeak')
             lastError = $lastError
             heartbeatAt = ConvertTo-AIFishBotDateTimeOffsetText `
                 -Value (Get-AIFishBotRequiredProtocolValue -InputObject $Status -Name 'heartbeatAt') `

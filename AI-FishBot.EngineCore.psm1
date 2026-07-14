@@ -286,6 +286,7 @@ function Get-AIFishBotEnginePeak {
         $peak -lt 0 -or $peak -gt 100) {
         throw 'The engine adapter returned an invalid audio peak.'
     }
+    $State.AudioPeak = [double]$peak
     return $peak
 }
 
@@ -366,6 +367,7 @@ function Write-AIFishBotEngineStatus {
         processStartedAt = $State.ProcessStartedAt
         remainingSeconds = Get-AIFishBotEngineRemainingSeconds -State $State `
             -MonotonicNow $monotonicNow
+        audioPeak = [double]$State.AudioPeak
         lastError = $State.LastError
         heartbeatAt = $now
         configVersion = [int]$State.ConfigVersion
@@ -488,6 +490,7 @@ function New-AIFishBotEngineState {
         ConfigVersion = [int]$ConfigVersion
         HookCount = 0
         RetryCount = 0
+        AudioPeak = [double]0
         StartedAt = [datetimeoffset]$effectiveStartedAt
         ProcessStartedAt = [datetimeoffset]$ProcessStartedAt
         State = 'ready'

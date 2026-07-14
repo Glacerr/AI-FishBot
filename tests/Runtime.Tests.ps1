@@ -31,6 +31,7 @@ function New-RuntimeStatus {
         startedAt = '2026-07-13T03:30:00.0000000+00:00'
         processStartedAt = '2026-07-13T03:29:58.1234567+00:00'
         remainingSeconds = 90
+        audioPeak = [double]42.5
         lastError = $null
         heartbeatAt = $HeartbeatAt
         configVersion = 4
@@ -431,12 +432,14 @@ Test-Case 'status round trip contains exactly the fixed protocol fields' {
         $actual = Read-AIFishBotStatus -RunDirectory $runDirectory
         $expectedNames = @(
             'processId', 'state', 'hookCount', 'retryCount', 'profileName', 'startedAt',
-            'processStartedAt', 'remainingSeconds', 'lastError', 'heartbeatAt', 'configVersion'
+            'processStartedAt', 'remainingSeconds', 'audioPeak', 'lastError', 'heartbeatAt',
+            'configVersion'
         )
 
         Assert-Equal -Expected $expectedNames -Actual @($actual.PSObject.Properties.Name)
         Assert-Equal -Expected 4321 -Actual $actual.processId
         Assert-Equal -Expected 'ready' -Actual $actual.state
+        Assert-Equal -Expected ([double]42.5) -Actual $actual.audioPeak
         Assert-Equal -Expected 4 -Actual $actual.configVersion
     }
     finally {
@@ -695,6 +698,59 @@ foreach ($case in @(
 }
 
 foreach ($case in @(
+        [pscustomobject]@{ Name = 'a negative value'; Value = -0.1 },
+        [pscustomobject]@{ Name = 'a value above one hundred'; Value = 100.1 },
+        [pscustomobject]@{ Name = 'a Boolean'; Value = $true },
+        [pscustomobject]@{ Name = 'text'; Value = '42.5' },
+        [pscustomobject]@{ Name = 'NaN'; Value = [double]::NaN },
+        [pscustomobject]@{ Name = 'positive infinity'; Value = [double]::PositiveInfinity },
+        [pscustomobject]@{ Name = 'negative infinity'; Value = [double]::NegativeInfinity }
+    )) {
+    Test-Case ("status audioPeak rejects {0}" -f $case.Name) {
+        $runDirectory = New-TestDirectory
+        try {
+            $status = New-RuntimeStatus
+            $status.audioPeak = $case.Value
+            Assert-Throws -ScriptBlock {
+                Write-AIFishBotStatus -RunDirectory $runDirectory -Status $status
+            } -MessageLike '*audioPeak*'
+        }
+        finally {
+            Remove-RuntimeTestDirectory -Path $runDirectory
+        }
+    }
+}
+
+Test-Case 'status audioPeak is required' {
+    $runDirectory = New-TestDirectory
+    try {
+        $status = New-RuntimeStatus
+        $status.PSObject.Properties.Remove('audioPeak')
+        Assert-Throws -ScriptBlock {
+            Write-AIFishBotStatus -RunDirectory $runDirectory -Status $status
+        } -MessageLike '*audioPeak*required*'
+    }
+    finally {
+        Remove-RuntimeTestDirectory -Path $runDirectory
+    }
+}
+
+Test-Case 'status audioPeak accepts both range endpoints' {
+    $runDirectory = New-TestDirectory
+    try {
+        foreach ($expected in @([double]0, [double]100)) {
+            $status = New-RuntimeStatus
+            $status.audioPeak = $expected
+            Write-AIFishBotStatus -RunDirectory $runDirectory -Status $status | Out-Null
+            Assert-Equal -Expected $expected -Actual (Read-AIFishBotStatus -RunDirectory $runDirectory).audioPeak
+        }
+    }
+    finally {
+        Remove-RuntimeTestDirectory -Path $runDirectory
+    }
+}
+
+foreach ($case in @(
         [pscustomobject]@{ Name = 'a number'; Value = 1 },
         [pscustomobject]@{ Name = 'a Boolean'; Value = $false }
     )) {
@@ -730,6 +786,8 @@ Test-Case 'status fields retain the protocol value types after a round trip' {
         Assert-Equal -Expected ([string]) -Actual $actual.startedAt.GetType()
         Assert-Equal -Expected ([string]) -Actual $actual.processStartedAt.GetType()
         Assert-Equal -Expected ([double]) -Actual $actual.remainingSeconds.GetType()
+        Assert-Equal -Expected ([double]) -Actual $actual.audioPeak.GetType()
+        Assert-Equal -Expected ([double]42.5) -Actual $actual.audioPeak
         Assert-Equal -Expected ([string]) -Actual $actual.lastError.GetType()
         Assert-Equal -Expected ([string]) -Actual $actual.heartbeatAt.GetType()
         Assert-Equal -Expected ([int]) -Actual $actual.configVersion.GetType()

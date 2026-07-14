@@ -6,6 +6,8 @@ $script:WindowsPowerShellPath = Join-Path -Path $env:SystemRoot -ChildPath 'Syst
 foreach ($moduleName in @(
         'AI-FishBot.Config.psm1',
         'AI-FishBot.Runtime.psm1',
+        'AI-FishBot.Adapters.psm1',
+        'AI-FishBot.EngineCore.psm1',
         'AI-FishBot.Dependencies.psm1',
         'AI-FishBot.UI.psm1',
         'AI-FishBot.Controller.psm1'
@@ -215,6 +217,66 @@ exit $LASTEXITCODE
         }
         if ($null -ne $process) { $process.Dispose() }
         Remove-IntegrationDirectory $captureRoot
+    }
+}
+
+Test-Case 'injected simulation peak flows through engine status polling into the hidden WinForms meter' {
+    $root = New-TestDirectory
+    $state = $null
+    $adapter = $null
+    $view = $null
+    $controller = $null
+    try {
+        $now = [datetimeoffset]'2026-07-14T12:00:00+08:00'
+        $profilesDirectory = Join-Path $root 'profiles'
+        $runtimeRoot = Join-Path $root 'runtime'
+        $config = New-AIFishBotDefaultConfig
+        $config.profileName = '峰值链路模拟方案'
+        $config.useWeakAura = $true
+        $config.fishingRetries = 2
+        $config.audioSensitivity = 3
+        $config.useWindowFocus = $false
+        $config.usePi = $false
+        $config.enableNotifications = $false
+        Save-AIFishBotProfile -ProfilesDirectory $profilesDirectory -Config $config | Out-Null
+        $runDirectory = New-AIFishBotRunDirectory -RuntimeRoot $runtimeRoot `
+            -StartConfig $config -LiveConfig ([pscustomobject]@{ configVersion = 1 })
+
+        $adapter = New-AIFishBotEngineAdapter -Simulation `
+            -SimulationPeaks @([double]47.25) -SimulationNow $now `
+            -SimulationThrottleProvider { param($milliseconds) }
+        $state = New-AIFishBotEngineState -Config $config -RunDirectory $runDirectory `
+            -Adapter $adapter -ConfigVersion 1 -ProcessStartedAt $now.AddSeconds(-2)
+        Assert-Equal -Expected $true -Actual (Invoke-AIFishBotCast -State $state)
+        Invoke-AIFishBotStop -State $state | Out-Null
+
+        $view = New-AIFishBotMainView
+        $controller = New-AIFishBotController -View $view `
+            -ProfilesDirectory $profilesDirectory -RuntimeRoot $runtimeRoot `
+            -EngineScriptPath (Join-Path $script:IntegrationRoot 'AI-FishBot.Engine.ps1') `
+            -DependencyChecker { [pscustomobject]@{ Status = 'Available'; IsAvailable = $true } } `
+            -ProcessStarter { param($request) throw '链路测试禁止启动进程。' } `
+            -ProcessLookup { param($id) return $null } `
+            -AvailablePortsProvider { @() } -Clock { $now } -Simulation
+        $controller.CurrentRunDirectory = $runDirectory
+        Set-AIFishBotRunningState -Controller $controller -Running $true | Out-Null
+
+        $onTick = $view.Timers.Status.GetType().GetMethod(
+            'OnTick',
+            [Reflection.BindingFlags]::Instance -bor [Reflection.BindingFlags]::NonPublic)
+        Assert-True -Condition ($null -ne $onTick)
+        $onTick.Invoke($view.Timers.Status, @([EventArgs]::Empty)) | Out-Null
+
+        Assert-True -Condition ($view.Controls.AudioPeakBar -is [Windows.Forms.ProgressBar])
+        Assert-Equal -Expected 47 -Actual $view.Controls.AudioPeakBar.Value
+    }
+    finally {
+        if ($null -ne $controller) { $controller.Dispose() }
+        if ($null -ne $view) { $view.Dispose() }
+        if ($null -ne $adapter -and $null -ne $adapter.PSObject.Properties['Dispose']) {
+            & $adapter.Dispose | Out-Null
+        }
+        Remove-IntegrationDirectory $root
     }
 }
 
