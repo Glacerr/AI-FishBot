@@ -1,12 +1,15 @@
 ﻿[CmdletBinding()]
 param(
-    [string]$DataRoot = $PSScriptRoot,
+    [string]$DataRoot,
     [switch]$SelfTest,
     [switch]$NoShow,
     [switch]$Simulation
 )
 
 $ErrorActionPreference = 'Stop'
+if (-not $PSBoundParameters.ContainsKey('DataRoot')) {
+    $DataRoot = $PSScriptRoot
+}
 $exitCode = 0
 $mutex = $null
 $ownsMutex = $false

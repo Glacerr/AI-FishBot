@@ -29,7 +29,8 @@ function Quote-IntegrationArgument {
 
 function Invoke-GuiEntryProcess {
     param(
-        [Parameter(Mandatory = $true)][string]$DataRoot,
+        [string]$DataRoot,
+        [string]$GuiEntryPath = $script:GuiEntryPath,
         [switch]$SelfTest,
         [switch]$NoShow,
         [switch]$Simulation,
@@ -45,10 +46,11 @@ function Invoke-GuiEntryProcess {
         '-ExecutionPolicy',
         'Bypass',
         '-File',
-        (Quote-IntegrationArgument $script:GuiEntryPath),
-        '-DataRoot',
-        (Quote-IntegrationArgument $DataRoot)
+        (Quote-IntegrationArgument $GuiEntryPath)
     )
+    if ($PSBoundParameters.ContainsKey('DataRoot')) {
+        $arguments += @('-DataRoot', (Quote-IntegrationArgument $DataRoot))
+    }
     if ($SelfTest) { $arguments += '-SelfTest' }
     if ($NoShow) { $arguments += '-NoShow' }
     if ($Simulation) { $arguments += '-Simulation' }
@@ -622,14 +624,98 @@ Test-Case 'launcher uses its own directory and starts the quoted GUI entry in ST
         '@echo off',
         'setlocal',
         'cd /d "%~dp0"',
-        'start "AI-FishBot" "%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -Sta -ExecutionPolicy Bypass -File "%~dp0AI-FishBot.GUI.ps1"',
-        'endlocal'
+        'set "startOptions="',
+        'if defined AIFISHBOT_LAUNCHER_WAIT set "startOptions=/b /wait"',
+        'start "AI-FishBot" %startOptions% "%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -Sta -ExecutionPolicy Bypass -File "%~dp0AI-FishBot.GUI.ps1" -DataRoot "%~dp0." %*',
+        'set "exitCode=%errorlevel%"',
+        'endlocal & exit /b %exitCode%'
     ) -Actual $lines
+}
+
+Test-Case 'launcher executes its real command chain from a Chinese path' {
+    $root = New-TestDirectory
+    $process = $null
+    $previousWait = [Environment]::GetEnvironmentVariable('AIFISHBOT_LAUNCHER_WAIT', 'Process')
+    try {
+        $appRoot = Join-Path $root '中文 启动 目录'
+        [void](New-Item -ItemType Directory -Path $appRoot -Force)
+        foreach ($source in @(Get-ChildItem -LiteralPath $script:IntegrationRoot -File |
+                Where-Object { $_.Name -like 'AI-FishBot*' -and $_.Extension -in @('.ps1', '.psm1') })) {
+            Copy-Item -LiteralPath $source.FullName -Destination $appRoot
+        }
+        Copy-Item -LiteralPath $script:LauncherPath -Destination (Join-Path $appRoot 'launch.cmd')
+        $stdoutPath = Join-Path $root 'launcher-stdout.txt'
+        $stderrPath = Join-Path $root 'launcher-stderr.txt'
+        [Environment]::SetEnvironmentVariable('AIFISHBOT_LAUNCHER_WAIT', '1', 'Process')
+
+        $process = Start-Process -FilePath $env:ComSpec `
+            -ArgumentList '/d /c call launch.cmd -SelfTest -NoShow -Simulation' `
+            -WorkingDirectory $appRoot -WindowStyle Hidden -PassThru `
+            -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath
+        if (-not $process.WaitForExit(30000)) {
+            throw '启动器模拟自检没有按时退出。'
+        }
+        $process.WaitForExit()
+
+        Assert-Equal -Expected 0 -Actual ([int]$process.ExitCode)
+        $stdout = [IO.File]::ReadAllText($stdoutPath, [Text.Encoding]::Default).Trim()
+        $report = $stdout | ConvertFrom-Json
+        Assert-Equal -Expected $true -Actual $report.success
+        Assert-True -Condition (Test-Path -LiteralPath (Join-Path $appRoot 'profiles\时光服.json'))
+        Assert-True -Condition (Test-Path -LiteralPath (Join-Path $appRoot 'runtime'))
+        Assert-True -Condition (Test-Path -LiteralPath (Join-Path $appRoot 'logs'))
+    }
+    finally {
+        [Environment]::SetEnvironmentVariable(
+            'AIFISHBOT_LAUNCHER_WAIT', $previousWait, 'Process')
+        if ($null -ne $process -and -not $process.HasExited) {
+            try { $process.Kill() } catch { }
+            try { $process.WaitForExit(5000) | Out-Null } catch { }
+        }
+        if ($null -ne $process) { $process.Dispose() }
+        if ($null -ne $appRoot) {
+            $guiPath = Join-Path $appRoot 'AI-FishBot.GUI.ps1'
+            foreach ($candidate in @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+                    Where-Object { $_.CommandLine -and
+                        $_.CommandLine.IndexOf($guiPath, [StringComparison]::OrdinalIgnoreCase) -ge 0 })) {
+                try { Stop-Process -Id $candidate.ProcessId -Force -ErrorAction SilentlyContinue } catch { }
+            }
+        }
+        Remove-IntegrationDirectory $root
+    }
+}
+
+Test-Case 'GUI entry without DataRoot uses its own directory' {
+    $root = New-TestDirectory
+    try {
+        $appRoot = Join-Path $root 'app'
+        [void](New-Item -ItemType Directory -Path $appRoot -Force)
+        foreach ($source in @(Get-ChildItem -LiteralPath $script:IntegrationRoot -File |
+                Where-Object { $_.Name -like 'AI-FishBot*' -and $_.Extension -in @('.ps1', '.psm1') })) {
+            Copy-Item -LiteralPath $source.FullName -Destination $appRoot
+        }
+
+        $result = Invoke-GuiEntryProcess `
+            -GuiEntryPath (Join-Path $appRoot 'AI-FishBot.GUI.ps1') `
+            -SelfTest -NoShow -Simulation
+
+        Assert-Equal -Expected 0 -Actual $result.ExitCode
+        $report = $result.StandardOutput.Trim() | ConvertFrom-Json
+        Assert-Equal -Expected $true -Actual $report.success
+        Assert-True -Condition (Test-Path -LiteralPath (Join-Path $appRoot 'profiles\时光服.json'))
+        Assert-True -Condition (Test-Path -LiteralPath (Join-Path $appRoot 'runtime'))
+        Assert-True -Condition (Test-Path -LiteralPath (Join-Path $appRoot 'logs'))
+    }
+    finally {
+        Remove-IntegrationDirectory $root
+    }
 }
 
 Test-Case 'GUI entry declares the supported public switches and does not alter the legacy script' {
     $text = [IO.File]::ReadAllText($script:GuiEntryPath)
-    Assert-True -Condition ($text -match '\[string\]\s*\$DataRoot\s*=\s*\$PSScriptRoot')
+    Assert-True -Condition ($text -match '\[string\]\s*\$DataRoot(?:\s*[,\r\n])')
+    Assert-True -Condition ($text -match "PSBoundParameters\.ContainsKey\('DataRoot'\)")
+    Assert-True -Condition ($text -match '\$DataRoot\s*=\s*\$PSScriptRoot')
     foreach ($switchName in @('SelfTest', 'NoShow', 'Simulation')) {
         Assert-True -Condition ($text -match ('\[switch\]\s*\${0}' -f $switchName))
     }
