@@ -73,6 +73,7 @@ function New-SimulatedAdapter {
         MonotonicMilliseconds = [double]0
         Peaks = $queue
         Events = New-Object 'System.Collections.Generic.List[string]'
+        Notifications = New-Object 'System.Collections.Generic.List[object]'
         DisposeCount = 0
         ThrowOnNotify = [bool]$ThrowOnNotify
         ThrowOnReadPeak = [bool]$ThrowOnReadPeak
@@ -110,8 +111,12 @@ function New-SimulatedAdapter {
         Notify = ({
                 param($eventName, $webhook)
                 [void]$captured.Events.Add(('notify:{0}' -f $eventName))
+                [void]$captured.Notifications.Add([pscustomobject]@{
+                        EventName = [string]$eventName
+                        Webhook = [string]$webhook
+                    })
                 if ($captured.ThrowOnNotify) {
-                    throw 'simulated notification failure'
+                    throw ('simulated notification failure for {0}' -f $webhook)
                 }
             }.GetNewClosure())
         Dispose = ({ $captured.DisposeCount += 1 }.GetNewClosure())
@@ -1605,6 +1610,42 @@ Test-Case 'latest auto-stop settings stop immediately and send the locked logout
             -Actual @($adapter.Context.Events)
         Assert-Equal -Expected @('ready', 'stopping', 'stopped') -Actual @($state.StateHistory)
         Assert-Equal -Expected 1 -Actual $adapter.Context.DisposeCount
+    }
+    finally {
+        Remove-EngineTestState -State $state
+    }
+}
+
+Test-Case 'a running webhook update changes only the later stop notification address' {
+    $adapter = New-SimulatedAdapter
+    $oldWebhook = 'https://discord.com/api/webhooks/123/old-secret-token'
+    $newWebhook = 'https://discord.com/api/webhooks/456/new-secret-token'
+    $config = New-EngineConfig -Values @{
+        autoStop = $false
+        enableNotifications = $true
+        notifyOnStart = $true
+        notifyOnStop = $true
+        discordWebhook = $oldWebhook
+    }
+    $updated = Copy-EngineConfig -Config $config
+    $updated.autoStop = $true
+    $updated.autoStopTime = 0.5
+    $updated.discordWebhook = $newWebhook
+    $loader = New-VersionedLoader -Items @(
+        $null,
+        [pscustomobject]@{ ConfigVersion = 1; Config = $updated }
+    )
+    $state = $null
+    try {
+        $state = New-EngineTestState -Config $config -Adapter $adapter -LiveConfigLoader $loader
+        $adapter.Context.MonotonicMilliseconds = 60000
+
+        Start-AIFishBotEngineLoop -State $state | Out-Null
+
+        Assert-Equal -Expected @('start', 'stop') -Actual @($adapter.Context.Notifications.EventName)
+        Assert-Equal -Expected @($oldWebhook, $newWebhook) -Actual @($adapter.Context.Notifications.Webhook)
+        Assert-Equal -Expected 1 -Actual (Get-EventCount -Adapter $adapter -Event 'notify:start')
+        Assert-Equal -Expected 1 -Actual (Get-EventCount -Adapter $adapter -Event 'notify:stop')
     }
     finally {
         Remove-EngineTestState -State $state

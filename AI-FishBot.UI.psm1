@@ -198,26 +198,33 @@ function New-AIFishBotMainView {
     $headerPanel.Controls.Add($profileSelector)
     $controls.ProfileSelector = $profileSelector
 
-    $newProfileButton = New-AIFishBotButton -Text '新建' -Width 58 -Height 28
+    $newProfileButton = New-AIFishBotButton -Text '新建' -Width 52 -Height 28
     Set-AIFishBotControlLocation -Control $newProfileButton -X 220 -Y 53
     $headerPanel.Controls.Add($newProfileButton)
     $controls.NewProfileButton = $newProfileButton
 
-    $copyProfileButton = New-AIFishBotButton -Text '复制' -Width 58 -Height 28
-    Set-AIFishBotControlLocation -Control $copyProfileButton -X 284 -Y 53
+    $copyProfileButton = New-AIFishBotButton -Text '复制' -Width 52 -Height 28
+    Set-AIFishBotControlLocation -Control $copyProfileButton -X 278 -Y 53
     $headerPanel.Controls.Add($copyProfileButton)
     $controls.CopyProfileButton = $copyProfileButton
 
-    $renameProfileButton = New-AIFishBotButton -Text '重命名' -Width 70 -Height 28
-    Set-AIFishBotControlLocation -Control $renameProfileButton -X 348 -Y 53
+    $renameProfileButton = New-AIFishBotButton -Text '重命名' -Width 64 -Height 28
+    Set-AIFishBotControlLocation -Control $renameProfileButton -X 336 -Y 53
     $headerPanel.Controls.Add($renameProfileButton)
     $controls.RenameProfileButton = $renameProfileButton
 
-    $deleteProfileButton = New-AIFishBotButton -Text '删除' -Width 58 -Height 28 -BackColor $script:AIFishBotColors.Error -ForeColor $script:AIFishBotColors.Background
+    $deleteProfileButton = New-AIFishBotButton -Text '删除' -Width 52 -Height 28 -BackColor $script:AIFishBotColors.Error -ForeColor $script:AIFishBotColors.Background
     $deleteProfileButton.FlatAppearance.BorderColor = $script:AIFishBotColors.Error
-    Set-AIFishBotControlLocation -Control $deleteProfileButton -X 424 -Y 53
+    Set-AIFishBotControlLocation -Control $deleteProfileButton -X 406 -Y 53
     $headerPanel.Controls.Add($deleteProfileButton)
     $controls.DeleteProfileButton = $deleteProfileButton
+
+    $resetProfileButton = New-AIFishBotButton -Text '恢复默认' -Width 84 -Height 28 `
+        -BackColor $script:AIFishBotColors.Input -ForeColor $script:AIFishBotColors.Warning
+    $resetProfileButton.FlatAppearance.BorderColor = $script:AIFishBotColors.Warning
+    Set-AIFishBotControlLocation -Control $resetProfileButton -X 464 -Y 53
+    $headerPanel.Controls.Add($resetProfileButton)
+    $controls.ResetProfileButton = $resetProfileButton
 
     $statusHost = New-Object System.Windows.Forms.Panel
     $statusHost.Dock = [System.Windows.Forms.DockStyle]::Right

@@ -44,19 +44,20 @@ $script:AIFishBotNumericFields = @(
 )
 $script:AIFishBotLockedControls = @(
     'Retail', 'UseWindowFocus', 'UseWeakAura', 'FishingRetries', 'CastKey', 'BobberKey',
-    'LogoutKey', 'UsePi', 'PicoComPort', 'WebhookText', 'NotifyOnStart',
-    'ProfileSelector', 'RenameProfileButton', 'DeleteProfileButton'
+    'LogoutKey', 'UsePi', 'PicoComPort', 'NotifyOnStart',
+    'ProfileSelector', 'RenameProfileButton', 'DeleteProfileButton', 'ResetProfileButton'
 )
 $script:AIFishBotLiveFields = @(
     'audioSensitivity', 'autoStop', 'autoStopTime', 'autoLogout',
     'biteResponseMinSeconds', 'biteResponseMaxSeconds', 'preHookMinSeconds',
     'preHookMaxSeconds', 'postHookMinSeconds', 'postHookMaxSeconds',
-    'preCastMinSeconds', 'preCastMaxSeconds', 'buffs', 'enableNotifications', 'notifyOnStop'
+    'preCastMinSeconds', 'preCastMaxSeconds', 'buffs', 'enableNotifications',
+    'discordWebhook', 'notifyOnStop'
 )
 $script:AIFishBotLiveControls = @(
     'AudioSensitivity', 'AutoStop', 'AutoStopTime', 'AutoLogout', 'BiteResponseMin',
     'BiteResponseMax', 'PreHookMin', 'PreHookMax', 'PostHookMin', 'PostHookMax',
-    'PreCastMin', 'PreCastMax', 'BuffGrid', 'EnableNotifications', 'NotifyOnStop'
+    'PreCastMin', 'PreCastMax', 'BuffGrid', 'EnableNotifications', 'WebhookText', 'NotifyOnStop'
 )
 $script:AIFishBotUnverifiedWarning = '发现无法验证的后台，可能仍在运行，需要手动处理。'
 
@@ -741,14 +742,25 @@ function Save-AIFishBotCurrentProfile {
     $Controller.CurrentConfig = Copy-AIFishBotControllerObject $saved
     $Controller.CurrentProfileName = [string]$saved.profileName
     if ($Controller.IsRunning) {
-        try { [void](Write-AIFishBotControllerLiveConfig $Controller $config) }
+        try {
+            if ($null -ne $Controller.LiveConfigWriter) {
+                [void](& $Controller.LiveConfigWriter $Controller $config)
+            }
+            else {
+                [void](Write-AIFishBotControllerLiveConfig $Controller $config)
+            }
+        }
         catch {
+            $safeDetail = Protect-AIFishBotSecret -Text ([string]$_.Exception.Message)
+            $errorMessage = '方案已保存，但后台实时配置写入失败：{0}' -f $safeDetail
+            $saveState = Get-AIFishBotControllerControl -Controller $Controller -Name 'SaveStateLabel'
+            if ($null -ne $saveState) { $saveState.Text = $errorMessage }
             return [pscustomobject]@{
                 Success = $false
                 ProfileSaved = $true
                 LiveConfigSaved = $false
                 Config = $saved
-                Error = ('方案已保存，但后台实时配置写入失败：{0}' -f $_.Exception.Message)
+                Error = $errorMessage
             }
         }
     }
@@ -1709,6 +1721,7 @@ function Bind-AIFishBotControllerEvents {
     Add-AIFishBotEventHandler (Get-AIFishBotControllerControl $Controller 'CopyProfileButton') 'Click' ({ $Controller.CopyProfile() | Out-Null }.GetNewClosure()) -Binding $binding
     Add-AIFishBotEventHandler (Get-AIFishBotControllerControl $Controller 'RenameProfileButton') 'Click' ({ $Controller.RenameProfile() | Out-Null }.GetNewClosure()) -Binding $binding
     Add-AIFishBotEventHandler (Get-AIFishBotControllerControl $Controller 'DeleteProfileButton') 'Click' ({ $Controller.DeleteProfile() | Out-Null }.GetNewClosure()) -Binding $binding
+    Add-AIFishBotEventHandler (Get-AIFishBotControllerControl $Controller 'ResetProfileButton') 'Click' ({ $Controller.ResetProfile() | Out-Null }.GetNewClosure()) -Binding $binding
     Add-AIFishBotEventHandler (Get-AIFishBotControllerControl $Controller 'InstallAudioButton') 'Click' ({ $Controller.InstallAudio() | Out-Null }.GetNewClosure()) -Binding $binding
     Add-AIFishBotEventHandler (Get-AIFishBotControllerControl $Controller 'ClearLogButton') 'Click' ({ $Controller.ClearLog() }.GetNewClosure()) -Binding $binding
     Add-AIFishBotEventHandler (Get-AIFishBotControllerControl $Controller 'OpenLogButton') 'Click' ({ $Controller.OpenLog() | Out-Null }.GetNewClosure()) -Binding $binding
@@ -1781,7 +1794,8 @@ function New-AIFishBotController {
         [ValidateRange(0.1, 3600)][double]$HeartbeatMaxAgeSeconds = 5,
         [ValidateRange(1, 60000)][int]$PollIntervalMilliseconds = 100,
         [ValidateRange(0, 3600)][double]$StopTimeoutSeconds = 10,
-        [switch]$Simulation
+        [switch]$Simulation,
+        [scriptblock]$LiveConfigWriter
     )
     $profilesPath = [System.IO.Path]::GetFullPath($ProfilesDirectory)
     $runtimePath = [System.IO.Path]::GetFullPath($RuntimeRoot)
@@ -1796,6 +1810,7 @@ function New-AIFishBotController {
         EngineScriptPath = [System.IO.Path]::GetFullPath($EngineScriptPath)
         DependencyChecker = $DependencyChecker
         DependencyInstaller = $DependencyInstaller
+        LiveConfigWriter = $LiveConfigWriter
         LogOpener = $LogOpener
         ProcessStarter = $ProcessStarter
         ProcessLookup = $ProcessLookup
@@ -1939,6 +1954,47 @@ function New-AIFishBotController {
             return [pscustomobject]@{ Success = $true; Config = $saved }
         }
         catch { return [pscustomobject]@{ Success = $false; Error = $_.Exception.Message } }
+    }
+    $controller | Add-Member -MemberType ScriptMethod -Name ResetProfile -Value {
+        if ($this.IsRunning) {
+            return [pscustomobject]@{ Success = $false; Error = '运行中不能恢复方案默认值。' }
+        }
+        if (-not (& $this.ConfirmProvider 'ResetProfile')) {
+            return [pscustomobject]@{ Success = $false; Cancelled = $true }
+        }
+
+        $originalView = Get-AIFishBotConfigFromView -Controller $this
+        $originalSaved = $null
+        try {
+            $originalSaved = Read-AIFishBotProfile -ProfilesDirectory $this.ProfilesDirectory `
+                -ProfileName $this.CurrentProfileName
+            $defaults = New-AIFishBotDefaultConfig
+            $defaults.profileName = $this.CurrentProfileName
+            $validation = Test-AIFishBotConfig -Config $defaults `
+                -AvailablePorts @(& $this.AvailablePortsProvider)
+            if (-not $validation.IsValid) { throw '默认配置未通过验证。' }
+
+            $saved = Save-AIFishBotProfile -ProfilesDirectory $this.ProfilesDirectory `
+                -Config $defaults
+            try {
+                Set-AIFishBotViewFromConfig -Controller $this -Config $saved | Out-Null
+                Set-AIFishBotProfileItems -Controller $this `
+                    -Profiles @(Get-AIFishBotProfiles $this.ProfilesDirectory)
+            }
+            catch {
+                Save-AIFishBotProfile -ProfilesDirectory $this.ProfilesDirectory `
+                    -Config $originalSaved | Out-Null
+                Set-AIFishBotViewFromConfig -Controller $this -Config $originalView | Out-Null
+                throw
+            }
+            return [pscustomobject]@{ Success = $true; Config = $saved }
+        }
+        catch {
+            $message = '恢复默认失败，原方案未更改。'
+            $saveState = Get-AIFishBotControllerControl -Controller $this -Name 'SaveStateLabel'
+            if ($null -ne $saveState) { $saveState.Text = $message }
+            return [pscustomobject]@{ Success = $false; Error = $message }
+        }
     }
     $controller | Add-Member -MemberType ScriptMethod -Name DeleteProfile -Value {
         if ($this.IsRunning) { return [pscustomobject]@{ Success = $false; Error = '运行中不能删除方案。' } }

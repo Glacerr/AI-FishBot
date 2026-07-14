@@ -526,6 +526,7 @@ Test-Case 'simulation GUI controller completes start live update reopen resume a
             -Actual ([datetimeoffset]$readyStatus.processStartedAt).ToUniversalTime().ToString('o')
 
         $firstView.Controls.AudioSensitivity.Value = 8
+        $firstView.Controls.WebhookText.Text = 'https://discord.com/api/webhooks/112233/integration-fake-token'
         $saved = Save-AIFishBotCurrentProfile -Controller $firstController
         if (-not $saved.Success) {
             throw ('完整模拟保存实时配置失败：{0}' -f ($saved | ConvertTo-Json -Compress))
@@ -534,6 +535,7 @@ Test-Case 'simulation GUI controller completes start live update reopen resume a
         $live = Read-AIFishBotJson -Path (Join-Path $runDirectory 'live-config.json')
         Assert-Equal -Expected 2 -Actual $live.configVersion
         Assert-Equal -Expected 8 -Actual $live.audioSensitivity
+        Assert-Equal -Expected 'https://discord.com/api/webhooks/112233/integration-fake-token' -Actual $live.discordWebhook
 
         $appliedStatus = Wait-IntegrationCondition -FailureMessage '模拟后台没有读取新的实时配置版本。' -Condition {
             try {
@@ -633,4 +635,9 @@ Test-Case 'GUI entry declares the supported public switches and does not alter t
     }
     Assert-True -Condition ($text -match 'AI-FishBot\.ps1')
     Assert-True -Condition ($text -match 'Application\]::Run')
+}
+
+Test-Case 'GUI confirmation provider gives reset profile an explicit warning' {
+    $text = [IO.File]::ReadAllText($script:GuiEntryPath)
+    Assert-True -Condition ($text -match "'ResetProfile'\s*\{\s*'确定将当前方案的所有设置恢复为默认值吗？'")
 }

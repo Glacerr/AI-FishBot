@@ -228,7 +228,7 @@ Test-Case 'view exposes the stable controller contract' {
 
     foreach ($controlName in @(
             'ProfileSelector', 'NewProfileButton', 'CopyProfileButton', 'RenameProfileButton',
-            'DeleteProfileButton', 'StatusBadge', 'SaveStateLabel', 'SaveButton', 'StartStopButton',
+            'DeleteProfileButton', 'ResetProfileButton', 'StatusBadge', 'SaveStateLabel', 'SaveButton', 'StartStopButton',
             'Retail', 'AutoStop', 'AutoStopTime', 'AutoLogout', 'AudioSensitivity', 'AudioPeakBar',
             'HookCount', 'RemainingTime', 'BiteResponseMin', 'BiteResponseMax', 'PreHookMin',
             'PreHookMax', 'PostHookMin', 'PostHookMax', 'PreCastMin', 'PreCastMax', 'CastKey',
@@ -272,6 +272,7 @@ Test-Case 'header tabs and persistent footer are laid out in the required order'
         $tabs.TabPages | ForEach-Object { $_.Text }
     )
     Assert-True -Condition ($script:View.Controls.ProfileSelector.Parent -ne $null)
+    Assert-True -Condition (Test-ControlDescendsFrom -Control $script:View.Controls.ResetProfileButton -ExpectedAncestor $script:View.Controls.HeaderPanel)
     Assert-True -Condition ($script:View.Controls.StatusBadge.Parent -ne $null)
     Assert-True -Condition (($script:View.Controls.FooterPanel.Dock -band [System.Windows.Forms.DockStyle]::Bottom) -ne 0)
     Assert-True -Condition (Test-ControlDescendsFrom -Control $script:View.Controls.SaveStateLabel -ExpectedAncestor $script:View.Controls.FooterPanel)
@@ -315,6 +316,12 @@ Test-Case 'every controller control remains inside the laid out client area' {
     }
 
     Assert-True -Condition ($script:View.Controls.StatusBadge.Height -ge 30)
+
+    $profileButtons = @('NewProfileButton', 'CopyProfileButton', 'RenameProfileButton', 'DeleteProfileButton', 'ResetProfileButton') |
+        ForEach-Object { Get-TestFormBounds -Control $script:View.Controls[$_] -Form $form }
+    for ($index = 0; $index -lt ($profileButtons.Count - 1); $index += 1) {
+        Assert-True -Condition ($profileButtons[$index].Right -le $profileButtons[$index + 1].Left)
+    }
 
     $notificationPage = Get-TestTabPage -Control $script:View.Controls.WebhookText
     $tabControl.SelectedTab = $notificationPage
@@ -363,6 +370,29 @@ Test-Case 'every visible control fits its direct parent at initial and minimum s
             $view.Dispose()
         }
     }
+}
+
+Test-Case 'profile actions stay inside the header without overlap at 125 percent scaling' {
+    $view = New-AIFishBotMainView
+    try {
+        $form = $view.Form
+        $form.Scale([System.Drawing.SizeF]::new(1.25, 1.25))
+        $form.Size = $form.MinimumSize
+        $null = $form.Handle
+        Invoke-TestLayoutTree -Control $form
+
+        Assert-TestControlTreeInsideParent -Parent $form -Path 'Form[125% minimum]'
+        $names = @('NewProfileButton', 'CopyProfileButton', 'RenameProfileButton', 'DeleteProfileButton', 'ResetProfileButton')
+        $buttons = @($names | ForEach-Object { Get-TestFormBounds -Control $view.Controls[$_] -Form $form })
+        for ($index = 0; $index -lt ($buttons.Count - 1); $index += 1) {
+            Assert-True -Condition ($buttons[$index].Right -le $buttons[$index + 1].Left)
+        }
+        $resetBounds = Get-TestFormBounds -Control $view.Controls.ResetProfileButton -Form $form
+        $statusBounds = Get-TestFormBounds -Control $view.Controls.StatusBadge -Form $form
+        Assert-True -Condition ($resetBounds.Right -le $statusBounds.Left)
+        Assert-Equal -Expected $false -Actual $form.Visible
+    }
+    finally { $view.Dispose() }
 }
 
 Test-Case 'all four timing ranges use tenths of a second with bounded values' {

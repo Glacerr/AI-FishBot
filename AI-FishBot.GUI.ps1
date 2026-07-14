@@ -218,6 +218,7 @@ try {
             param($Purpose)
             $message = switch ($Purpose) {
                 'DeleteProfile' { '确定删除当前方案吗？' }
+                'ResetProfile' { '确定将当前方案的所有设置恢复为默认值吗？' }
                 'ForceStop' { '后台没有及时停止，是否强制结束它？' }
                 default { '当前更改尚未保存，确定继续吗？' }
             }

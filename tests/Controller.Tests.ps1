@@ -61,7 +61,7 @@ function New-ControllerFakeView {
     $controls = @{}
     foreach ($name in @(
             'ProfileSelector', 'NewProfileButton', 'CopyProfileButton', 'RenameProfileButton',
-            'DeleteProfileButton', 'StatusBadge', 'SaveStateLabel', 'SaveButton', 'StartStopButton',
+            'DeleteProfileButton', 'ResetProfileButton', 'StatusBadge', 'SaveStateLabel', 'SaveButton', 'StartStopButton',
             'Retail', 'AutoStop', 'AutoStopTime', 'AutoLogout', 'AudioSensitivity', 'AudioPeakBar',
             'HookCount', 'RemainingTime', 'BiteResponseMin', 'BiteResponseMax', 'PreHookMin',
             'PreHookMax', 'PostHookMin', 'PostHookMax', 'PreCastMin', 'PreCastMax', 'CastKey',
@@ -179,6 +179,7 @@ function New-ControllerForTest {
         [scriptblock]$ForceStopper = { param($id) },
         [scriptblock]$DependencyInstaller,
         [scriptblock]$LogOpener,
+        [scriptblock]$LiveConfigWriter,
         [switch]$Simulation
     )
     $profiles = Join-Path $Root 'profiles'
@@ -205,6 +206,9 @@ function New-ControllerForTest {
     }
     if ($PSBoundParameters.ContainsKey('LogOpener')) {
         $controllerParameters.LogOpener = $LogOpener
+    }
+    if ($PSBoundParameters.ContainsKey('LiveConfigWriter')) {
+        $controllerParameters.LiveConfigWriter = $LiveConfigWriter
     }
     if ($Simulation) { $controllerParameters.Simulation = $true }
     New-AIFishBotController @controllerParameters
@@ -362,10 +366,10 @@ Test-Case 'Running locks fixed settings while live settings remain editable' {
         $controller = New-ControllerForTest -View $view -Root $root
         Set-AIFishBotRunningState -Controller $controller -Running $true
 
-        foreach ($name in @('Retail', 'UseWindowFocus', 'UseWeakAura', 'FishingRetries', 'CastKey', 'BobberKey', 'LogoutKey', 'UsePi', 'PicoComPort', 'WebhookText', 'NotifyOnStart', 'ProfileSelector', 'RenameProfileButton', 'DeleteProfileButton')) {
+        foreach ($name in @('Retail', 'UseWindowFocus', 'UseWeakAura', 'FishingRetries', 'CastKey', 'BobberKey', 'LogoutKey', 'UsePi', 'PicoComPort', 'NotifyOnStart', 'ProfileSelector', 'RenameProfileButton', 'DeleteProfileButton', 'ResetProfileButton')) {
             Assert-Equal -Expected $false -Actual $view.Controls[$name].Enabled
         }
-        foreach ($name in @('AudioSensitivity', 'AutoStop', 'AutoStopTime', 'AutoLogout', 'BiteResponseMin', 'BiteResponseMax', 'PreHookMin', 'PreHookMax', 'PostHookMin', 'PostHookMax', 'PreCastMin', 'PreCastMax', 'BuffGrid', 'EnableNotifications', 'NotifyOnStop')) {
+        foreach ($name in @('AudioSensitivity', 'AutoStop', 'AutoStopTime', 'AutoLogout', 'BiteResponseMin', 'BiteResponseMax', 'PreHookMin', 'PreHookMax', 'PostHookMin', 'PostHookMax', 'PreCastMin', 'PreCastMax', 'BuffGrid', 'EnableNotifications', 'WebhookText', 'NotifyOnStop')) {
             Assert-Equal -Expected $true -Actual $view.Controls[$name].Enabled
         }
         Assert-Equal -Expected $true -Actual $view.Timers.Status.Enabled
@@ -375,7 +379,7 @@ Test-Case 'Running locks fixed settings while live settings remain editable' {
             'AudioSensitivity', 'AutoStop', 'AutoStopTime', 'AutoLogout',
             'BiteResponseMin', 'BiteResponseMax', 'PreHookMin', 'PreHookMax',
             'PostHookMin', 'PostHookMax', 'PreCastMin', 'PreCastMax',
-            'BuffGrid', 'EnableNotifications', 'NotifyOnStop'
+            'BuffGrid', 'EnableNotifications', 'WebhookText', 'NotifyOnStop'
         )
         $allConfigControls = @(
             'Retail', 'AutoStop', 'AutoStopTime', 'AutoLogout', 'AudioSensitivity',
@@ -424,6 +428,7 @@ Test-Case 'Saving while running persists the profile but writes only live fields
         $controller.ConfigVersion = 4
         Set-AIFishBotRunningState -Controller $controller -Running $true
         $view.Controls.AudioSensitivity.Value = 8
+        $view.Controls.WebhookText.Text = 'https://discord.com/api/webhooks/987654/new-secret-token'
         $view.Controls.Retail.Checked = $false
 
         Save-AIFishBotCurrentProfile -Controller $controller | Out-Null
@@ -432,13 +437,119 @@ Test-Case 'Saving while running persists the profile but writes only live fields
 
         Assert-Equal -Expected 5 -Actual $live.configVersion
         Assert-Equal -Expected 8 -Actual $live.audioSensitivity
-        Assert-True -Condition ($null -eq $live.PSObject.Properties['discordWebhook'])
+        Assert-Equal -Expected 'https://discord.com/api/webhooks/987654/new-secret-token' -Actual $live.discordWebhook
         Assert-True -Condition ($null -eq $live.PSObject.Properties['retail'])
         Assert-True -Condition ($null -eq $live.PSObject.Properties['notifyOnStart'])
         Assert-Equal -Expected $false -Actual $saved.retail
-        Assert-Equal -Expected $config.discordWebhook -Actual $saved.discordWebhook
+        Assert-Equal -Expected 'https://discord.com/api/webhooks/987654/new-secret-token' -Actual $saved.discordWebhook
     }
     finally { Remove-ControllerTestDirectory $root }
+}
+
+Test-Case 'Reset profile cancellation preserves the file view and dirty state' {
+    $root = New-TestDirectory
+    try {
+        $view = New-ControllerFakeView
+        $script:resetPurposes = @()
+        $controller = New-ControllerForTest -View $view -Root $root -ConfirmProvider {
+            param($purpose)
+            $script:resetPurposes += $purpose
+            return $false
+        }
+        $config = New-ControllerTestConfig -Name '取消重置方案'
+        Set-AIFishBotViewFromConfig -Controller $controller -Config $config
+        Save-AIFishBotCurrentProfile -Controller $controller | Out-Null
+        $view.Controls.AutoStopTime.Value = 44
+        $controller.MarkDirty()
+        $profilePath = Get-AIFishBotProfilePath -ProfilesDirectory (Join-Path $root 'profiles') -ProfileName '取消重置方案'
+        $fileBefore = Get-Content -LiteralPath $profilePath -Raw
+        $viewBefore = (Get-AIFishBotConfigFromView $controller | ConvertTo-Json -Depth 20 -Compress)
+
+        $result = $controller.ResetProfile()
+
+        Assert-Equal -Expected $false -Actual $result.Success
+        Assert-Equal -Expected $true -Actual $result.Cancelled
+        Assert-Equal -Expected @('ResetProfile') -Actual $script:resetPurposes
+        Assert-Equal -Expected $fileBefore -Actual (Get-Content -LiteralPath $profilePath -Raw)
+        Assert-Equal -Expected $viewBefore -Actual (Get-AIFishBotConfigFromView $controller | ConvertTo-Json -Depth 20 -Compress)
+        Assert-Equal -Expected $true -Actual $controller.IsDirty
+    }
+    finally { Remove-ControllerTestDirectory $root; Remove-Variable resetPurposes -Scope Script -ErrorAction SilentlyContinue }
+}
+
+Test-Case 'Reset profile atomically restores every default while preserving its name' {
+    $root = New-TestDirectory
+    try {
+        $view = New-ControllerFakeView
+        $controller = New-ControllerForTest -View $view -Root $root -ConfirmProvider { param($purpose) $purpose -eq 'ResetProfile' }
+        $config = New-ControllerTestConfig -Name '保留名称'
+        Set-AIFishBotViewFromConfig -Controller $controller -Config $config
+        Save-AIFishBotCurrentProfile -Controller $controller | Out-Null
+        $controller.MarkDirty()
+
+        $result = $controller.ResetProfile()
+        $saved = Read-AIFishBotProfile -ProfilesDirectory (Join-Path $root 'profiles') -ProfileName '保留名称'
+        $expected = New-AIFishBotDefaultConfig
+        $expected.profileName = '保留名称'
+
+        Assert-Equal -Expected $true -Actual $result.Success
+        Assert-Equal -Expected ($expected | ConvertTo-Json -Depth 20 -Compress) -Actual ($saved | ConvertTo-Json -Depth 20 -Compress)
+        Assert-Equal -Expected ($expected | ConvertTo-Json -Depth 20 -Compress) -Actual (Get-AIFishBotConfigFromView $controller | ConvertTo-Json -Depth 20 -Compress)
+        Assert-Equal -Expected $false -Actual $controller.IsDirty
+        Assert-Equal -Expected '已保存' -Actual $view.Controls.SaveStateLabel.Text
+    }
+    finally { Remove-ControllerTestDirectory $root }
+}
+
+Test-Case 'Reset profile is disabled and rejected while running' {
+    $root = New-TestDirectory
+    try {
+        $view = New-ControllerFakeView
+        $script:resetConfirmCalls = 0
+        $controller = New-ControllerForTest -View $view -Root $root -ConfirmProvider { param($purpose) $script:resetConfirmCalls += 1; $true }
+        $config = New-ControllerTestConfig -Name '运行重置方案'
+        Set-AIFishBotViewFromConfig -Controller $controller -Config $config
+        Save-AIFishBotCurrentProfile -Controller $controller | Out-Null
+        Set-AIFishBotRunningState -Controller $controller -Running $true
+
+        $result = $controller.ResetProfile()
+
+        Assert-Equal -Expected $false -Actual $view.Controls.ResetProfileButton.Enabled
+        Assert-Equal -Expected $false -Actual $result.Success
+        Assert-True -Condition ($result.Error -like '*运行中*')
+        Assert-Equal -Expected 0 -Actual $script:resetConfirmCalls
+        Assert-Equal -Expected ($config | ConvertTo-Json -Depth 20 -Compress) -Actual (Read-AIFishBotProfile -ProfilesDirectory (Join-Path $root 'profiles') -ProfileName '运行重置方案' | ConvertTo-Json -Depth 20 -Compress)
+    }
+    finally { Remove-ControllerTestDirectory $root; Remove-Variable resetConfirmCalls -Scope Script -ErrorAction SilentlyContinue }
+}
+
+Test-Case 'Failed reset preserves the original profile and current view without a half reset' {
+    $root = New-TestDirectory
+    $lock = $null
+    try {
+        $view = New-ControllerFakeView
+        $controller = New-ControllerForTest -View $view -Root $root -ConfirmProvider { param($purpose) $true }
+        $config = New-ControllerTestConfig -Name '失败重置方案'
+        Set-AIFishBotViewFromConfig -Controller $controller -Config $config
+        Save-AIFishBotCurrentProfile -Controller $controller | Out-Null
+        $profilePath = Get-AIFishBotProfilePath -ProfilesDirectory (Join-Path $root 'profiles') -ProfileName '失败重置方案'
+        $fileBefore = Get-Content -LiteralPath $profilePath -Raw
+        $viewBefore = (Get-AIFishBotConfigFromView $controller | ConvertTo-Json -Depth 20 -Compress)
+        $lock = [System.IO.File]::Open($profilePath, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::None)
+
+        $result = $controller.ResetProfile()
+        $lock.Dispose()
+        $lock = $null
+
+        Assert-Equal -Expected $false -Actual $result.Success
+        Assert-True -Condition (-not [string]::IsNullOrWhiteSpace($result.Error))
+        Assert-Equal -Expected $fileBefore -Actual (Get-Content -LiteralPath $profilePath -Raw)
+        Assert-Equal -Expected $viewBefore -Actual (Get-AIFishBotConfigFromView $controller | ConvertTo-Json -Depth 20 -Compress)
+    }
+    finally {
+        if ($null -ne $lock) { $lock.Dispose() }
+        Remove-ControllerTestDirectory $root
+    }
 }
 
 Test-Case 'Running edits remain unsaved until Save writes one new live version' {
@@ -491,6 +602,73 @@ Test-Case 'Running Save reports when profile persistence succeeds but live persi
         Assert-Equal -Expected $true -Actual $controller.IsDirty
     }
     finally { Remove-ControllerTestDirectory $root }
+}
+
+Test-Case 'Running live-config failure masks the webhook in the returned error and status bar' {
+    $root = New-TestDirectory
+    try {
+        $view = New-ControllerFakeView
+        $script:sensitiveWebhook = 'https://discord.com/api/webhooks/654321/private-live-token'
+        $controller = New-ControllerForTest -View $view -Root $root -LiveConfigWriter {
+            param($controllerState, $configState)
+            throw ('模拟写入失败：{0}' -f $script:sensitiveWebhook)
+        }
+        $config = New-ControllerTestConfig -Name '安全失败方案'
+        Set-AIFishBotViewFromConfig -Controller $controller -Config $config
+        Save-AIFishBotCurrentProfile -Controller $controller | Out-Null
+        $run = New-AIFishBotRunDirectory -RuntimeRoot (Join-Path $root 'runtime') `
+            -StartConfig $config -LiveConfig ([pscustomobject]@{ configVersion = 1 })
+        $controller.CurrentRunDirectory = $run
+        $controller.ConfigVersion = 1
+        Set-AIFishBotRunningState -Controller $controller -Running $true
+        $view.Controls.WebhookText.Text = $script:sensitiveWebhook
+
+        $result = Save-AIFishBotCurrentProfile -Controller $controller
+
+        Assert-Equal -Expected $false -Actual $result.Success
+        Assert-Equal -Expected $true -Actual $result.ProfileSaved
+        Assert-True -Condition ($result.Error -like '*实时配置写入失败*')
+        Assert-True -Condition ($view.Controls.SaveStateLabel.Text -like '*实时配置写入失败*')
+        foreach ($text in @([string]$result.Error, [string]$view.Controls.SaveStateLabel.Text, [string]$view.Controls.LogBox.Text)) {
+            Assert-True -Condition (-not $text.Contains($script:sensitiveWebhook))
+            Assert-True -Condition (-not $text.Contains('private-live-token'))
+        }
+    }
+    finally { Remove-ControllerTestDirectory $root; Remove-Variable sensitiveWebhook -Scope Script -ErrorAction SilentlyContinue }
+}
+
+Test-Case 'A real hidden reset button click restores defaults through the controller binding' {
+    $root = New-TestDirectory
+    $view = $null
+    try {
+        Import-Module (Join-Path -Path (Split-Path -Path $PSScriptRoot -Parent) `
+                -ChildPath 'AI-FishBot.UI.psm1') -Force
+        $view = New-AIFishBotMainView
+        $script:realResetPurpose = ''
+        $controller = New-ControllerForTest -View $view -Root $root -ConfirmProvider {
+            param($purpose)
+            $script:realResetPurpose = $purpose
+            return $true
+        }
+        $config = New-ControllerTestConfig -Name '真实按钮方案'
+        Set-AIFishBotViewFromConfig -Controller $controller -Config $config
+        Save-AIFishBotCurrentProfile -Controller $controller | Out-Null
+
+        Invoke-ControllerRealButtonClick $view.Controls.ResetProfileButton
+
+        $expected = New-AIFishBotDefaultConfig
+        $expected.profileName = '真实按钮方案'
+        $saved = Read-AIFishBotProfile -ProfilesDirectory (Join-Path $root 'profiles') -ProfileName '真实按钮方案'
+        Assert-Equal -Expected 'ResetProfile' -Actual $script:realResetPurpose
+        Assert-Equal -Expected ($expected | ConvertTo-Json -Depth 20 -Compress) -Actual ($saved | ConvertTo-Json -Depth 20 -Compress)
+        Assert-Equal -Expected $false -Actual $controller.IsDirty
+        Assert-Equal -Expected $false -Actual $view.Form.Visible
+    }
+    finally {
+        if ($null -ne $view) { $view.Dispose() }
+        Remove-ControllerTestDirectory $root
+        Remove-Variable realResetPurpose -Scope Script -ErrorAction SilentlyContinue
+    }
 }
 
 Test-Case 'Profile buttons create copy rename and delete with collision-free copy names' {
