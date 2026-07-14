@@ -213,9 +213,6 @@ function Test-AIFishBotControllerProcessIdentity {
     if ($actualPid -ne $ProcessId) {
         return [pscustomobject]@{ Success = $false; Error = '查找到的进程编号不匹配。' }
     }
-    if (-not (Test-AIFishBotHeartbeatFresh -Status $Status -Now (& $Controller.Clock) -MaxAgeSeconds $Controller.HeartbeatMaxAgeSeconds)) {
-        return [pscustomobject]@{ Success = $false; Error = '后台心跳已经过期。' }
-    }
     $actualStart = Get-AIFishBotControllerProcessStartTime $Process
     if ($null -eq $actualStart) {
         return [pscustomobject]@{ Success = $false; Error = '无法核对后台进程的启动时间。' }
@@ -1075,7 +1072,14 @@ function Update-AIFishBotViewStatus {
         'waiting-for-bite' = '等待咬钩'; hooking = '正在提竿'; stopping = '正在停止';
         stopped = '已停止'; error = '出错'
     }
-    $label = if ($labels.ContainsKey($state)) { $labels[$state] } else { '未知状态' }
+    $heartbeatFresh = Test-AIFishBotHeartbeatFresh -Status $Status -Now (& $Controller.Clock) `
+        -MaxAgeSeconds $Controller.HeartbeatMaxAgeSeconds
+    $label = if ($Controller.IsRunning -and $state -notin @('stopped', 'error') -and
+        -not $heartbeatFresh) {
+        '后台暂时未响应'
+    }
+    elseif ($labels.ContainsKey($state)) { $labels[$state] }
+    else { '未知状态' }
     $badge = Get-AIFishBotControllerControl $Controller 'StatusBadge'
     if ($null -ne $badge) { $badge.Text = '● {0}' -f $label }
     $hook = Get-AIFishBotControllerControl $Controller 'HookCount'

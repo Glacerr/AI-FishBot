@@ -964,6 +964,90 @@ Test-Case 'Resume validates process and fresh heartbeat then restores the runnin
     finally { Remove-ControllerTestDirectory $root }
 }
 
+Test-Case 'Resume keeps an identity-matched run with an expired heartbeat and blocks a duplicate start' {
+    $root = New-TestDirectory
+    try {
+        $view = New-ControllerFakeView
+        $now = [datetimeoffset]'2026-07-13T10:00:00+08:00'
+        $processStart = $now.AddMinutes(-1)
+        $run = New-AIFishBotRunDirectory -RuntimeRoot (Join-Path $root 'runtime') `
+            -StartConfig (New-ControllerTestConfig) -LiveConfig ([pscustomobject]@{ configVersion = 1 })
+        $status = [pscustomobject]@{
+            processId = 556; state = 'ready'; heartbeatAt = $now.AddSeconds(-10).ToString('o')
+            startedAt = $processStart.ToString('o'); configVersion = 1
+        }
+        $controller = New-ControllerForTest -View $view -Root $root `
+            -StatusReader { param($path) $status } `
+            -ProcessLookup { param($id) [pscustomobject]@{ Id = $id; StartTime = $processStart.UtcDateTime } }
+        Write-AIFishBotAtomicJson -Path $controller.ActiveMarkerPath -InputObject ([pscustomobject]@{
+                runDirectory = $run; processId = 556; processStartedAt = $processStart.ToString('o')
+            }) | Out-Null
+
+        $resume = Resume-AIFishBotRun -Controller $controller
+
+        Assert-Equal -Expected $true -Actual $resume.Success
+        Assert-Equal -Expected $true -Actual $controller.IsRunning
+        Assert-True -Condition (Test-Path -LiteralPath $controller.ActiveMarkerPath -PathType Leaf)
+        Assert-Equal -Expected '● 后台暂时未响应' -Actual $view.Controls.StatusBadge.Text
+        Assert-Equal -Expected '停止钓鱼' -Actual $view.Controls.StartStopButton.Text
+
+        $script:expiredStarterCalls = 0
+        $secondView = New-ControllerFakeView
+        $secondController = New-ControllerForTest -View $secondView -Root $root `
+            -StatusReader { param($path) $status } `
+            -ProcessLookup { param($id) [pscustomobject]@{ Id = $id; StartTime = $processStart.UtcDateTime } } `
+            -ProcessStarter { param($request) $script:expiredStarterCalls += 1 }
+        Set-AIFishBotViewFromConfig -Controller $secondController -Config (New-ControllerTestConfig)
+
+        $start = Start-AIFishBotRun -Controller $secondController
+
+        Assert-Equal -Expected $false -Actual $start.Success
+        Assert-Equal -Expected $true -Actual $start.AlreadyRunning
+        Assert-Equal -Expected 0 -Actual $script:expiredStarterCalls
+    }
+    finally {
+        Remove-ControllerTestDirectory $root
+        Remove-Variable expiredStarterCalls -Scope Script -ErrorAction SilentlyContinue
+    }
+}
+
+Test-Case 'Force stop accepts an expired heartbeat only after the process start time matches' {
+    $root = New-TestDirectory
+    try {
+        $view = New-ControllerFakeView
+        $now = [datetimeoffset]'2026-07-13T10:00:00+08:00'
+        $processStart = $now.AddMinutes(-1)
+        $run = New-AIFishBotRunDirectory -RuntimeRoot (Join-Path $root 'runtime') `
+            -StartConfig (New-ControllerTestConfig) -LiveConfig ([pscustomobject]@{ configVersion = 1 })
+        $status = [pscustomobject]@{
+            processId = 557; state = 'stopping'; heartbeatAt = $now.AddSeconds(-10).ToString('o')
+            startedAt = $processStart.ToString('o'); configVersion = 1
+        }
+        $script:expiredForceCalls = 0
+        $controller = New-ControllerForTest -View $view -Root $root `
+            -StatusReader { param($path) $status } `
+            -ProcessLookup { param($id) [pscustomobject]@{ Id = $id; StartTime = $processStart.UtcDateTime } } `
+            -ForceStopper { param($id) $script:expiredForceCalls += 1 }
+        $controller.CurrentRunDirectory = $run
+        $controller.CurrentProcessId = 557
+        $controller.CurrentProcessStartedAt = $processStart.ToString('o')
+        Set-AIFishBotRunningState -Controller $controller -Running $true
+        Write-AIFishBotAtomicJson -Path $controller.ActiveMarkerPath -InputObject ([pscustomobject]@{
+                runDirectory = $run; processId = 557; processStartedAt = $processStart.ToString('o')
+            }) | Out-Null
+
+        $result = $controller.ForceStop()
+
+        Assert-Equal -Expected $true -Actual $result.Success
+        Assert-Equal -Expected 1 -Actual $script:expiredForceCalls
+        Assert-Equal -Expected $false -Actual $controller.IsRunning
+    }
+    finally {
+        Remove-ControllerTestDirectory $root
+        Remove-Variable expiredForceCalls -Scope Script -ErrorAction SilentlyContinue
+    }
+}
+
 Test-Case 'Resume clears stale controller state without terminating a process' {
     $root = New-TestDirectory
     try {

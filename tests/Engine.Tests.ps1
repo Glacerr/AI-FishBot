@@ -317,7 +317,7 @@ Test-Case 'bite sequence uses the exact simulated four-delay action order' {
         Invoke-AIFishBotBiteSequence -State $state | Out-Null
 
         Assert-Equal -Expected @(
-            'sleep:300', 'sleep:500', 'key:F7', 'sleep:1100', 'sleep:200', 'key:F6'
+            'sleep:300', 'sleep:500', 'key:F7', 'sleep:1000', 'sleep:100', 'sleep:200', 'key:F6'
         ) -Actual @($adapter.Context.Events)
         Assert-Equal -Expected 1 -Actual $state.HookCount
     }
@@ -336,7 +336,7 @@ Test-Case 'focus is placed immediately before each simulated fishing key' {
 
         Assert-Equal -Expected @(
             'sleep:300', 'sleep:500', 'focus', 'key:F7',
-            'sleep:1100', 'sleep:200', 'focus', 'key:F6'
+            'sleep:1000', 'sleep:100', 'sleep:200', 'focus', 'key:F6'
         ) -Actual @($adapter.Context.Events)
     }
     finally {
@@ -359,7 +359,9 @@ Test-Case 'random delay ranges include each configured upper boundary' {
         Invoke-AIFishBotBiteSequence -State $state | Out-Null
 
         Assert-Equal -Expected @('300-700', '1100-1500', '200-600') -Actual @($ranges)
-        Assert-Equal -Expected @('sleep:700', 'sleep:500', 'key:F7', 'sleep:1500', 'sleep:600', 'key:F6') `
+        Assert-Equal -Expected @(
+            'sleep:700', 'sleep:500', 'key:F7', 'sleep:1000', 'sleep:500', 'sleep:600', 'key:F6'
+        ) `
             -Actual @($adapter.Context.Events)
     }
     finally {
@@ -395,7 +397,9 @@ Test-Case 'live delay changes take effect on the very next fishing action' {
             -LiveConfigLoader (New-VersionedLoader -Items $items)
         Invoke-AIFishBotBiteSequence -State $state | Out-Null
 
-        Assert-Equal -Expected @('sleep:400', 'sleep:600', 'key:F7', 'sleep:1200', 'sleep:250', 'key:F6') `
+        Assert-Equal -Expected @(
+            'sleep:400', 'sleep:600', 'key:F7', 'sleep:1000', 'sleep:200', 'sleep:250', 'key:F6'
+        ) `
             -Actual @($adapter.Context.Events)
         Assert-Equal -Expected 6 -Actual $state.ConfigVersion
     }
@@ -634,9 +638,11 @@ Test-Case 'no bite completes the classic window and starts the next round before
         Assert-Equal -Expected 'stopped' -Actual $state.State
         Assert-Equal -Expected 1 -Actual $adapter.Context.DisposeCount
         Assert-True -Condition ($adapter.Context.Now -ge $state.StartedAt.AddSeconds(30))
-        $silentIndex = $adapter.Context.Events.IndexOf('sleep:4000')
         $firstPeakIndex = $adapter.Context.Events.IndexOf('peak')
-        Assert-True -Condition ($silentIndex -ge 0 -and $firstPeakIndex -gt $silentIndex)
+        $longWaitSlicesBeforePeak = @(
+            $adapter.Context.Events[0..($firstPeakIndex - 1)] | Where-Object { $_ -eq 'sleep:1000' }
+        ).Count
+        Assert-True -Condition ($firstPeakIndex -ge 0 -and $longWaitSlicesBeforePeak -ge 4)
     }
     finally {
         Remove-EngineTestState -State $state
@@ -731,6 +737,76 @@ Test-Case 'waiting loop refreshes its runtime heartbeat while no bite is heard' 
 
         Assert-True -Condition ($null -ne $observation.HeartbeatAt)
         Assert-True -Condition ($observation.HeartbeatAt -ge $state.StartedAt.AddSeconds(5))
+    }
+    finally {
+        Remove-EngineTestState -State $state
+    }
+}
+
+Test-Case 'a configurable wait longer than five seconds refreshes heartbeat in bounded slices' {
+    $holder = @{ State = $null; HeartbeatAt = $null; LargestSleep = 0 }
+    $capturedHolder = $holder
+    $onSleep = {
+        param($milliseconds)
+        $capturedHolder.LargestSleep = [math]::Max($capturedHolder.LargestSleep, $milliseconds)
+        if ($null -ne $capturedHolder.State -and
+            $capturedHolder.State.Adapter.Context.MonotonicMilliseconds -ge 5500) {
+            $path = Join-Path -Path $capturedHolder.State.RunDirectory -ChildPath 'status.json'
+            $status = [System.IO.File]::ReadAllText($path) | ConvertFrom-Json
+            $capturedHolder.HeartbeatAt = [datetimeoffset]$status.heartbeatAt
+        }
+    }.GetNewClosure()
+    $adapter = New-SimulatedAdapter -OnSleep $onSleep
+    $config = New-EngineConfig -Values @{
+        preCastMinSeconds = 6; preCastMaxSeconds = 6
+    }
+    $state = $null
+    try {
+        $state = New-EngineTestState -Config $config -Adapter $adapter
+        $holder.State = $state
+
+        Assert-Equal -Expected $true -Actual (Invoke-AIFishBotCast -State $state)
+
+        Assert-True -Condition ($holder.LargestSleep -le 1000)
+        Assert-True -Condition ($null -ne $holder.HeartbeatAt)
+        Assert-True -Condition ($holder.HeartbeatAt -ge $state.StartedAt.AddSeconds(5))
+        Assert-Equal -Expected 1 -Actual (Get-EventCount -Adapter $adapter -Event 'key:F6')
+    }
+    finally {
+        Remove-EngineTestState -State $state
+    }
+}
+
+Test-Case 'stop arriving during a configurable wait prevents the pending key' {
+    $signal = @{ Stop = $false; Elapsed = 0 }
+    $capturedSignal = $signal
+    $onSleep = {
+        param($milliseconds)
+        $capturedSignal.Elapsed += $milliseconds
+        if ($capturedSignal.Elapsed -ge 2000) {
+            $capturedSignal.Stop = $true
+        }
+    }.GetNewClosure()
+    $adapter = New-SimulatedAdapter -OnSleep $onSleep
+    $reader = {
+        param($state)
+        if ($capturedSignal.Stop) {
+            return [pscustomobject]@{ command = 'stop' }
+        }
+        return $null
+    }.GetNewClosure()
+    $config = New-EngineConfig -Values @{
+        preCastMinSeconds = 6; preCastMaxSeconds = 6
+    }
+    $state = $null
+    try {
+        $state = New-EngineTestState -Config $config -Adapter $adapter -ControlReader $reader
+
+        Assert-Equal -Expected $false -Actual (Invoke-AIFishBotCast -State $state)
+
+        Assert-Equal -Expected 0 -Actual (Get-EventCount -Adapter $adapter -Event 'key:F6')
+        Assert-True -Condition ($adapter.Context.MonotonicMilliseconds -lt 6000)
+        Assert-Equal -Expected 'stopped' -Actual $state.State
     }
     finally {
         Remove-EngineTestState -State $state
@@ -893,7 +969,7 @@ Test-Case 'multiple buff rows keep separate keys and cast durations' {
         $state = New-EngineTestState -Config $config -Adapter $adapter
         Invoke-AIFishBotBuffCheck -State $state | Out-Null
 
-        Assert-Equal -Expected @('key:F9', 'sleep:1000', 'key:F10', 'sleep:2000') `
+        Assert-Equal -Expected @('key:F9', 'sleep:1000', 'key:F10', 'sleep:1000', 'sleep:1000') `
             -Actual @($adapter.Context.Events)
         Assert-Equal -Expected 2 -Actual @($state.BuffSchedule).Count
         Assert-True -Condition ($state.BuffSchedule[0].Identity -ne $state.BuffSchedule[1].Identity)
@@ -963,7 +1039,7 @@ Test-Case 'duplicate buff keys remain two independent scheduled rows' {
         $state = New-EngineTestState -Config $config -Adapter $adapter
         Invoke-AIFishBotBuffCheck -State $state | Out-Null
 
-        Assert-Equal -Expected @('key:F9', 'sleep:1000', 'key:F9', 'sleep:2000') `
+        Assert-Equal -Expected @('key:F9', 'sleep:1000', 'key:F9', 'sleep:1000', 'sleep:1000') `
             -Actual @($adapter.Context.Events)
         Assert-Equal -Expected 2 -Actual @($state.BuffSchedule).Count
         Assert-True -Condition ($state.BuffSchedule[0].Identity -ne $state.BuffSchedule[1].Identity)
@@ -1340,7 +1416,7 @@ Test-Case 'buff live update waits for the next check and does not interrupt the 
         Assert-Equal -Expected @('key:F9', 'sleep:1000') -Actual @($adapter.Context.Events)
 
         Invoke-AIFishBotBuffCheck -State $state | Out-Null
-        Assert-Equal -Expected @('key:F9', 'sleep:1000', 'key:F10', 'sleep:2000') `
+        Assert-Equal -Expected @('key:F9', 'sleep:1000', 'key:F10', 'sleep:1000', 'sleep:1000') `
             -Actual @($adapter.Context.Events)
     }
     finally {

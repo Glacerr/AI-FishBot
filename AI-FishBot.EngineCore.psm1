@@ -215,6 +215,28 @@ function Invoke-AIFishBotEngineSleep {
         -ArgumentList @($Milliseconds) | Out-Null
 }
 
+function Wait-AIFishBotEngineInterruptibly {
+    param(
+        [Parameter(Mandatory = $true)]
+        [object]$State,
+
+        [Parameter(Mandatory = $true)]
+        [int]$Milliseconds
+    )
+
+    $remainingMilliseconds = [int]$Milliseconds
+    while ($remainingMilliseconds -gt 0) {
+        $sliceMilliseconds = [math]::Min(1000, $remainingMilliseconds)
+        Invoke-AIFishBotEngineSleep -State $State -Milliseconds $sliceMilliseconds
+        $remainingMilliseconds -= $sliceMilliseconds
+        if ($remainingMilliseconds -gt 0 -and
+            -not (Test-AIFishBotEngineCheckpoint -State $State)) {
+            return $false
+        }
+    }
+    return $true
+}
+
 function Invoke-AIFishBotEngineFocus {
     param(
         [Parameter(Mandatory = $true)]
@@ -730,7 +752,9 @@ function Invoke-AIFishBotCastAttempt {
     $delay = Get-AIFishBotEngineDelay -State $State `
         -MinimumSeconds $State.LiveConfig.preCastMinSeconds `
         -MaximumSeconds $State.LiveConfig.preCastMaxSeconds
-    Invoke-AIFishBotEngineSleep -State $State -Milliseconds $delay
+    if (-not (Wait-AIFishBotEngineInterruptibly -State $State -Milliseconds $delay)) {
+        return $false
+    }
 
     if ([bool]$State.LockedConfig.useWindowFocus) {
         if (-not (Test-AIFishBotEngineCheckpoint -State $State)) {
@@ -782,7 +806,9 @@ function Invoke-AIFishBotCast {
             return $false
         }
         $retryDelay = Get-AIFishBotEngineDelay -State $State -MinimumSeconds 1.0 -MaximumSeconds 1.5
-        Invoke-AIFishBotEngineSleep -State $State -Milliseconds $retryDelay
+        if (-not (Wait-AIFishBotEngineInterruptibly -State $State -Milliseconds $retryDelay)) {
+            return $false
+        }
         if (-not (Test-AIFishBotEngineCheckpoint -State $State)) {
             return $false
         }
@@ -813,7 +839,9 @@ function Invoke-AIFishBotBiteSequence {
     $delay = Get-AIFishBotEngineDelay -State $State `
         -MinimumSeconds $State.LiveConfig.biteResponseMinSeconds `
         -MaximumSeconds $State.LiveConfig.biteResponseMaxSeconds
-    Invoke-AIFishBotEngineSleep -State $State -Milliseconds $delay
+    if (-not (Wait-AIFishBotEngineInterruptibly -State $State -Milliseconds $delay)) {
+        return $false
+    }
 
     if (-not (Test-AIFishBotEngineCheckpoint -State $State)) {
         return $false
@@ -821,7 +849,9 @@ function Invoke-AIFishBotBiteSequence {
     $delay = Get-AIFishBotEngineDelay -State $State `
         -MinimumSeconds $State.LiveConfig.preHookMinSeconds `
         -MaximumSeconds $State.LiveConfig.preHookMaxSeconds
-    Invoke-AIFishBotEngineSleep -State $State -Milliseconds $delay
+    if (-not (Wait-AIFishBotEngineInterruptibly -State $State -Milliseconds $delay)) {
+        return $false
+    }
 
     if ([bool]$State.LockedConfig.useWindowFocus) {
         if (-not (Test-AIFishBotEngineCheckpoint -State $State)) {
@@ -842,7 +872,9 @@ function Invoke-AIFishBotBiteSequence {
     $delay = Get-AIFishBotEngineDelay -State $State `
         -MinimumSeconds $State.LiveConfig.postHookMinSeconds `
         -MaximumSeconds $State.LiveConfig.postHookMaxSeconds
-    Invoke-AIFishBotEngineSleep -State $State -Milliseconds $delay
+    if (-not (Wait-AIFishBotEngineInterruptibly -State $State -Milliseconds $delay)) {
+        return $false
+    }
     return Invoke-AIFishBotCast -State $State
 }
 
@@ -1000,7 +1032,10 @@ function Invoke-AIFishBotBuffCheck {
         $castMilliseconds = Get-AIFishBotEngineDelay -State $State `
             -MinimumSeconds $scheduled.CastTimeSeconds `
             -MaximumSeconds $scheduled.CastTimeSeconds
-        Invoke-AIFishBotEngineSleep -State $State -Milliseconds $castMilliseconds
+        if (-not (Wait-AIFishBotEngineInterruptibly -State $State `
+                -Milliseconds $castMilliseconds)) {
+            return $false
+        }
         $scheduled.LastAppliedMonotonicMilliseconds =
             Get-AIFishBotEngineMonotonicMilliseconds -State $State
         $scheduled.LastAppliedAt = Get-AIFishBotEngineNow -State $State
@@ -1077,7 +1112,9 @@ function Start-AIFishBotEngineLoop {
             if (-not (Test-AIFishBotEngineCheckpoint -State $State)) {
                 break
             }
-            Invoke-AIFishBotEngineSleep -State $State -Milliseconds 4000
+            if (-not (Wait-AIFishBotEngineInterruptibly -State $State -Milliseconds 4000)) {
+                break
+            }
             Set-AIFishBotEngineStateValue -State $State -Value 'waiting-for-bite'
             $windowSeconds = if ([bool]$State.LockedConfig.retail) { 22 } else { 30 }
             $deadline = $windowStart + ($windowSeconds * 1000)
